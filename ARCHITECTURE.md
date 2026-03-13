@@ -170,28 +170,6 @@ NOTE: it’s not yet clear if this crate is an API Boundary or an implementation
 
 Portable RDP client without GPU acceleration.
 
-#### [`crates/ironrdp-web`](./crates/ironrdp-web)
-
-WebAssembly high-level bindings targeting web browsers.
-
-This crate is an **API Boundary** (WASM module).
-
-#### [`web-client/iron-remote-desktop`](./web-client/iron-remote-desktop)
-
-Core frontend UI used by `iron-svelte-client` as a Web Component.
-
-This crate is an **API Boundary**.
-
-#### [`web-client/iron-remote-desktop-rdp`](./web-client/iron-remote-desktop-rdp)
-
-Implementation of the TypeScript interfaces exposed by WebAssembly bindings from `ironrdp-web` and used by `iron-svelte-client`.
-
-This crate is an **API Boundary**.
-
-#### [`web-client/iron-svelte-client`](./web-client/iron-svelte-client)
-
-Web-based frontend using `Svelte` and `Material` frameworks.
-
 #### [`crates/ironrdp-cliprdr-native`](./crates/ironrdp-cliprdr-native)
 
 Native CLIPRDR backend implementations.
@@ -289,7 +267,7 @@ This section talks about the things which are everywhere and nowhere in particul
 ### Avoid I/O wherever possible
 
 **Architecture Invariant**: core tier crates must never interact with the outside world. Only extra tier crates
-such as `ironrdp-client`, `ironrdp-web` or `ironrdp-async` are allowed to do I/O.
+such as `ironrdp-client` or `ironrdp-async` are allowed to do I/O.
 
 ### Continuous integration
 

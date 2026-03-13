@@ -192,14 +192,8 @@ pub mod ffi {
 
                 #[cfg(windows)]
                 platform: MajorPlatformType::WINDOWS,
-                #[cfg(target_os = "macos")]
-                platform: MajorPlatformType::MACINTOSH,
-                #[cfg(target_os = "ios")]
-                platform: MajorPlatformType::IOS,
                 #[cfg(target_os = "linux")]
                 platform: MajorPlatformType::UNIX,
-                #[cfg(target_os = "android")]
-                platform: MajorPlatformType::ANDROID,
                 #[cfg(target_os = "freebsd")]
                 platform: MajorPlatformType::UNIX,
                 #[cfg(target_os = "dragonfly")]

@@ -14,8 +14,6 @@ mod ffi;
 mod fuzz;
 mod prelude;
 mod section;
-mod wasm;
-mod web;
 
 use std::path::{Path, PathBuf};
 
@@ -30,8 +28,6 @@ pub const LOCAL_CARGO_ROOT: &str = ".cargo\\local_root\\";
 pub const LOCAL_CARGO_ROOT: &str = ".cargo/local_root/";
 
 pub const CARGO: &str = env!("CARGO");
-
-pub const WASM_PACKAGES: &[&str] = &["ironrdp-web"];
 
 pub const FUZZ_TARGETS: &[&str] = &[
     "pdu_decoding",
@@ -60,8 +56,7 @@ fn main() -> anyhow::Result<()> {
             check::install(&sh)?;
             cov::install(&sh)?;
             fuzz::install(&sh)?;
-            wasm::install(&sh)?;
-            web::install(&sh)?;
+            ffi::install(&sh)?;
 
             if is_verbose() {
                 list_files(&sh, local_bin())?;
@@ -89,10 +84,10 @@ fn main() -> anyhow::Result<()> {
             check::tests_compile(&sh)?;
             check::tests_run(&sh)?;
             check::lints(&sh)?;
-            wasm::check(&sh)?;
             fuzz::run(&sh, None, None)?;
-            web::install(&sh)?;
-            web::check(&sh)?;
+            ffi::install(&sh)?;
+            ffi::build_dynamic_lib(&sh, false)?;
+            ffi::build_bindings(&sh, false)?;
             check::lock_files(&sh)?;
         }
         Action::Clean => clean::workspace(&sh)?,
@@ -106,12 +101,6 @@ fn main() -> anyhow::Result<()> {
         Action::FuzzCorpusPush => fuzz::corpus_push(&sh)?,
         Action::FuzzInstall => fuzz::install(&sh)?,
         Action::FuzzRun { duration, target } => fuzz::run(&sh, duration, target)?,
-        Action::WasmCheck => wasm::check(&sh)?,
-        Action::WasmInstall => wasm::install(&sh)?,
-        Action::WebCheck => web::check(&sh)?,
-        Action::WebBuild => web::build(&sh, false)?,
-        Action::WebInstall => web::install(&sh)?,
-        Action::WebRun => web::run(&sh)?,
         Action::FfiInstall => ffi::install(&sh)?,
         Action::FfiBuildDll { release } => ffi::build_dynamic_lib(&sh, release)?,
         Action::FfiBuildBindings { skip_dotnet_build } => ffi::build_bindings(&sh, skip_dotnet_build)?,

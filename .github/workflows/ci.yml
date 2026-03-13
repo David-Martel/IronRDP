@@ -61,14 +61,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows, linux, macos]
+        os: [windows, linux]
         include:
           - os: windows
             runner: windows-latest
           - os: linux
             runner: ubuntu-latest
-          - os: macos
-            runner: macos-latest
 
     steps:
       - name: Checkout
@@ -108,12 +106,6 @@ jobs:
       - name: Lints
         run: cargo xtask check lints -v
 
-      - name: WASM (prepare)
-        run: cargo xtask wasm install -v
-
-      - name: WASM (check)
-        run: cargo xtask wasm check -v
-
       - name: Lock files
         run: cargo xtask check locks -v
 
@@ -146,36 +138,10 @@ jobs:
       - name: Lock files
         run: cargo xtask check locks -v
 
-  web:
-    name: Web Client
-    needs: [formatting]
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2.7.3
-
-      - name: Binary cache
-        uses: actions/cache@v4
-        with:
-          path: ./.cargo/local_root/bin
-          key: ${{ runner.os }}-bin-${{ github.job }}-${{ hashFiles('xtask/src/bin_version.rs') }}
-
-      - name: Prepare
-        run: cargo xtask web install -v
-
-      - name: Check
-        run: cargo xtask web check -v
-
-      - name: Lock files
-        run: cargo xtask check locks -v
-
   ffi:
     name: FFI
     needs: [formatting]
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -204,7 +170,7 @@ jobs:
   success:
     name: Success
     if: ${{ always() }}
-    needs: [formatting, typos, checks, fuzz, web, ffi]
+    needs: [formatting, typos, checks, fuzz, ffi]
     runs-on: ubuntu-latest
 
     steps:

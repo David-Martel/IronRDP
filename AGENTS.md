@@ -12,7 +12,7 @@ You are responsible for the full lifecycle of a task: understanding intent, plan
 
 2. **Plan**
    - Make a short plan for non-trivial changes; keep scope tight to the user request.
-   - Identify affected workspace members (`crates/*`, `xtask`, `ffi`, `benches`, `fuzz`, `web-client`) and API boundaries.
+   - Identify affected workspace members (`crates/*`, `xtask`, `ffi`, `benches`, `fuzz`) and API boundaries.
    - Prefer root-cause fixes over local workarounds.
 
 3. **Documentation**
@@ -48,13 +48,12 @@ You are expected to read and follow these sources of truth when relevant:
 - **Coding/style conventions:** `STYLE.md`
 - **Task automation details:** `xtask/README.md`
 - **Workspace/build configuration:** `Cargo.toml`, `rust-toolchain.toml`, `clippy.toml`, `rustfmt.toml`
-- **Cargo aliases & WASM flags:** `.cargo/config.toml` (defines `cargo xtask` alias and WASM `rustflags`)
+- **Cargo aliases:** `.cargo/config.toml` (defines `cargo xtask` alias)
 - **Typo checker config:** `typos.toml`
 - **CI behavior:** `.github/workflows/ci.yml`
 - **Changelog / release config:** `cliff.toml`, `release-plz.toml`
 - **Crate-level specifics:** `crates/*/README.md` and `crates/*/CHANGELOG.md`
 - **FFI details:** `ffi/README.md`
-- **Web client details:** `web-client/README.md`
 
 ### Microsoft Open Specifications (Agent Skill)
 
@@ -75,7 +74,6 @@ See [skills.sh](https://skills.sh) for more on the `npx skills` command.
 - **`xtask/`**: Project automation entrypoint (`cargo xtask ...`).
 - **`fuzz/`**: Fuzz targets/corpus for robustness testing.
 - **`ffi/`**: Native library + .NET bindings and examples.
-- **`web-client/`**: Browser/web-component/Svelte client artifacts.
 - **`benches/`**: Benchmarks and perf-related code.
 
 When changing architecture-sensitive crates, preserve tier boundaries and invariants from `ARCHITECTURE.md`.
@@ -94,7 +92,6 @@ These crates exist on disk but are not documented in `ARCHITECTURE.md`. Be aware
 - `ironrdp-rdpdr-native` — native RDPDR backend
 - `ironrdp-rdpsnd-native` — native RDPSND backend
 - `ironrdp-bench` — benchmarking harness
-- `iron-remote-desktop` (under `crates/`) — remote desktop abstractions
 
 ### Workspace Exclusions
 
@@ -119,8 +116,6 @@ Do not modify them unless specifically working on fixing their compilation.
 - **Full CI-equivalent sweep:** `cargo xtask ci -v`
 
 ### Specialized Commands
-- **WASM checks:** `cargo xtask wasm install -v` and `cargo xtask wasm check -v`
-- **Web checks/build/run:** `cargo xtask web install -v`, `cargo xtask web check -v`, `cargo xtask web build -v`, `cargo xtask web run -v`
 - **Fuzzing:** `cargo xtask fuzz install -v`, `cargo xtask fuzz run -v`
 - **FFI:** `cargo xtask ffi install -v`, `cargo xtask ffi build -v`, `cargo xtask ffi bindings -v`
 - **FFI .NET build:** `cd ./ffi/dotnet && dotnet build` (also run in CI, not an xtask command)
@@ -171,12 +166,12 @@ CI runs via GitHub Actions (`.github/workflows/ci.yml`).
 The expectation is that `cargo xtask ci -v` locally is equivalent to a full CI run.
 All commands in the Core and Specialized Commands sections above are what CI executes (each preceded by its `install` step where applicable, and `cargo xtask check locks -v` is run in multiple jobs).
 
-Additional workflows exist for releases (`release-crates.yml`), npm (`npm-publish.yml`), NuGet (`nuget-publish.yml`), coverage, and fuzzing.
+Additional workflows exist for releases (`release-crates.yml`), NuGet (`nuget-publish.yml`), coverage, and fuzzing.
 Do not alter release automation unless explicitly requested.
 
 ### Workspace & Change Scope Rules
 
-- Workspace members are declared in root `Cargo.toml`. Secondary ecosystems exist in `web-client/` (Node/npm) and `ffi/dotnet/` (.NET).
+- Workspace members are declared in root `Cargo.toml`. A secondary .NET ecosystem exists in `ffi/dotnet/`.
 - Keep crate-local changes crate-local when possible.
 - Use targeted commands during iteration (e.g., `cargo test -p <crate>`), then run relevant `xtask` checks.
 - Treat lockfile and cross-crate dependency updates as intentional, reviewable changes.

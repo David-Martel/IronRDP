@@ -194,11 +194,6 @@ strip = "symbols"
 codegen-units = 1
 lto = true
 
-[profile.production-wasm]
-inherits = "release"
-opt-level = "s"
-lto = true
-
 [profile.test.package.proptest]
 opt-level = 3
 

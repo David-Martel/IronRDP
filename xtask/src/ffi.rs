@@ -5,26 +5,11 @@ use anyhow::Context as _;
 
 use crate::prelude::*;
 
-#[cfg(target_os = "windows")]
 const OUTPUT_LIB_NAME: &str = "ironrdp.dll";
-#[cfg(target_os = "linux")]
-const OUTPUT_LIB_NAME: &str = "libironrdp.so";
-#[cfg(target_os = "macos")]
-const OUTPUT_LIB_NAME: &str = "libironrdp.dylib";
 
-#[cfg(target_os = "windows")]
 const DOTNET_NATIVE_LIB_NAME: &str = "DevolutionsIronRdp.dll";
-#[cfg(target_os = "linux")]
-const DOTNET_NATIVE_LIB_NAME: &str = "libDevolutionsIronRdp.so";
-#[cfg(target_os = "macos")]
-const DOTNET_NATIVE_LIB_NAME: &str = "libDevolutionsIronRdp.dylib";
 
-#[cfg(target_os = "windows")]
 const DOTNET_NATIVE_LIB_PATH: &str = "dependencies/runtimes/win-x64/native/";
-#[cfg(target_os = "linux")]
-const DOTNET_NATIVE_LIB_PATH: &str = "dependencies/runtimes/linux-x64/native/";
-#[cfg(target_os = "macos")]
-const DOTNET_NATIVE_LIB_PATH: &str = "dependencies/runtimes/osx-x64/native/";
 
 pub(crate) fn install(sh: &Shell) -> anyhow::Result<()> {
     let _s = Section::new("FFI-INSTALL");

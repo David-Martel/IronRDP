@@ -267,7 +267,6 @@ pub(crate) fn query_volume_information(
         Some(file) => {
             if let Ok(statvfs) = nix::sys::statvfs::fstatvfs(file.as_fd()) {
                 if FileSystemInformationClassLevel::FILE_FS_FULL_SIZE_INFORMATION == req_inner.fs_info_class_lvl {
-                    #[cfg_attr(target_os = "macos", expect(clippy::unnecessary_fallible_conversions))]
                     let info = FileFsFullSizeInformation {
                         total_alloc_units: i64::try_from(statvfs.blocks()).unwrap(),
                         caller_available_alloc_units: i64::try_from(statvfs.blocks_available()).unwrap(),
@@ -331,7 +330,6 @@ pub(crate) fn query_volume_information(
                         RdpdrPdu::ClientDriveQueryVolumeInformationResponse(
                             ClientDriveQueryVolumeInformationResponse {
                                 device_io_reply: DeviceIoResponse::new(req_inner.device_io_request, NtStatus::SUCCESS),
-                                #[cfg_attr(target_os = "macos", expect(clippy::unnecessary_fallible_conversions))]
                                 buffer: Some(FileSystemInformationClass::FileFsSizeInformation(
                                     FileFsSizeInformation {
                                         total_alloc_units: i64::try_from(statvfs.blocks()).unwrap(),
