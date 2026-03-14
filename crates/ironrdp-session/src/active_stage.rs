@@ -8,7 +8,7 @@ use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_dvc::{DrdynvcClient, DvcProcessor, DynamicVirtualChannel};
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::geometry::InclusiveRectangle;
-use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
+use ironrdp_pdu::input::fast_path::{FastPathInputEvent, FastPathInputRef};
 use ironrdp_pdu::rdp::client_info::CompressionType as PduCompressionType;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
@@ -98,8 +98,7 @@ impl ActiveStage {
         let mut output = Vec::with_capacity(2);
 
         // Encoding fastpath response frame
-        // PERF: unnecessary copy
-        let fastpath_input = FastPathInput::new(events.to_vec()).map_err(SessionError::decode)?;
+        let fastpath_input = FastPathInputRef::new(events).map_err(SessionError::decode)?;
         let frame = ironrdp_core::encode_vec(&fastpath_input).map_err(SessionError::encode)?;
         output.push(ActiveStageOutput::ResponseFrame(frame));
 

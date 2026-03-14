@@ -18,13 +18,12 @@ test = false
 
 [features]
 default = []
-std = []
+std = ["ironrdp-core/std", "ironrdp-pdu/std"]
 
 [dependencies]
 ironrdp-core = { path = "../ironrdp-core", version = "0.1" } # public
-ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.7", features = ["alloc", "std"] } # public
+ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.7", features = ["alloc"] } # public
 bitflags = "2.9"
 
 [lints]
 workspace = true
-

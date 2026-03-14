@@ -44,6 +44,7 @@ pub fn load(properties: &mut PropertySet, input: &str) -> Result<(), Vec<Error>>
     let mut errors = Vec::new();
 
     for (idx, line) in input.lines().enumerate() {
+        let line_number = idx.saturating_add(1);
         let mut split = line.splitn(3, ':');
 
         if let (Some(key), Some(ty), Some(value)) = (split.next(), split.next(), split.next()) {
@@ -57,7 +58,7 @@ pub fn load(properties: &mut PropertySet, input: &str) -> Result<(), Vec<Error>>
                                 ty: ty.to_owned(),
                                 value: value.to_owned(),
                             },
-                            line: idx,
+                            line: line_number,
                         });
                     }
                 }
@@ -67,14 +68,14 @@ pub fn load(properties: &mut PropertySet, input: &str) -> Result<(), Vec<Error>>
                 _ => {
                     errors.push(Error {
                         kind: ErrorKind::UnknownType { ty: ty.to_owned() },
-                        line: idx,
+                        line: line_number,
                     });
                 }
             }
         } else {
             errors.push(Error {
                 kind: ErrorKind::MalformedLine { line: line.to_owned() },
-                line: idx,
+                line: line_number,
             })
         }
     }
