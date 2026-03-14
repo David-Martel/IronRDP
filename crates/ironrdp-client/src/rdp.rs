@@ -1,38 +1,41 @@
+//! Connection setup and reconnect policy for the native client.
+//!
+//! This module owns transport establishment, gateway/WebSocket/TLS upgrade,
+//! static and dynamic channel wiring, and top-level reconnect behavior.
+//! The live session loop itself lives in [`crate::session_driver`].
+
 use core::num::NonZeroU16;
 use std::sync::Arc;
 
 use ironrdp::cliprdr::backend::{ClipboardMessage, CliprdrBackendFactory};
-use ironrdp::connector::connection_activation::ConnectionActivationState;
 use ironrdp::connector::{ConnectionResult, ConnectorResult};
 use ironrdp::displaycontrol::client::DisplayControlClient;
-use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 #[cfg(windows)]
 use ironrdp::dvc::DvcProcessor as _;
 use ironrdp::echo::client::EchoClient;
-use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::graphics::pointer::DecodedPointer;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::{PduResult, pdu_other_err};
-use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
+use ironrdp::session::{GracefulDisconnectReason, SessionResult};
 use ironrdp::svc::SvcMessage;
-use ironrdp::{cliprdr, connector, rdpdr, rdpsnd, session};
+use ironrdp::{cliprdr, connector, rdpdr, rdpsnd};
 use ironrdp_core::WriteBuf;
 #[cfg(windows)]
 use ironrdp_dvc_com_plugin::load_dvc_plugin;
 use ironrdp_dvc_pipe_proxy::DvcNamedPipeProxy;
 use ironrdp_rdpsnd_native::cpal;
+use ironrdp_tokio::FramedWrite;
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
-use ironrdp_tokio::{FramedWrite, single_sequence_step_read, split_tokio_framed};
 use rdpdr::NoopRdpdrBackend;
 use smallvec::SmallVec;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 use winit::event_loop::EventLoopProxy;
 
 use crate::config::{Config, RDCleanPathConfig};
+use crate::session_driver::{RdpControlFlow, run_active_session};
 
 #[derive(Debug)]
 pub enum RdpOutputEvent {
@@ -147,7 +150,7 @@ impl RdpClient {
                 }
             };
 
-            match active_session(
+            match run_active_session(
                 framed,
                 connection_result,
                 &self.event_loop_proxy,
@@ -170,11 +173,6 @@ impl RdpClient {
             }
         }
     }
-}
-
-enum RdpControlFlow {
-    ReconnectWithNewSize { width: u16, height: u16 },
-    TerminatedGracefully(GracefulDisconnectReason),
 }
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite {}
@@ -567,224 +565,4 @@ where
 
         Ok((upgraded, server_public_key))
     }
-}
-
-async fn active_session(
-    framed: UpgradedFramed,
-    connection_result: ConnectionResult,
-    event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
-    input_event_receiver: &mut mpsc::UnboundedReceiver<RdpInputEvent>,
-) -> SessionResult<RdpControlFlow> {
-    let (mut reader, mut writer) = split_tokio_framed(framed);
-    let mut image = DecodedImage::new(
-        PixelFormat::RgbA32,
-        connection_result.desktop_size.width,
-        connection_result.desktop_size.height,
-    );
-
-    let mut active_stage = ActiveStage::new(connection_result);
-
-    let disconnect_reason = 'outer: loop {
-        let outputs = tokio::select! {
-            frame = reader.read_pdu() => {
-                let (action, payload) = frame.map_err(|e| session::custom_err!("read frame", e))?;
-                trace!(?action, frame_length = payload.len(), "Frame received");
-
-                active_stage.process(&mut image, action, &payload)?
-            }
-            input_event = input_event_receiver.recv() => {
-                let input_event = input_event.ok_or_else(|| session::general_err!("GUI is stopped"))?;
-
-                match input_event {
-                    RdpInputEvent::Resize { width, height, scale_factor, physical_size } => {
-                        trace!(width, height, "Resize event");
-                        let width = u32::from(width);
-                        let height = u32::from(height);
-                        // TODO: Make adjust_display_size take and return width and height as u16.
-                        // From the function's doc comment, the width and height values must be less than or equal to 8192 pixels.
-                        // Therefore, we can remove unnecessary casts from u16 to u32 and back.
-                        let (width, height) = MonitorLayoutEntry::adjust_display_size(width, height);
-                        debug!(width, height, "Adjusted display size");
-                        if let Some(response_frame) = active_stage.encode_resize(width, height, Some(scale_factor), physical_size) {
-                            vec![ActiveStageOutput::ResponseFrame(response_frame?)]
-                        } else {
-                            // TODO(#271): use the "auto-reconnect cookie": https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/15b0d1c9-2891-4adb-a45e-deb4aeeeab7c
-                            debug!("Reconnecting with new size");
-                            let width = u16::try_from(width).expect("always in the range");
-                            let height = u16::try_from(height).expect("always in the range");
-                            return Ok(RdpControlFlow::ReconnectWithNewSize { width, height })
-                        }
-                    },
-                    RdpInputEvent::FastPath(events) => {
-                        trace!(?events);
-                        active_stage.process_fastpath_input(&mut image, &events)?
-                    }
-                    RdpInputEvent::Close => {
-                        active_stage.graceful_shutdown()?
-                    }
-                    RdpInputEvent::Clipboard(event) => {
-                        if let Some(cliprdr) = active_stage.get_svc_processor::<cliprdr::CliprdrClient>() {
-                            if let Some(svc_messages) = match event {
-                                ClipboardMessage::SendInitiateCopy(formats) => {
-                                    Some(cliprdr.initiate_copy(&formats)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendFormatData(response) => {
-                                    Some(cliprdr.submit_format_data(response)
-                                    .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendInitiatePaste(format) => {
-                                    Some(cliprdr.initiate_paste(format)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendLockClipboard { clip_data_id } => {
-                                    Some(cliprdr.lock_clipboard(clip_data_id)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendUnlockClipboard { clip_data_id } => {
-                                    Some(cliprdr.unlock_clipboard(clip_data_id)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendFileContentsRequest(request) => {
-                                    Some(cliprdr.request_file_contents(request)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendFileContentsResponse(response) => {
-                                    Some(cliprdr.submit_file_contents(response)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::Error(e) => {
-                                    error!("Clipboard backend error: {}", e);
-                                    None
-                                }
-                            } {
-                                let frame = active_stage.process_svc_processor_messages(svc_messages)?;
-                                // Send the messages to the server
-                                vec![ActiveStageOutput::ResponseFrame(frame)]
-                            } else {
-                                // No messages to send to the server
-                                Vec::new()
-                            }
-                        } else  {
-                            warn!("Clipboard event received, but Cliprdr is not available");
-                            Vec::new()
-                        }
-                    }
-                    RdpInputEvent::SendDvcMessages { channel_id, messages } => {
-                        trace!(channel_id, ?messages, "Send DVC messages");
-
-                        let frame = active_stage.encode_dvc_messages(messages)?;
-                        vec![ActiveStageOutput::ResponseFrame(frame)]
-                    }
-                }
-            }
-        };
-
-        for out in outputs {
-            match out {
-                ActiveStageOutput::ResponseFrame(frame) => writer
-                    .write_all(&frame)
-                    .await
-                    .map_err(|e| session::custom_err!("write response", e))?,
-                ActiveStageOutput::GraphicsUpdate(_region) => {
-                    let buffer: Vec<u32> = image
-                        .data()
-                        .chunks_exact(4)
-                        .map(|pixel| {
-                            let r = pixel[0];
-                            let g = pixel[1];
-                            let b = pixel[2];
-                            u32::from_be_bytes([0, r, g, b])
-                        })
-                        .collect();
-
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::Image {
-                            buffer,
-                            width: NonZeroU16::new(image.width())
-                                .ok_or_else(|| session::general_err!("width is zero"))?,
-                            height: NonZeroU16::new(image.height())
-                                .ok_or_else(|| session::general_err!("height is zero"))?,
-                        })
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::PointerDefault => {
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::PointerDefault)
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::PointerHidden => {
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::PointerHidden)
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::PointerPosition { x, y } => {
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::PointerPosition { x, y })
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::PointerBitmap(pointer) => {
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::PointerBitmap(pointer))
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::DeactivateAll(mut connection_activation) => {
-                    // Execute the Deactivation-Reactivation Sequence:
-                    // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
-                    debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
-                    let mut buf = WriteBuf::new();
-                    'activation_seq: loop {
-                        let written = single_sequence_step_read(&mut reader, &mut *connection_activation, &mut buf)
-                            .await
-                            .map_err(|e| session::custom_err!("read deactivation-reactivation sequence step", e))?;
-
-                        if written.size().is_some() {
-                            writer.write_all(buf.filled()).await.map_err(|e| {
-                                session::custom_err!("write deactivation-reactivation sequence step", e)
-                            })?;
-                        }
-
-                        if let ConnectionActivationState::Finalized {
-                            io_channel_id,
-                            user_channel_id,
-                            desktop_size,
-                            share_id,
-                            enable_server_pointer,
-                            pointer_software_rendering,
-                        } = connection_activation.connection_activation_state()
-                        {
-                            debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
-                            // Update image size with the new desktop size.
-                            image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
-                            // Update the active stage with the new channel IDs and pointer settings.
-                            active_stage.set_fastpath_processor(
-                                fast_path::ProcessorBuilder {
-                                    io_channel_id,
-                                    user_channel_id,
-                                    share_id,
-                                    enable_server_pointer,
-                                    pointer_software_rendering,
-                                    bulk_decompressor: None,
-                                }
-                                .build(),
-                            );
-                            active_stage.set_share_id(share_id);
-                            active_stage.set_enable_server_pointer(enable_server_pointer);
-                            break 'activation_seq;
-                        }
-                    }
-                }
-                ActiveStageOutput::MultitransportRequest(pdu) => {
-                    debug!(
-                        request_id = pdu.request_id,
-                        requested_protocol = ?pdu.requested_protocol,
-                        "Multitransport request received (UDP transport not implemented)"
-                    );
-                }
-                ActiveStageOutput::Terminate(reason) => break 'outer reason,
-            }
-        }
-    };
-
-    Ok(RdpControlFlow::TerminatedGracefully(disconnect_reason))
 }

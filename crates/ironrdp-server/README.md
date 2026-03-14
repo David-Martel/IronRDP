@@ -24,6 +24,17 @@ Custom logic for your RDP server can be added by implementing these traits:
  - `RdpServerInputHandler` - callbacks used when the server receives input events from a client
  - `RdpServerDisplay`      - notifies the server of display updates
 
+## Internal layout
+
+The Tokio server is now split into a few coarse responsibilities:
+
+- `builder.rs`: typed builder for assembling `RdpServer` instances.
+- `server.rs`: listener lifecycle, transport/security bootstrap, and channel registration.
+- `session_driver.rs`: accepted-client runtime, including input dispatch, display updates, server events, and deactivation/reactivation handling.
+- `display.rs` / `handler.rs`: integration traits for host display and input backends.
+
+That split keeps the long-lived listener/bootstrap path separate from the per-client session state machine, which reduces coupling between connection setup and runtime event handling.
+
 This crate is part of the [IronRDP] project.
 
 ## Echo RTT probes (feature `echo`)

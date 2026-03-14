@@ -18,6 +18,8 @@ mod handler;
 #[cfg(feature = "helper")]
 mod helper;
 mod server;
+/// Accepted-client session runtime for the Tokio server implementation.
+mod session_driver;
 mod sound;
 
 // FIXME: too much wildcards here.

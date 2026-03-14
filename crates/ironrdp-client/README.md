@@ -6,6 +6,19 @@ This is a a full-fledged RDP client based on IronRDP crates suite, and implement
 non-blocking, asynchronous I/O. Portability is achieved by using softbuffer for rendering
 and winit for windowing.
 
+## Internal layout
+
+The native client is split into a few coarse responsibilities:
+
+- `main.rs`: CLI bootstrap, logging, Tokio runtime startup, and top-level app wiring.
+- `app.rs`: window creation, rendering, and translation of `winit` events into client input events.
+- `rdp.rs`: connection establishment, transport upgrades, channel wiring, and reconnect policy.
+- `session_driver.rs`: active-session runtime that drives an established connection and translates
+  protocol output into window events.
+
+That split keeps the live session loop separate from connection setup, which makes the runtime easier
+to reason about and reduces coupling between transport code and window/rendering code.
+
 ## Sample usage
 
 ```shell
@@ -45,4 +58,3 @@ This crate is part of the [IronRDP] project.
 
 [IronRDP]: https://github.com/Devolutions/IronRDP
 [awakecoding-repository]: https://github.com/awakecoding/wireshark-rdp#sslkeylogfile
-

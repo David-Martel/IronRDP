@@ -1,3 +1,11 @@
+//! Native windowing and rendering bridge for the IronRDP client.
+//!
+//! This module owns the `winit` application handler, softbuffer surface management,
+//! and translation from desktop-window input into [`RdpInputEvent`] values consumed
+//! by the active session driver.
+//!
+//! [`RdpInputEvent`]: crate::rdp::RdpInputEvent
+
 #![allow(clippy::print_stderr, clippy::print_stdout)] // allowed in this module only
 
 use core::num::NonZeroU32;
@@ -5,25 +13,45 @@ use core::time::Duration;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Context as _;
-use raw_window_handle::{DisplayHandle, HasDisplayHandle as _};
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, PhysicalSize};
 use winit::event::{self, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::platform::scancode::PhysicalKeyExtScancode as _;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes};
 
 use crate::rdp::{RdpInputEvent, RdpOutputEvent};
 
-type WindowSurface = (Arc<Window>, softbuffer::Surface<DisplayHandle<'static>, Arc<Window>>);
+struct WindowState {
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    context: softbuffer::Context<Arc<Window>>,
+    window: Arc<Window>,
+}
+
+impl WindowState {
+    fn new(window: Arc<Window>) -> anyhow::Result<Self> {
+        let context = softbuffer::Context::new(Arc::clone(&window))
+            .map_err(|e| anyhow::anyhow!("unable to initialize softbuffer context: {e}"))?;
+        let surface = softbuffer::Surface::new(&context, Arc::clone(&window))
+            .map_err(|e| anyhow::anyhow!("unable to initialize softbuffer surface: {e}"))?;
+
+        Ok(Self {
+            surface,
+            context,
+            window,
+        })
+    }
+
+    fn surface_mut(&mut self) -> &mut softbuffer::Surface<Arc<Window>, Arc<Window>> {
+        &mut self.surface
+    }
+}
 
 pub struct App {
     input_event_sender: mpsc::UnboundedSender<RdpInputEvent>,
-    context: softbuffer::Context<DisplayHandle<'static>>,
-    window: Option<WindowSurface>,
+    window_state: Option<WindowState>,
     buffer: Vec<u32>,
     buffer_size: (u16, u16),
     input_database: ironrdp::input::Database,
@@ -32,25 +60,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        event_loop: &EventLoop<RdpOutputEvent>,
-        input_event_sender: &mpsc::UnboundedSender<RdpInputEvent>,
-    ) -> anyhow::Result<Self> {
-        // SAFETY: We drop the softbuffer context right before the event loop is stopped, thus making this safe.
-        // FIXME: This is not a sufficient proof and the API is actually unsound as-is.
-        let display_handle = unsafe {
-            core::mem::transmute::<DisplayHandle<'_>, DisplayHandle<'static>>(
-                event_loop.display_handle().context("get display handle")?,
-            )
-        };
-        let context = softbuffer::Context::new(display_handle)
-            .map_err(|e| anyhow::anyhow!("unable to initialize softbuffer context: {e}"))?;
-
+    pub fn new(input_event_sender: &mpsc::UnboundedSender<RdpInputEvent>) -> anyhow::Result<Self> {
         let input_database = ironrdp::input::Database::new();
         Ok(Self {
             input_event_sender: input_event_sender.clone(),
-            context,
-            window: None,
+            window_state: None,
             buffer: Vec::new(),
             buffer_size: (0, 0),
             input_database,
@@ -63,9 +77,10 @@ impl App {
         let Some(size) = self.last_size.take() else {
             return;
         };
-        let Some((window, _)) = self.window.as_mut() else {
+        let Some(window_state) = self.window_state.as_ref() else {
             return;
         };
+        let window = &window_state.window;
         #[expect(clippy::as_conversions, reason = "casting f64 to u32")]
         let scale_factor = (window.scale_factor() * 100.0) as u32;
 
@@ -88,10 +103,11 @@ impl App {
         if self.buffer.is_empty() {
             return;
         }
-        let Some((_, surface)) = self.window.as_mut() else {
+        let Some(window_state) = self.window_state.as_mut() else {
             return;
         };
-        let mut sb_buffer = surface.buffer_mut().expect("surface buffer");
+        let _keep_context_alive = &window_state.context;
+        let mut sb_buffer = window_state.surface_mut().buffer_mut().expect("surface buffer");
         sb_buffer.copy_from_slice(self.buffer.as_slice());
         sb_buffer.present().expect("buffer present");
     }
@@ -115,8 +131,15 @@ impl ApplicationHandler<RdpOutputEvent> for App {
         match event_loop.create_window(window_attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
-                let surface = softbuffer::Surface::new(&self.context, Arc::clone(&window)).expect("surface");
-                self.window = Some((window, surface));
+                match WindowState::new(window) {
+                    Ok(window_state) => {
+                        self.window_state = Some(window_state);
+                    }
+                    Err(error) => {
+                        error!(%error, "Failed to create drawing surface");
+                        event_loop.exit();
+                    }
+                }
             }
             Err(error) => {
                 error!(%error, "Failed to create window");
@@ -126,9 +149,10 @@ impl ApplicationHandler<RdpOutputEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: winit::window::WindowId, event: WindowEvent) {
-        let Some((window, _)) = self.window.as_mut() else {
+        let Some(window_state) = self.window_state.as_mut() else {
             return;
         };
+        let window = Arc::clone(&window_state.window);
         if window_id != window.id() {
             return;
         }
@@ -338,16 +362,18 @@ impl ApplicationHandler<RdpOutputEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: RdpOutputEvent) {
-        let Some((window, surface)) = self.window.as_mut() else {
+        let Some(window_state) = self.window_state.as_mut() else {
             return;
         };
+        let window = Arc::clone(&window_state.window);
         match event {
             RdpOutputEvent::Image { buffer, width, height } => {
                 trace!(width = ?width, height = ?height, "Received image with size");
                 trace!(window_physical_size = ?window.inner_size(), "Drawing image to the window with size");
                 self.buffer_size = (width.get(), height.get());
                 self.buffer = buffer;
-                surface
+                window_state
+                    .surface_mut()
                     .resize(NonZeroU32::from(width), NonZeroU32::from(height))
                     .expect("surface resize");
 
