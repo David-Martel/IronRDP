@@ -2,7 +2,7 @@
 name = "ironrdp-rdcleanpath"
 version = "0.2.1"
 readme = "README.md"
-description = "RDCleanPath PDU structure used by IronRDP web client and Devolutions Gateway"
+description = "RDCleanPath PDU structure used by Devolutions Gateway and related gateway integrations"
 edition.workspace = true
 rust-version = "1.89"
 license.workspace = true
@@ -21,4 +21,3 @@ der = { version = "0.7", features = ["alloc", "derive"] } # public
 
 [lints]
 workspace = true
-

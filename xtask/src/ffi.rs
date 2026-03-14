@@ -6,10 +6,9 @@ use anyhow::Context as _;
 use crate::prelude::*;
 
 const OUTPUT_LIB_NAME: &str = "ironrdp.dll";
-
 const DOTNET_NATIVE_LIB_NAME: &str = "DevolutionsIronRdp.dll";
-
 const DOTNET_NATIVE_LIB_PATH: &str = "dependencies/runtimes/win-x64/native/";
+const FFI_RELEASE_PROFILE: &str = "production-ffi";
 
 pub(crate) fn install(sh: &Shell) -> anyhow::Result<()> {
     let _s = Section::new("FFI-INSTALL");
@@ -26,11 +25,11 @@ pub(crate) fn build_dynamic_lib(sh: &Shell, release: bool) -> anyhow::Result<()>
 
     let mut args = vec!["build", "--package", "ffi"];
     if release {
-        args.push("--release");
+        args.extend(["--profile", FFI_RELEASE_PROFILE]);
     }
     sh.cmd("cargo").args(&args).run()?;
 
-    let profile_dir = if release { "release" } else { "debug" };
+    let profile_dir = if release { FFI_RELEASE_PROFILE } else { "debug" };
 
     let root_dir = sh.current_dir();
     let target_dir = root_dir.join("target");

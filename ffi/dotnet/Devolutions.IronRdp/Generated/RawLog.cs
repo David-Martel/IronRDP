@@ -16,15 +16,8 @@ public partial struct Log
 {
     private const string NativeLib = "DevolutionsIronRdp";
 
-    /// <summary>
-    /// # Panics
-    /// </summary>
-    /// <remarks>
-    /// - Panics if log directory creation fails.
-    /// - Panics if tracing initialization fails.
-    /// </remarks>
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "Log_init_with_env", ExactSpelling = true)]
-    public static unsafe extern void InitWithEnv();
+    public static unsafe extern LogFfiResultVoidBoxIronRdpError InitWithEnv();
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "Log_destroy", ExactSpelling = true)]
     public static unsafe extern void Destroy(Log* self);

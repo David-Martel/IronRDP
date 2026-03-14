@@ -85,9 +85,13 @@ fn main() -> anyhow::Result<()> {
             check::tests_run(&sh)?;
             check::lints(&sh)?;
             fuzz::run(&sh, None, None)?;
-            ffi::install(&sh)?;
-            ffi::build_dynamic_lib(&sh, false)?;
-            ffi::build_bindings(&sh, false)?;
+            if cfg!(windows) {
+                ffi::install(&sh)?;
+                ffi::build_dynamic_lib(&sh, false)?;
+                ffi::build_bindings(&sh, false)?;
+            } else {
+                println!("Skip FFI steps on non-Windows");
+            }
             check::lock_files(&sh)?;
         }
         Action::Clean => clean::workspace(&sh)?,

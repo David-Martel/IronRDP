@@ -10,7 +10,8 @@ public static class Connection
         CliprdrBackendFactory? factory, int port = 3389)
     {
         var client = await CreateTcpConnection(serverName, port);
-        string clientAddr = client.Client.LocalEndPoint.ToString();
+        string clientAddr = client.Client.LocalEndPoint?.ToString()
+            ?? throw new IronRdpLibException(IronRdpLibExceptionType.ConnectionFailed, "TCP client local endpoint is unavailable.");
         System.Diagnostics.Debug.WriteLine(clientAddr);
 
         var framed = new Framed<NetworkStream>(client.GetStream());
@@ -20,24 +21,37 @@ public static class Connection
         ConnectionHelpers.SetupConnector(connector, config, factory);
 
         await ConnectBegin(framed, connector);
-        var (serverPublicKey, framedSsl) = await SecurityUpgrade(framed, connector);
+        var (serverPublicKey, framedSsl) = await SecurityUpgrade(framed, connector, serverName);
         var result = await ConnectionHelpers.ConnectFinalize(serverName, connector, serverPublicKey, framedSsl);
 
         return (result, framedSsl);
     }
 
-    private static async Task<(byte[], Framed<SslStream>)> SecurityUpgrade(Framed<NetworkStream> framed,
-        ClientConnector connector)
+    private static async Task<(byte[], Framed<SslStream>)> SecurityUpgrade(
+        Framed<NetworkStream> framed,
+        ClientConnector connector,
+        string serverName)
     {
         var (streamRequireUpgrade, _) = framed.GetInner();
-        var promise = new TaskCompletionSource<byte[]>();
-        var sslStream = new SslStream(streamRequireUpgrade, false, (_, certificate, _, _) =>
+        var promise = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sslStream = new SslStream(streamRequireUpgrade, false, (_, certificate, _, sslPolicyErrors) =>
         {
-            promise.SetResult(certificate!.GetPublicKey());
-            return true;
+            if (certificate is not null)
+            {
+                promise.TrySetResult(certificate.GetPublicKey());
+            }
+            else
+            {
+                promise.TrySetException(new IronRdpLibException(
+                    IronRdpLibExceptionType.ConnectionFailed,
+                    "TLS server certificate is unavailable."));
+            }
+
+            return sslPolicyErrors == SslPolicyErrors.None;
         });
         await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions()
         {
+            TargetHost = serverName,
             AllowTlsResume = false
         });
         var serverPublicKey = await promise.Task;
@@ -89,7 +103,7 @@ public static class Connection
                 }
                 else
                 {
-                    throw new Exception($"Unimplemented protocol: {protocol}");
+                    throw new InvalidOperationException($"Unimplemented protocol: {protocol}");
                 }
             }
             else if (state.IsCompleted())

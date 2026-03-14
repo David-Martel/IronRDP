@@ -20,7 +20,7 @@ pub mod ffi {
     use crate::clipboard::ffi::Cliprdr;
     use crate::dvc::dvc_pipe_proxy_message_queue::DvcPipeProxyMessageInner;
     use crate::dvc::ffi::DvcPipeProxyConfig;
-    use crate::error::ValueConsumedError;
+    use crate::error::{GenericError, ValueConsumedError};
     use crate::error::ffi::{IronRdpError, IronRdpErrorKind};
     use crate::pdu::ffi::WriteBuf;
 
@@ -86,7 +86,9 @@ pub mod ffi {
                     connector.attach_static_channel(ironrdp::dvc::DrdynvcClient::new());
                     connector
                         .get_static_channel_processor_mut::<ironrdp::dvc::DrdynvcClient>()
-                        .expect("DrdynvcClient should be initialized above")
+                        .ok_or_else(|| -> Box<IronRdpError> {
+                            GenericError(anyhow::anyhow!("unable to initialize drdynvc static channel")).into()
+                        })?
                 }
             };
 

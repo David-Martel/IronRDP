@@ -1,35 +1,38 @@
-use core::error::Error;
-use std::sync::Once;
+use std::sync::OnceLock;
 
-static INIT_LOG: Once = Once::new();
+static INIT_LOG: OnceLock<Result<(), String>> = OnceLock::new();
 
 const IRONRDP_LOG_PATH: &str = "IRONRDP_LOG_PATH";
 const IRONRDP_LOG: &str = "IRONRDP_LOG";
 
 #[diplomat::bridge]
 pub mod ffi {
+    use anyhow::anyhow;
+
     use super::{INIT_LOG, IRONRDP_LOG_PATH, setup_logging};
+    use crate::error::GenericError;
+    use crate::error::ffi::IronRdpError;
 
     #[diplomat::opaque]
     pub struct Log;
 
     impl Log {
-        /// # Panics
-        ///
-        /// - Panics if log directory creation fails.
-        /// - Panics if tracing initialization fails.
-        // FIXME: We should return an error instead, because panicking at the FFI boundary is unsafe.
-        pub fn init_with_env() {
-            INIT_LOG.call_once(|| {
+        pub fn init_with_env() -> Result<(), Box<IronRdpError>> {
+            let init_result = INIT_LOG.get_or_init(|| {
                 let log_file = std::env::var(IRONRDP_LOG_PATH).ok();
                 let log_file = log_file.as_deref();
-                setup_logging(log_file).expect("failed to setup logging");
+                setup_logging(log_file).map_err(|error| error.to_string())
             });
+
+            match init_result {
+                Ok(()) => Ok(()),
+                Err(error) => Err(GenericError(anyhow!("{error}")).into()),
+            }
         }
     }
 }
 
-fn setup_logging(log_file_path: Option<&str>) -> Result<(), Box<dyn Error>> {
+fn setup_logging(log_file_path: Option<&str>) -> anyhow::Result<()> {
     use std::fs::{OpenOptions, create_dir_all};
     use std::path::PathBuf;
 
@@ -53,10 +56,7 @@ fn setup_logging(log_file_path: Option<&str>) -> Result<(), Box<dyn Error>> {
             .with_ansi(false)
             .with_writer(file)
             .compact();
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .try_init()?;
+        tracing_subscriber::registry().with(env_filter).with(fmt_layer).try_init()?;
     } else {
         let fmt_layer = tracing_subscriber::fmt::layer()
             .compact()
@@ -64,10 +64,7 @@ fn setup_logging(log_file_path: Option<&str>) -> Result<(), Box<dyn Error>> {
             .with_line_number(true)
             .with_thread_ids(true)
             .with_target(false);
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .try_init()?;
+        tracing_subscriber::registry().with(env_filter).with(fmt_layer).try_init()?;
     };
 
     Ok(())

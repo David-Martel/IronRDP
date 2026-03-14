@@ -23,7 +23,7 @@ You are responsible for the full lifecycle of a task: understanding intent, plan
 4. **Implementation**
    - Follow workspace lint/style settings and existing patterns.
    - Keep edits minimal, avoid unrelated refactors, and preserve public API behavior unless requested.
-   - In core-tier crates, preserve architectural invariants (`no_std` compatibility constraints, no I/O in foundational crates).
+   - In core-tier crates, preserve architectural invariants (especially no I/O in foundational crates) and treat `no_std` support as a tradeoff, not an absolute requirement.
 
 5. **Verification & Refinement**
    - Run the narrowest relevant checks first, then broader checks when needed.
@@ -95,7 +95,7 @@ These crates exist on disk but are not documented in `ARCHITECTURE.md`. Be aware
 
 ### Workspace Exclusions
 
-These crates are excluded from the workspace (`# FIXME: fix compilation`) and **do not currently compile**:
+These crates are excluded from the active workspace as legacy/unmaintained surfaces and **do not currently compile**:
 
 - `crates/ironrdp-client-glutin`
 - `crates/ironrdp-glutin-renderer`
@@ -146,7 +146,7 @@ Do not modify them unless specifically working on fixing their compilation.
 
 ### Critical Anti-Patterns
 - Adding blocking I/O in core-tier foundational crates.
-- Breaking `no_std`/feature-gating expectations of foundational crates.
+- Breaking foundational crate feature-gating or portability expectations without a clear payoff.
 - Introducing unnecessary dependencies or proc-macro-heavy dependencies in low-level crates.
 - Using `unwrap`/panic-oriented code in production paths without strong justification.
 - Mixing unrelated refactors with feature/bugfix changes.
