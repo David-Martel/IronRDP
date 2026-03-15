@@ -34,6 +34,9 @@ The Tokio server is now split into a few coarse responsibilities:
 - `display.rs` / `handler.rs`: integration traits for host display and input backends.
 
 That split keeps the long-lived listener/bootstrap path separate from the per-client session state machine, which reduces coupling between connection setup and runtime event handling.
+The session driver is also the place where backlog handling, display-update dispatch,
+and resize-triggered reactivation are coordinated, so reliability and protocol tests
+for those paths should land close to that boundary rather than in the listener/bootstrap code.
 
 This crate is part of the [IronRDP] project.
 

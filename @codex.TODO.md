@@ -113,42 +113,45 @@ Status: done.
 Refs: `build.ps1`, `README.md`.
 Status: done.
 
+14. Native client frame presentation now reuses packed frame buffers instead of allocating a fresh packed buffer on every image update.
+Refs: `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`.
+Status: done.
+
+15. Native client Unicode text entry now uses `winit` IME commit events while suppressing conflicting raw key forwarding during composition.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/rdp.rs`.
+Status: done.
+
+16. Client/session/server documentation was updated to reflect the Windows-native runtime split, software presentation path, and current protocol/runtime responsibilities.
+Refs: `README.md`, `ARCHITECTURE.md`, `crates/ironrdp-client/README.md`, `crates/ironrdp-session/README.md`, `crates/ironrdp-server/README.md`.
+Status: done.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
 
-1. Eliminate the native client’s avoidable full-frame copy/repack churn.
-Refs: `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`.
-Why now:
-- this is the clearest CPU bottleneck on Intel systems
-- it affects both GPU-present and software-only machines
-- it should move perf more than speculative GPU work
-Done when:
-- frame conversion reuses buffers or hands off a reusable pixel buffer
-- per-frame heap churn is reduced measurably
-
-2. Finish native-client Unicode/IME input.
-Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
-Why now:
-- this is still one of the biggest Windows usability gaps vs `mstsc`
-- it matters more than deeper protocol refactors for real demos
-Done when:
-- `WindowEvent::Ime` is handled correctly
-- committed Unicode text input works in normal Windows use
-
-3. Add focused runtime tests for the newer client/server session seams.
+1. Add focused runtime tests for the newer client/server session seams.
 Refs: `crates/ironrdp-testsuite-extra`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Why now:
 - recent reliability changes need narrow tests, not just broad smoke coverage
+- the frame-buffer reuse and IME work now have unit coverage, but the server seam still needs integration coverage
 Done when:
 - backlog disconnect, display failure, and single-session behavior are pinned down
 
-4. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
+2. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
 Refs: `build.ps1`, emitted artifact manifests, remote deploy scripts to be added.
 Why now:
 - this turns the branch into a real product path instead of a local-only build
 Done when:
 - package output can be copied, launched, and verified remotely with one documented flow
+
+3. Add lightweight client frame-path diagnostics before deeper render changes.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
+Why now:
+- buffer reuse removes one obvious churn source, so the next step is to measure what remains
+- this is the lowest-risk way to decide whether software-path tuning is enough before GPU work
+Done when:
+- frame conversion and present timing can be sampled in traces
+- resize/reconnect churn is visible in logs or metrics
 
 ## Priority 0: Lock the Windows build contract
 
@@ -206,8 +209,8 @@ Effort: medium.
 Refs: `crates/ironrdp-server/src/encoder/bitmap.rs`, `crates/ironrdp-server/src/encoder/mod.rs`, `crates/ironrdp-server/src/session_driver.rs`.
 Effort: medium.
 
-4. Finish Unicode/IME input.
-Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
+4. Extend Unicode/IME coverage from unit tests into end-to-end Windows validation.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-testsuite-extra`, deployment/demo notes.
 Effort: medium.
 
 5. Finish reconnect/shutdown clarity.
@@ -219,8 +222,8 @@ Effort: medium.
 1. Remove avoidable client graphics-copy overhead.
 Refs: `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`.
 Problem:
-- the client still repacks a full decoded frame and then copies it again into `softbuffer`
-- this is likely the top CPU bottleneck on Intel machines
+- packed-frame allocation churn is fixed, but the client still copies the packed frame into `softbuffer`
+- the remaining full-frame copy is likely still the top CPU bottleneck on Intel machines
 Effort: medium.
 
 2. Add lightweight graphics/runtime diagnostics before deep render changes.
@@ -350,7 +353,7 @@ Effort: large.
 1. Lock the supported build matrix and artifact-class contract.
 2. Finish the `dtm-p1gen7` deploy-and-smoke-test path.
 3. Remove client graphics-copy overhead and add frame-path diagnostics.
-4. Finish Unicode/IME input and reconnect/shutdown clarity.
+4. Extend Unicode/IME validation into end-to-end Windows smoke coverage and finish reconnect/shutdown clarity.
 5. Add focused runtime tests for display failure, backlog disconnect, and single-session behavior.
 6. Measure portable vs host-tuned Intel builds on both primary machines.
 7. Revisit optional LLVM/lld, oneAPI, Intel iGPU, EGFX, and CUDA work only after the CPU/software baseline is measured and stable.

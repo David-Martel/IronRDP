@@ -54,6 +54,12 @@ optional overlays and are recorded in the emitted manifest rather than becoming
 hard dependencies for normal builds. Portable release artifacts remain distinct
 from host-tuned `-NativeCpu` builds.
 
+On the Windows-native branch, the current client path remains CPU/software-first:
+`winit` drives input and window lifecycle, `softbuffer` presents the decoded
+desktop, IME commit events are translated into Unicode fast-path input, and the
+packed presentation buffer is now reused across frames to reduce render-path
+heap churn before deeper GPU work is considered.
+
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 
 Example of utilizing IronRDP in a blocking, synchronous fashion.

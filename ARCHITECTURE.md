@@ -177,7 +177,11 @@ The current native client is intentionally split between:
 - `session_driver.rs` for the active-session runtime over an established transport.
 
 Keeping the active-session driver separate from connection establishment reduces coupling
-between GUI concerns, transport setup, and protocol/session processing.
+between GUI concerns, transport setup, and protocol/session processing. The Windows-native
+path also keeps text input and presentation concerns at the top of the stack: `app.rs`
+translates `winit` IME commit events into Unicode fast-path input, and `session_driver.rs`
+reuses packed presentation buffers so the software-render path can be optimized without
+leaking windowing assumptions into transport/session code.
 
 #### [`crates/ironrdp-cliprdr-native`](./crates/ironrdp-cliprdr-native)
 
