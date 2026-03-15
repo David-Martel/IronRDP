@@ -1,6 +1,6 @@
 use ironrdp_connector::connection_activation::ConnectionActivationSequence;
 use ironrdp_connector::legacy::SendDataIndicationCtx;
-use ironrdp_core::WriteBuf;
+use ironrdp_core::{Encode, WriteBuf};
 use ironrdp_dvc::{DrdynvcClient, DvcProcessor, DynamicVirtualChannel};
 use ironrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason, McsMessage};
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
@@ -213,6 +213,11 @@ impl Processor {
         .map_err(crate::legacy::map_error)?;
         Ok(written)
     }
+
+    /// Encodes a raw IO-channel PDU such as a multitransport response.
+    pub fn encode_io_channel<T: Encode>(&self, output: &mut WriteBuf, pdu: &T) -> SessionResult<usize> {
+        encode_io_channel_pdu(self.user_channel_id, self.io_channel_id, output, pdu)
+    }
 }
 
 /// Processes a vector of [`SvcMessage`] in preparation for sending them to the server on the `channel_id` channel.
@@ -223,4 +228,41 @@ impl Processor {
 /// The caller is responsible for ensuring that the `channel_id` corresponds to the correct channel.
 fn process_svc_messages(messages: Vec<SvcMessage>, channel_id: u16, initiator_id: u16) -> SessionResult<Vec<u8>> {
     client_encode_svc_messages(messages, channel_id, initiator_id).map_err(SessionError::encode)
+}
+
+fn encode_io_channel_pdu<T: Encode>(
+    initiator_id: u16,
+    channel_id: u16,
+    output: &mut WriteBuf,
+    pdu: &T,
+) -> SessionResult<usize> {
+    ironrdp_connector::legacy::encode_send_data_request(initiator_id, channel_id, pdu, output)
+        .map_err(crate::legacy::map_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_connector::legacy::decode_send_data_indication;
+    use ironrdp_core::{WriteBuf, decode};
+    use ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu;
+
+    use super::encode_io_channel_pdu;
+
+    #[test]
+    fn encode_io_channel_pdu_wraps_multitransport_response_on_global_channel() {
+        let mut output = WriteBuf::new();
+        let response = MultitransportResponsePdu::abort(42);
+
+        let written =
+            encode_io_channel_pdu(1003, 1001, &mut output, &response).expect("encode multitransport response");
+        assert!(written > 0);
+
+        let data_ctx = decode_send_data_indication(output.filled()).expect("decode send-data indication");
+        assert_eq!(data_ctx.initiator_id, 1003);
+        assert_eq!(data_ctx.channel_id, 1001);
+
+        let decoded = decode::<MultitransportResponsePdu>(data_ctx.user_data).expect("decode multitransport response");
+        assert_eq!(decoded.request_id, 42);
+        assert_eq!(decoded.hr_response, MultitransportResponsePdu::E_ABORT);
+    }
 }

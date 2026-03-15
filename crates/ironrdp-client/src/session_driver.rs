@@ -7,6 +7,9 @@
 //! owns the live-session driver and the reusable packed-frame buffer used by the
 //! software presentation path. It also emits lightweight frame-pack and reconnect
 //! diagnostics to guide the next render and transport optimization passes.
+//! Multitransport requests are currently answered explicitly with `E_ABORT` on the
+//! TCP control path so negotiation remains standards-complete until a real UDP
+//! sideband transport is implemented.
 
 use core::num::NonZeroU16;
 use std::time::Instant;
@@ -17,6 +20,7 @@ use ironrdp::connector::ConnectionResult;
 use ironrdp::connector::connection_activation::{ConnectionActivationSequence, ConnectionActivationState};
 use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::rdp::multitransport::MultitransportResponsePdu;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{self, ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
 use ironrdp_core::WriteBuf;
@@ -259,9 +263,17 @@ impl SessionDriver {
                 Ok(None)
             }
             ActiveStageOutput::MultitransportRequest(pdu) => {
+                let response = self
+                    .active_stage
+                    .encode_multitransport_response(&MultitransportResponsePdu::abort(pdu.request_id))?;
+                writer
+                    .write_all(&response)
+                    .await
+                    .map_err(|e| session::custom_err!("write multitransport response", e))?;
                 debug!(
                     request_id = pdu.request_id,
                     requested_protocol = ?pdu.requested_protocol,
+                    response = "E_ABORT",
                     "Multitransport request received (UDP transport not implemented)"
                 );
                 Ok(None)

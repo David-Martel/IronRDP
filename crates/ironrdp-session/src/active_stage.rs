@@ -11,7 +11,7 @@ use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::input::fast_path::{FastPathInputEvent, FastPathInputRef};
 use ironrdp_pdu::rdp::client_info::CompressionType as PduCompressionType;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
-use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
+use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu};
 use ironrdp_pdu::{Action, mcs};
 use ironrdp_svc::{SvcMessage, SvcProcessor, SvcProcessorMessages};
 use tracing::{debug, info};
@@ -210,6 +210,16 @@ impl ActiveStage {
     /// Send a pdu on the static global channel. Typically used to send input events
     pub fn encode_static(&self, output: &mut WriteBuf, pdu: ShareDataPdu) -> SessionResult<usize> {
         self.x224_processor.encode_static(output, pdu)
+    }
+
+    /// Fully encodes a multitransport response on the IO channel.
+    ///
+    /// This is used by client runtimes that want to keep negotiation explicit
+    /// even before a UDP sideband transport has been implemented.
+    pub fn encode_multitransport_response(&self, response: &MultitransportResponsePdu) -> SessionResult<Vec<u8>> {
+        let mut frame = WriteBuf::new();
+        self.x224_processor.encode_io_channel(&mut frame, response)?;
+        Ok(frame.into_inner())
     }
 
     pub fn get_svc_processor<T: SvcProcessor + 'static>(&mut self) -> Option<&T> {

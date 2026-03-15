@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use clap::Parser;
 use clap::clap_derive::ValueEnum;
 use ironrdp::connector::{self, Credentials};
+use ironrdp::pdu::gcc::MultiTransportFlags;
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp_mstsgu::GwConnectTarget;
@@ -90,6 +91,35 @@ fn compression_type_from_level(level: u32) -> anyhow::Result<ironrdp::pdu::rdp::
         2 => Ok(CompressionType::Rdp6),
         3 => Ok(CompressionType::Rdp61),
         _ => anyhow::bail!("Invalid compression level. Valid values are 0, 1, 2, 3."),
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum MultitransportMode {
+    Off,
+    Reliable,
+    PreferReliable,
+    Lossy,
+    PreferLossy,
+}
+
+fn multitransport_flags_from_mode(mode: MultitransportMode) -> Option<MultiTransportFlags> {
+    use MultitransportMode as Mode;
+
+    match mode {
+        Mode::Off => None,
+        Mode::Reliable => Some(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR),
+        Mode::PreferReliable => Some(
+            MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
+                | MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED
+                | MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
+        ),
+        Mode::Lossy => Some(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL),
+        Mode::PreferLossy => Some(
+            MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL
+                | MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED
+                | MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
+        ),
     }
 }
 
@@ -364,6 +394,14 @@ struct Args {
     #[clap(long, value_parser = clap::value_parser!(u32).range(0..=3), default_value_t = 3)]
     compression_level: u32,
 
+    /// Advertise RDP multitransport capability.
+    ///
+    /// This is currently experimental on the Windows-native client. When the
+    /// server requests a UDP sideband, IronRDP still replies with a standards-
+    /// compliant abort response until the native UDP transport path is implemented.
+    #[clap(long, value_enum, default_value_t = MultitransportMode::Off)]
+    multitransport: MultitransportMode,
+
     /// Add DVC channel named pipe proxy
     ///
     /// The format is `<name>=<pipe>`, e.g., `ChannelName=PipeName` where `ChannelName` is the name of the channel,
@@ -551,7 +589,7 @@ impl Config {
             enable_audio_playback: true,
             request_data: None,
             pointer_software_rendering: false,
-            multitransport_flags: None,
+            multitransport_flags: multitransport_flags_from_mode(args.multitransport),
             compression_type,
             performance_flags: PerformanceFlags::default(),
             timezone_info: TimezoneInfo::default(),
@@ -580,7 +618,9 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_desktop_size;
+    use ironrdp::pdu::gcc::MultiTransportFlags;
+
+    use super::{MultitransportMode, multitransport_flags_from_mode, resolve_desktop_size};
 
     #[test]
     fn resolve_desktop_size_prefers_cli_values() {
@@ -606,5 +646,20 @@ mod tests {
                 .to_string()
                 .contains("desktop width and height must be provided together")
         );
+    }
+
+    #[test]
+    fn multitransport_mode_off_disables_capability() {
+        assert_eq!(multitransport_flags_from_mode(MultitransportMode::Off), None);
+    }
+
+    #[test]
+    fn multitransport_mode_prefer_reliable_sets_expected_flags() {
+        let flags = multitransport_flags_from_mode(MultitransportMode::PreferReliable).expect("flags should be set");
+
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR));
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED));
+        assert!(flags.contains(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP));
+        assert!(!flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL));
     }
 }

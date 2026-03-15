@@ -26,6 +26,10 @@ the transport/session split.
 The reconnect path now also guards against repeated resize-triggered reconnects that do not
 actually change the negotiated desktop size, which makes resize churn easier to diagnose instead
 of silently looping forever.
+The native client can now also advertise experimental multitransport policy through the CLI, but
+it still responds with a standards-compliant `E_ABORT` until a real UDP sideband transport is
+implemented. This keeps protocol negotiation visible without pretending the Windows-native client
+already supports multitransport data flow.
 The client now also emits lightweight frame-path diagnostics through `tracing`: packed-frame
 conversion time, surface-present time, and resize/reconnect churn are visible at `trace`/`debug`
 level to guide the next GPU/render and multitransport work.
@@ -44,6 +48,16 @@ ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD> --width 16
 
 If you provide an `.rdp` file, `desktopwidth` and `desktopheight` are now used as the initial
 desktop request when explicit CLI sizing is not supplied.
+
+For multitransport protocol testing, the Windows-native client can advertise optional UDP
+capability:
+
+```shell
+ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD> --multitransport prefer-reliable
+```
+
+Current behavior: if the server follows up with a multitransport request, the client replies
+with `E_ABORT` on the TCP control path until the sideband UDP transport is implemented.
 
 ## Configuring log filter directives
 

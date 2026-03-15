@@ -142,6 +142,10 @@ Status: done.
 Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/README.md`, `ARCHITECTURE.md`.
 Status: partially done; broader reconnect and single-session integration coverage still remains.
 
+21. The native client now exposes experimental multitransport advertising and replies to unsupported server-side multitransport requests with an explicit TCP-side `E_ABORT` instead of silently dropping them.
+Refs: `crates/ironrdp-client/src/config.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-session/src/active_stage.rs`, `crates/ironrdp-session/src/x224/mod.rs`, `crates/ironrdp-client/README.md`.
+Status: groundwork done; real UDP sideband transport is still not implemented.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -171,6 +175,14 @@ Why now:
 Done when:
 - reconnect causes are explicit in logs/tests
 - graceful close and hard session failure remain distinct at the top-level client boundary
+
+4. Split the Windows acceleration plan into two tracks and keep them separate in implementation.
+Refs: `crates/ironrdp-client`, `crates/ironrdp-server/src/gfx.rs`, `crates/ironrdp-egfx`, future Windows-only streaming experiments.
+Why now:
+- the repo already supports standards-based acceleration ideas such as EGFX and multitransport negotiation
+- Gemini-style IDD / GPU-P / custom UDP video ideas are better treated as a separate Windows streaming subsystem, not as accidental scope creep inside the core RDP path
+Done when:
+- the roadmap and docs keep standards-first RDP acceleration separate from any future custom streamer mode
 
 ## Priority 0: Lock the Windows build contract
 
@@ -237,7 +249,7 @@ Effort: medium.
 Refs: `crates/ironrdp-client/src/main.rs`, `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Effort: medium.
 
-## Priority 2: Windows performance and acceleration
+## Priority 2: Windows performance, acceleration, and transport groundwork
 
 1. Remove avoidable client graphics-copy overhead.
 Refs: `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`.
@@ -246,13 +258,13 @@ Problem:
 - the remaining full-frame copy is likely still the top CPU bottleneck on Intel machines
 Effort: medium.
 
-2. Add lightweight graphics/runtime diagnostics before deep render changes.
+2. Introduce a presentation-backend seam around the current `softbuffer` path.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Do next:
-- trace frame conversion time
-- trace present time
-- count resize/reconnect and cursor churn
-Effort: small.
+- isolate surface ownership and present logic behind an internal backend boundary
+- keep `softbuffer` as the default implementation
+- make later Windows GPU experiments additive rather than another app rewrite
+Effort: medium.
 
 3. Baseline CPU-first performance on Intel hardware before chasing GPU work.
 Refs: `build.ps1`, `crates/ironrdp-client`, `crates/ironrdp-server/src/encoder/*`, `benches/`.
@@ -278,7 +290,15 @@ Do next:
 - add metrics around underruns
 Effort: medium.
 
-6. Evaluate Intel iGPU acceleration as a scoped experiment, not a default path.
+6. Make standards-based transport acceleration real before custom transport ideas.
+Refs: `crates/ironrdp-client/src/config.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-session/src/active_stage.rs`.
+Do next:
+- add focused tests around the new multitransport advertise/abort path
+- decide the first real UDP posture to support (`UDP_FECR` first, lossy later)
+- keep unsupported cases explicit on the TCP control path
+Effort: medium to large.
+
+7. Evaluate Intel iGPU acceleration as a scoped experiment, not a default path.
 Refs: future Windows-native render/encode experimentation.
 Guardrails:
 - no hard dependency in the default build
@@ -286,20 +306,27 @@ Guardrails:
 - keep the experiment separate from the portable baseline
 Effort: medium.
 
-7. Keep NVIDIA/CUDA optional and isolated.
+8. Keep NVIDIA/CUDA optional and isolated.
 Refs: future packaging/docs/experiments.
 Guardrails:
 - do not require CUDA for normal builds
 - only pursue if CPU and software-path wins are exhausted first
 Effort: small.
 
-8. Decide where LLVM/lld and oneAPI materially help, using measurements.
+9. Decide where LLVM/lld and oneAPI materially help, using measurements.
 Refs: `build.ps1`, local machine configuration, future benchmark notes.
 Effort: medium.
 
 ## Priority 3: Windows-native feature parity and usability
 
-1. Add real Windows device redirection beyond the current `NoopRdpdrBackend`.
+1. Decide whether end-to-end EGFX/H.264 becomes a first-class Windows track.
+Refs: `crates/ironrdp-server/src/gfx.rs`, `crates/ironrdp-egfx`, native client graphics path.
+Guardrails:
+- prove value on Windows workloads
+- keep classic bitmap/RemoteFX compatibility paths intact
+Effort: medium to large.
+
+2. Add real Windows device redirection beyond the current `NoopRdpdrBackend`.
 Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-rdpdr`, `crates/ironrdp-rdpdr-native`.
 Initial scope:
 - drive redirection
@@ -307,36 +334,39 @@ Initial scope:
 - smartcard cleanup if already close
 Effort: medium to large.
 
-2. Define the Windows-only strategy for USB-class or vendor-specific devices.
+3. Define the Windows-only strategy for USB-class or vendor-specific devices.
 Refs: `crates/ironrdp-dvc-com-plugin`, `crates/ironrdp-dvc-pipe-proxy`.
 Likely direction:
 - DVC/COM plugin bridge instead of trying to force everything through generic `RDPDR`
 Effort: medium.
 
-3. Decide whether end-to-end EGFX/H.264 becomes a first-class Windows track.
-Refs: `crates/ironrdp-server/src/gfx.rs`, `crates/ironrdp-egfx`, native client graphics path.
-Guardrails:
-- prove value on Windows workloads
-- keep classic bitmap/RemoteFX compatibility paths intact
-Effort: medium to large.
-
-4. Evaluate UDP/multitransport support.
-Refs: client runtime, transport stack, session-driver notes.
-Problem:
-- this is still a major gap vs native Windows RDP on lossy or higher-latency links
-Effort: large.
+4. Defer Gemini-style IDD / VDD / GPU-P / DDA / hardware-encoder streaming ideas into a separate Windows streaming track.
+Refs: future Windows-only capture/encode subsystem, Hyper-V or workstation experiments, `gateway.TODO.md` for control-plane style notes when relevant.
+Why defer:
+- these ideas are closer to a Parsec-like streamer than to standards-based RDP
+- they likely require WDK driver work, encoder integration, and a custom transport
+- they should reuse IronRDP for auth/session control only if they prove worth the complexity
+Effort: large and separate from the core RDP branch.
 
 ## Priority 4: Deployment and operator experience
 
-1. Turn `dtm-p1gen7` into a repeatable smoke-deploy target.
+1. Add a local Hyper-V Windows Server validation target before broader remote rollout.
+Refs: local Hyper-V host tooling, `build.ps1`, portable bundle scripts.
+Do next:
+- use the Windows Server 2025 VM as the first no-repo guest install/smoke target
+- prefer PowerShell Direct + `Copy-Item -ToSession` over guest-service file copy
+- keep the VM flow scriptable enough to become a repeatable host-side validation job
+Effort: medium.
+
+2. Turn `dtm-p1gen7` into a repeatable smoke-deploy target.
 Refs: SSH deploy path, `build.ps1`, emitted manifests.
 Effort: medium.
 
-2. Add a real installer layer after the portable bundle stays stable.
+3. Add a real installer layer after the portable bundle stays stable.
 Refs: `build.ps1`, `docs/windows-native-install.md`, future MSIX/MSI packaging project.
 Effort: medium.
 
-3. Finish the .NET package and demo-distribution story.
+4. Finish the .NET package and demo-distribution story.
 Refs: `ffi/dotnet/Devolutions.IronRdp/*.csproj`, `ffi/README.md`.
 Effort: medium.
 
@@ -371,11 +401,13 @@ Effort: large.
 ## Suggested execution order
 
 1. Lock the supported build matrix and artifact-class contract.
-2. Add frame-path diagnostics and remove remaining client graphics-copy overhead.
-3. Finish reconnect/shutdown clarity and add focused runtime seam tests.
-4. Measure portable vs host-tuned Intel builds on both primary machines.
-5. Revisit optional Intel iGPU, EGFX, UDP/multitransport, LLVM/lld, oneAPI, and CUDA work only after the CPU/software baseline is measured and stable.
-6. Finish the `dtm-p1gen7` deploy-and-smoke-test path.
-7. Extend Unicode/IME validation into end-to-end Windows smoke coverage.
-8. Take on the next connector/session/FFI boundary cleanup.
-9. Keep gateway work in [gateway.TODO.md](C:/codedev/IronRDP/gateway.TODO.md) until the direct machine-to-machine path is stronger.
+2. Finish reconnect/shutdown clarity and add focused runtime seam tests.
+3. Remove the remaining client graphics-copy overhead and isolate the presentation backend boundary.
+4. Make multitransport groundwork explicit and measurable before real UDP work.
+5. Measure portable vs host-tuned Intel builds on both primary machines.
+6. Revisit optional Intel iGPU, EGFX, UDP/multitransport, LLVM/lld, oneAPI, and CUDA work only after the CPU/software baseline is measured and stable.
+7. Validate the no-repo install path in the local Hyper-V Windows Server VM.
+8. Then finish the `dtm-p1gen7` deploy-and-smoke-test path.
+9. Extend Unicode/IME validation into end-to-end Windows smoke coverage.
+10. Take on the next connector/session/FFI boundary cleanup.
+11. Keep gateway work in [gateway.TODO.md](C:/codedev/IronRDP/gateway.TODO.md) until the direct machine-to-machine path is stronger, and keep any Gemini-style custom streaming ideas out of the core RDP track until a separate subsystem is justified.
