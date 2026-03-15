@@ -15,7 +15,14 @@ param(
     [string]$ArtifactRoot,
     [string]$DeploymentName,
     [string]$TargetMachine,
-    [int]$Jobs
+    [int]$Jobs,
+    [string]$InstallerPublisher = 'CN=David-Martel IronRDP Test',
+    [string]$InstallerCertificatePath,
+    [string]$InstallerCertificatePassword,
+    [string]$ReleaseRepo,
+    [string]$ReleaseTag,
+    [switch]$SkipMsix,
+    [switch]$SkipMsi
 )
 
 Set-StrictMode -Version Latest
@@ -943,6 +950,16 @@ function Publish-DeploymentSupportFiles {
             ArtifactKind = 'deployment-tool'
         },
         @{
+            SourcePath = Join-Path $RepoRoot 'scripts\windows\New-IronRdpInstallers.ps1'
+            RelativeDirectory = 'tools'
+            ArtifactKind = 'deployment-tool'
+        },
+        @{
+            SourcePath = Join-Path $RepoRoot 'scripts\windows\Invoke-HyperVInstallerTest.ps1'
+            RelativeDirectory = 'tools'
+            ArtifactKind = 'deployment-tool'
+        },
+        @{
             SourcePath = Join-Path $RepoRoot 'docs\windows-native-install.md'
             RelativeDirectory = 'docs'
             ArtifactKind = 'deployment-doc'
@@ -992,6 +1009,100 @@ function Publish-DeploymentBundle {
     Compress-Archive -Path (Join-Path $script:ArtifactRoot '*') -DestinationPath $DestinationPath -Force
 }
 
+function New-InstallerOutputRoot {
+    $installerRoot = Join-Path (Split-Path -Parent $script:ArtifactRoot) 'installers'
+    New-Item -ItemType Directory -Force -Path $installerRoot | Out-Null
+
+    $buildClass = if ($NativeCpu) { 'host-optimized' } else { 'portable' }
+    $version = Get-NestedValue $script:VersionInfo @('SemVer')
+    $outputName = "IronRDP-$($script:MachineIdentity)-$version-$buildClass"
+
+    return Join-Path $installerRoot $outputName
+}
+
+function Publish-InstallerArtifacts {
+    param(
+        [Parameter(Mandatory)][string]$PackageRoot
+    )
+
+    $installerScript = Join-Path $RepoRoot 'scripts\windows\New-IronRdpInstallers.ps1'
+    if (-not (Test-Path -LiteralPath $installerScript -PathType Leaf)) {
+        throw "installer script not found: $installerScript"
+    }
+
+    $installerOutputRoot = New-InstallerOutputRoot
+    if (Test-Path -LiteralPath $installerOutputRoot) {
+        Remove-Item -LiteralPath $installerOutputRoot -Recurse -Force
+    }
+
+    $resolvedReleaseRepo = if ([string]::IsNullOrWhiteSpace($ReleaseRepo)) {
+        if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_REPOSITORY)) { $env:GITHUB_REPOSITORY } else { $null }
+    } else {
+        $ReleaseRepo
+    }
+    $resolvedReleaseTag = if ([string]::IsNullOrWhiteSpace($ReleaseTag)) {
+        if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_REF_NAME)) { $env:GITHUB_REF_NAME } else { $null }
+    } else {
+        $ReleaseTag
+    }
+
+    $arguments = @(
+        '-NoLogo',
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $installerScript,
+        '-PackageRoot', $PackageRoot,
+        '-OutputRoot', $installerOutputRoot,
+        '-Publisher', $InstallerPublisher,
+        '-OutputJsonPath', (Join-Path $installerOutputRoot 'installer-output.json')
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($InstallerCertificatePath)) {
+        $arguments += @('-CertificatePath', $InstallerCertificatePath)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($InstallerCertificatePassword)) {
+        $arguments += @('-CertificatePassword', $InstallerCertificatePassword)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($resolvedReleaseRepo)) {
+        $arguments += @('-ReleaseRepo', $resolvedReleaseRepo)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($resolvedReleaseTag)) {
+        $arguments += @('-ReleaseTag', $resolvedReleaseTag)
+    }
+
+    if ($SkipMsix) {
+        $arguments += '-SkipMsix'
+    }
+
+    if ($SkipMsi) {
+        $arguments += '-SkipMsi'
+    }
+
+    & pwsh @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw 'installer generation failed'
+    }
+
+    $installerResultPath = Join-Path $installerOutputRoot 'installer-output.json'
+    if (-not (Test-Path -LiteralPath $installerResultPath -PathType Leaf)) {
+        throw "installer generation did not produce metadata: $installerResultPath"
+    }
+
+    $installerResult = Get-Content -LiteralPath $installerResultPath -Raw | ConvertFrom-Json
+    return @(
+        foreach ($artifact in $installerResult.artifacts) {
+            [pscustomobject]@{
+                kind = $artifact.kind
+                source = $PackageRoot
+                destination = $artifact.path
+            }
+        }
+    )
+}
+
 function Write-BuildManifest {
     param([object[]]$Artifacts = @())
 
@@ -1034,6 +1145,8 @@ function Write-BuildManifest {
             ironrdpBuildClass = $env:IRONRDP_BUILD_CLASS
             ironrdpPrimaryNetworkGbps = $env:IRONRDP_PRIMARY_NETWORK_GBPS
             ironrdpWindowsRuntime = $env:IRONRDP_WINDOWS_RUNTIME
+            ironrdpReleaseRepo = $ReleaseRepo
+            ironrdpReleaseTag = $ReleaseTag
         }
         modules = $script:ImportedModules
         cargoMachineConfig = $script:CargoMachineConfig
@@ -1216,6 +1329,8 @@ try {
             $bundleArtifact = New-DeploymentBundleArtifact
             $artifacts.Add($bundleArtifact)
             Write-BuildManifest -Artifacts $artifacts
+            foreach ($artifact in (Publish-InstallerArtifacts -PackageRoot $script:ArtifactRoot)) { $artifacts.Add($artifact) }
+            Write-BuildManifest -Artifacts $artifacts
             Publish-DeploymentBundle -DestinationPath $bundleArtifact.destination
         }
         'publish' {
@@ -1236,6 +1351,8 @@ try {
             foreach ($artifact in (Publish-DeploymentSupportFiles)) { $artifacts.Add($artifact) }
             $bundleArtifact = New-DeploymentBundleArtifact
             $artifacts.Add($bundleArtifact)
+            Write-BuildManifest -Artifacts $artifacts
+            foreach ($artifact in (Publish-InstallerArtifacts -PackageRoot $script:ArtifactRoot)) { $artifacts.Add($artifact) }
             Write-BuildManifest -Artifacts $artifacts
             Publish-DeploymentBundle -DestinationPath $bundleArtifact.destination
         }

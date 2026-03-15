@@ -364,19 +364,24 @@ Effort: large and separate from the core RDP branch.
 ## Priority 4: Deployment and operator experience
 
 1. Keep the local Hyper-V Windows Server validation target as a repeatable regression harness.
-Refs: local Hyper-V host tooling, `build.ps1`, portable bundle scripts.
+Refs: local Hyper-V host tooling, `build.ps1`, `scripts/windows/Invoke-HyperVInstallerTest.ps1`.
 Do next:
 - preserve the current Windows Server 2025 guest as the first clean-machine packaging regression target
-- replace the current offline bootstrap workaround with a cleaner host-side automation path when guest credentials or PowerShell Direct are available
-- keep the VM flow scriptable enough to become a repeatable host-side validation job
+- keep the VM powered on after installer validation unless a reboot or offline staging step is actually required
+- keep the PowerShell Direct validation path working with the temporary local admin test account
+- add richer runtime validation on the live guest: guest logs, service state, port reachability, and eventually real client session traces
 Effort: medium.
 
 2. Turn `dtm-p1gen7` into a repeatable smoke-deploy target.
 Refs: SSH deploy path, `build.ps1`, emitted manifests.
 Effort: medium.
 
-3. Add a real installer layer after the portable bundle stays stable.
-Refs: `build.ps1`, `docs/windows-native-install.md`, future MSIX/MSI packaging project.
+3. Keep the installer layer small and release-shaped.
+Refs: `build.ps1`, `scripts/windows/New-IronRdpInstallers.ps1`, `.github/workflows/windows-release.yml`, `docs/windows-native-install.md`.
+Do next:
+- keep release outputs limited to portable zip, MSIX, MSI, App Installer, manifest, and trust material
+- remove or suppress intermediate installer layout artifacts from release-facing outputs
+- keep local `build.ps1 -Mode package|publish` behavior aligned with the GitHub tag workflow
 Effort: medium.
 
 4. Finish the .NET package and demo-distribution story.

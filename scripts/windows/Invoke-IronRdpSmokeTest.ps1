@@ -6,6 +6,9 @@ param(
     [Parameter(ParameterSetName = 'Install', Mandatory = $true)]
     [string]$InstallRoot,
 
+    [Parameter(ParameterSetName = 'Msix', Mandatory = $true)]
+    [string]$MsixPackageName,
+
     [string]$LaunchHost,
     [string]$Username
 )
@@ -13,10 +16,24 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if ($PSCmdlet.ParameterSetName -eq 'Install') {
-    $root = (Resolve-Path -LiteralPath $InstallRoot).Path
-} else {
-    $root = (Resolve-Path -LiteralPath $PackageRoot).Path
+switch ($PSCmdlet.ParameterSetName) {
+    'Install' {
+        $root = (Resolve-Path -LiteralPath $InstallRoot).Path
+    }
+    'Package' {
+        $root = (Resolve-Path -LiteralPath $PackageRoot).Path
+    }
+    'Msix' {
+        $package = Get-AppxPackage -Name $MsixPackageName | Sort-Object Version -Descending | Select-Object -First 1
+        if (-not $package) {
+            throw "installed MSIX package not found: $MsixPackageName"
+        }
+
+        $root = Join-Path $package.InstallLocation 'VFS\ProgramFilesX64\IronRDP'
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            throw "installed MSIX package does not expose an install location: $MsixPackageName"
+        }
+    }
 }
 
 $manifestPath = Join-Path $root 'build-manifest.json'
@@ -53,6 +70,7 @@ $result = [pscustomobject]@{
     docsPresent = Test-Path -LiteralPath $installGuide -PathType Leaf
     launcherPs1Present = if ($PSCmdlet.ParameterSetName -eq 'Install') { Test-Path -LiteralPath $launcherPs1 -PathType Leaf } else { $null }
     launcherCmdPresent = if ($PSCmdlet.ParameterSetName -eq 'Install') { Test-Path -LiteralPath $launcherCmd -PathType Leaf } else { $null }
+    packageFamilyName = if ($PSCmdlet.ParameterSetName -eq 'Msix') { $package.PackageFamilyName } else { $null }
 }
 
 $result | Format-List | Out-String | Write-Host

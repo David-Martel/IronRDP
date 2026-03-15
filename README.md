@@ -43,15 +43,20 @@ pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode package -Release
 pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode publish -Release -TargetMachine dtm-p1gen7
 ```
 
-For a machine that does not have the repo checked out, package mode now emits a
-portable artifact root plus a deployment zip. The operator-facing install and
-smoke-test flow is documented in [docs/windows-native-install.md](./docs/windows-native-install.md)
-and shipped inside the bundle under `docs/` and `tools/`.
-That bundle is the current shipping format; MSI/MSIX packaging remains a later
-layer once the artifact graph is stable.
-Package and publish modes now also embed a static MSVC CRT for the native
-Windows artifacts so the portable bundle does not depend on a separately
-installed Visual C++ Redistributable on a clean target machine.
+For a machine that does not have the repo checked out, package mode now emits:
+
+- a portable artifact root
+- a portable deployment zip
+- a signed MSIX package
+- a signed MSI package
+- an App Installer descriptor when `build.ps1` is given release repo/tag metadata
+
+The operator-facing install and smoke-test flow is documented in
+[docs/windows-native-install.md](./docs/windows-native-install.md) and shipped
+inside the package under `docs/` and `tools/`.
+Package and publish modes also embed a static MSVC CRT for the native Windows
+artifacts so the portable bundle and installer payloads do not depend on a
+separately installed Visual C++ Redistributable on a clean target machine.
 
 The script uses CargoTools machine settings for build job count, `sccache`,
 `CARGO_TARGET_DIR`, linker acceleration, and artifact publishing. Package and
@@ -82,12 +87,25 @@ The current deployment/test loop for Windows operators is:
 
 ```pwsh
 pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode package -Release -SkipDotNet
-pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Install-IronRdpPackage.ps1
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Install-IronRdpPackage.ps1 -BundlePath .\artifacts\IronRDP-DTM-WORK-0.0.0-dev-portable.zip -Force
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-IronRdpSmokeTest.ps1 -InstallRoot $env:LOCALAPPDATA\Programs\IronRDP
 ```
 
-That portable install/smoke flow has now been validated against a clean
-Hyper-V Windows Server 2025 guest using the packaged bundle alone.
+Installer-backed validation now also exists:
+
+```pwsh
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Install-IronRdpPackage.ps1 -InstallerPath .\IronRDP.msix -CertificatePath .\IronRDP-test-signing.cer
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-IronRdpSmokeTest.ps1 -MsixPackageName DavidMartel.IronRDP
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-HyperVInstallerTest.ps1 -MsiPath .\IronRDP.msi
+```
+
+The current validation baseline is:
+
+- portable bundle install and smoke on the host
+- MSIX install and smoke on the host
+- MSI install inside the Hyper-V Windows Server 2025 guest
+- guest-side `ironrdp-client --version` and `--help`
+- guest `TermService` availability and host-visible port `3389`
 
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 
