@@ -181,7 +181,9 @@ between GUI concerns, transport setup, and protocol/session processing. The Wind
 path also keeps text input and presentation concerns at the top of the stack: `app.rs`
 translates `winit` IME commit events into Unicode fast-path input, and `session_driver.rs`
 reuses packed presentation buffers so the software-render path can be optimized without
-leaking windowing assumptions into transport/session code.
+leaking windowing assumptions into transport/session code. The reconnect policy in `rdp.rs`
+also now treats repeated resize reconnects without an actual size change as a bounded error
+condition rather than an implicit infinite loop.
 
 #### [`crates/ironrdp-cliprdr-native`](./crates/ironrdp-cliprdr-native)
 

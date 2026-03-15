@@ -579,14 +579,14 @@ impl RdpServer {
     async fn handle_io_channel_data(&mut self, data: SendDataRequest<'_>) -> Result<bool> {
         let control: rdp::headers::ShareControlHeader = decode(data.user_data.as_ref())?;
 
+        if share_control_requests_disconnect(&control) {
+            return Ok(true);
+        }
+
         match control.share_control_pdu {
             ShareControlPdu::Data(header) => match header.share_data_pdu {
                 rdp::headers::ShareDataPdu::Input(pdu) => {
                     self.handle_input_event(pdu).await;
-                }
-
-                rdp::headers::ShareDataPdu::ShutdownRequest => {
-                    return Ok(true);
                 }
 
                 unexpected => {
@@ -610,6 +610,11 @@ impl RdpServer {
         frame: &[u8],
     ) -> Result<bool> {
         let message = decode::<X224<mcs::McsMessage<'_>>>(frame)?;
+
+        if mcs_message_requests_disconnect(&message.0) {
+            return Ok(true);
+        }
+
         match message.0 {
             mcs::McsMessage::SendDataRequest(data) => {
                 debug!(?data, "McsMessage::SendDataRequest");
@@ -623,12 +628,6 @@ impl RdpServer {
                     writer.write_all(&response).await?;
                 } else {
                     warn!(channel_id = data.channel_id, "Unexpected channel received: ID",);
-                }
-            }
-
-            mcs::McsMessage::DisconnectProviderUltimatum(disconnect) => {
-                if disconnect.reason == mcs::DisconnectReason::UserRequested {
-                    return Ok(true);
                 }
             }
 
@@ -751,6 +750,25 @@ impl RdpServer {
     }
 }
 
+fn share_control_requests_disconnect(control: &rdp::headers::ShareControlHeader) -> bool {
+    matches!(
+        control.share_control_pdu,
+        ShareControlPdu::Data(rdp::headers::ShareDataHeader {
+            share_data_pdu: rdp::headers::ShareDataPdu::ShutdownRequest,
+            ..
+        })
+    )
+}
+
+fn mcs_message_requests_disconnect(message: &mcs::McsMessage<'_>) -> bool {
+    matches!(
+        message,
+        mcs::McsMessage::DisconnectProviderUltimatum(mcs::DisconnectProviderUltimatum {
+            reason: mcs::DisconnectReason::UserRequested,
+        })
+    )
+}
+
 async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut impl FramedWrite) -> Result<()> {
     let pdu = ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll);
     let pdu = rdp::headers::ShareControlHeader {
@@ -814,6 +832,7 @@ mod tests {
     use core::num::{NonZeroU16, NonZeroUsize};
 
     use bytes::Bytes;
+    use ironrdp_pdu::rdp::headers::ShareDataHeader;
 
     use super::*;
     use crate::{BitmapUpdate, PixelFormat};
@@ -930,5 +949,30 @@ mod tests {
         .expect_err("display update write should fail");
 
         assert!(error.to_string().contains("failed to write display update"));
+    }
+
+    #[test]
+    fn shutdown_request_share_control_disconnects_session() {
+        let control = rdp::headers::ShareControlHeader {
+            share_id: 1,
+            pdu_source: 1001,
+            share_control_pdu: ShareControlPdu::Data(ShareDataHeader {
+                share_data_pdu: rdp::headers::ShareDataPdu::ShutdownRequest,
+                stream_priority: rdp::headers::StreamPriority::Medium,
+                compression_flags: rdp::headers::CompressionFlags::empty(),
+                compression_type: rdp::client_info::CompressionType::K8,
+            }),
+        };
+
+        assert!(share_control_requests_disconnect(&control));
+    }
+
+    #[test]
+    fn user_requested_disconnect_provider_disconnects_session() {
+        let message = mcs::McsMessage::DisconnectProviderUltimatum(mcs::DisconnectProviderUltimatum {
+            reason: mcs::DisconnectReason::UserRequested,
+        });
+
+        assert!(mcs_message_requests_disconnect(&message));
     }
 }

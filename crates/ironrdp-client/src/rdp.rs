@@ -121,6 +121,8 @@ pub struct RdpClient {
 
 impl RdpClient {
     pub async fn run(mut self) {
+        let mut same_size_reconnects = 0;
+
         loop {
             let (connection_result, framed) = if let Some(rdcleanpath) = self.config.rdcleanpath.as_ref() {
                 match connect_ws(
@@ -162,19 +164,50 @@ impl RdpClient {
             .await
             {
                 Ok(RdpControlFlow::ReconnectWithNewSize { width, height }) => {
+                    let current_width = self.config.connector.desktop_size.width;
+                    let current_height = self.config.connector.desktop_size.height;
+
+                    match update_resize_reconnect_state(
+                        current_width,
+                        current_height,
+                        width,
+                        height,
+                        same_size_reconnects,
+                    ) {
+                        Ok(next_same_size_reconnects) => {
+                            same_size_reconnects = next_same_size_reconnects;
+                        }
+                        Err(error) => {
+                            self.send_terminal_event(Err(error));
+                            break;
+                        }
+                    }
+
+                    info!(
+                        current_width,
+                        current_height,
+                        next_width = width,
+                        next_height = height,
+                        same_size_reconnects,
+                        "Restarting session with updated desktop size"
+                    );
                     self.config.connector.desktop_size.width = width;
                     self.config.connector.desktop_size.height = height;
                 }
                 Ok(RdpControlFlow::TerminatedGracefully(reason)) => {
-                    let _ = self.event_loop_proxy.send_event(RdpOutputEvent::Terminated(Ok(reason)));
+                    self.send_terminal_event(Ok(reason));
                     break;
                 }
                 Err(e) => {
-                    let _ = self.event_loop_proxy.send_event(RdpOutputEvent::Terminated(Err(e)));
+                    self.send_terminal_event(Err(e));
                     break;
                 }
             }
         }
+    }
+
+    fn send_terminal_event(&self, result: SessionResult<GracefulDisconnectReason>) {
+        let _ = self.event_loop_proxy.send_event(RdpOutputEvent::Terminated(result));
     }
 }
 
@@ -186,6 +219,29 @@ type UpgradedFramed = ironrdp_tokio::TokioFramed<Box<dyn AsyncReadWrite + Unpin 
 
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_SAME_SIZE_RECONNECTS: u8 = 3;
+
+fn update_resize_reconnect_state(
+    current_width: u16,
+    current_height: u16,
+    next_width: u16,
+    next_height: u16,
+    same_size_reconnects: u8,
+) -> SessionResult<u8> {
+    if current_width == next_width && current_height == next_height {
+        let next_same_size_reconnects = same_size_reconnects.saturating_add(1);
+
+        if next_same_size_reconnects > MAX_SAME_SIZE_RECONNECTS {
+            return Err(ironrdp::session::general_err!(
+                "too many resize reconnects without a desktop size change"
+            ));
+        }
+
+        return Ok(next_same_size_reconnects);
+    }
+
+    Ok(0)
+}
 
 fn configure_tcp_stream(stream: &TcpStream) -> ConnectorResult<()> {
     stream
@@ -590,5 +646,38 @@ where
         let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, connector);
 
         Ok((upgraded, server_public_key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SAME_SIZE_RECONNECTS, update_resize_reconnect_state};
+
+    #[test]
+    fn resize_reconnect_resets_counter_when_size_changes() {
+        let counter = update_resize_reconnect_state(1024, 768, 1600, 900, MAX_SAME_SIZE_RECONNECTS)
+            .expect("size change should be accepted");
+
+        assert_eq!(counter, 0);
+    }
+
+    #[test]
+    fn resize_reconnect_counts_unchanged_size_retries() {
+        let counter =
+            update_resize_reconnect_state(1024, 768, 1024, 768, 1).expect("same size retry should be tracked");
+
+        assert_eq!(counter, 2);
+    }
+
+    #[test]
+    fn resize_reconnect_rejects_excessive_unchanged_size_retries() {
+        let error = update_resize_reconnect_state(1024, 768, 1024, 768, MAX_SAME_SIZE_RECONNECTS)
+            .expect_err("same size retry limit should be enforced");
+
+        assert!(
+            error
+                .to_string()
+                .contains("too many resize reconnects without a desktop size change")
+        );
     }
 }

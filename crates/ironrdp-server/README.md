@@ -37,6 +37,9 @@ That split keeps the long-lived listener/bootstrap path separate from the per-cl
 The session driver is also the place where backlog handling, display-update dispatch,
 and resize-triggered reactivation are coordinated, so reliability and protocol tests
 for those paths should land close to that boundary rather than in the listener/bootstrap code.
+The current Windows-native fork intentionally serves one client session at a time; the listener
+serializes new accepts behind the active session loop until multi-session behavior is designed
+and tested explicitly.
 
 This crate is part of the [IronRDP] project.
 

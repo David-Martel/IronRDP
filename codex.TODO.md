@@ -134,35 +134,43 @@ Status: done.
 Refs: `build.ps1`, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `docs/windows-native-install.md`, `README.md`, `xtask/README.md`.
 Status: done for local package/install/smoke validation; remote `dtm-p1gen7` copy/install remains.
 
+19. Lightweight client frame-path diagnostics now trace frame packing, surface present timing, and resize/reconnect churn to guide deeper render work.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/README.md`.
+Status: done.
+
+20. The direct Windows-native runtime now treats repeated resize reconnects without any desktop-size change as a bounded error, and the server's single-session posture is now documented explicitly.
+Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/README.md`, `ARCHITECTURE.md`.
+Status: partially done; broader reconnect and single-session integration coverage still remains.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
 
-1. Add lightweight client frame-path diagnostics before deeper render changes.
-Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
-Why now:
-- GPU/render work should be driven by measured frame-pack and present costs
-- reconnect churn should be visible before changing transport policy
-Done when:
-- frame conversion and present timing can be sampled in traces
-- resize/reconnect churn is visible in logs or metrics
-
-2. Add focused runtime tests for the newer client/server session seams.
+1. Add focused runtime tests for the newer client/server session seams.
 Refs: `crates/ironrdp-testsuite-extra`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Why now:
 - recent reliability changes need narrow tests, not just broad smoke coverage
 - the frame-buffer reuse and IME work now have unit coverage
-- server seam tests now cover resize reactivation and write-failure handling, but integration coverage is still thin
+- server seam tests now cover resize reactivation, display-write failure, and disconnect parsing, but integration coverage is still thin
 Done when:
 - backlog disconnect, display failure, and single-session behavior are pinned down
 
-3. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
+2. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
 Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`.
 Why now:
 - this turns the branch into a real product path instead of a local-only build
 Done when:
 - package output can be copied, launched, and verified remotely with one documented flow
 - the current local portable-bundle install/smoke flow is mirrored on `dtm-p1gen7`
+
+3. Keep reconnect/shutdown behavior explicit before deeper transport work.
+Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/README.md`.
+Why now:
+- UDP/multitransport and GPU work should build on a predictable runtime contract
+- resize-triggered reconnects should fail clearly when the negotiated size never changes
+Done when:
+- reconnect causes are explicit in logs/tests
+- graceful close and hard session failure remain distinct at the top-level client boundary
 
 ## Priority 0: Lock the Windows build contract
 

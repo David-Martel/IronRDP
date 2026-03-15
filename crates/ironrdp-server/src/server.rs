@@ -165,6 +165,9 @@ impl DisplayControlHandler for DisplayControlBackend {
 ///  - receive display updates from a [`RdpServerDisplay`] and forward them to the client
 ///  - receive input events from a client and forward them to an [`RdpServerInputHandler`]
 ///
+/// This Windows-native fork currently accepts and services one client session
+/// at a time. New accepts are serialized behind the active session loop.
+///
 /// # Example
 ///
 /// ```

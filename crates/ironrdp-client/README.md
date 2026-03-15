@@ -23,6 +23,9 @@ the first connection and resize path more predictable for local demo use.
 The native input path now uses `winit` IME commit events for Unicode text entry while keeping
 scancode input for non-text keys, which closes a major Windows usability gap without changing
 the transport/session split.
+The reconnect path now also guards against repeated resize-triggered reconnects that do not
+actually change the negotiated desktop size, which makes resize churn easier to diagnose instead
+of silently looping forever.
 The client now also emits lightweight frame-path diagnostics through `tracing`: packed-frame
 conversion time, surface-present time, and resize/reconnect churn are visible at `trace`/`debug`
 level to guide the next GPU/render and multitransport work.
