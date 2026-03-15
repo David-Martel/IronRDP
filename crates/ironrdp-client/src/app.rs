@@ -2,7 +2,7 @@
 //!
 //! This module owns the `winit` application handler, softbuffer surface management,
 //! and translation from desktop-window input into [`RdpInputEvent`] values consumed
-//! by the active session driver.
+//! by the active session driver, including IME commit handling for Unicode text.
 //!
 //! [`RdpInputEvent`]: crate::rdp::RdpInputEvent
 
@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, PhysicalSize};
-use winit::event::{self, WindowEvent};
+use winit::event::{self, Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::platform::scancode::PhysicalKeyExtScancode as _;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes};
@@ -60,6 +60,7 @@ pub struct App {
     buffer_size: (u16, u16),
     surface_size: (u16, u16),
     input_database: ironrdp::input::Database,
+    ime_preedit_active: bool,
     last_size: Option<PhysicalSize<u32>>,
     resize_timeout: Option<Instant>,
     exit_code: Code,
@@ -79,6 +80,7 @@ impl App {
             buffer_size: (0, 0),
             surface_size: (0, 0),
             input_database,
+            ime_preedit_active: false,
             last_size: None,
             resize_timeout: None,
             exit_code: Code::SUCCESS,
@@ -172,6 +174,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                 let window = Arc::new(window);
                 match WindowState::new(window) {
                     Ok(window_state) => {
+                        window_state.window.set_ime_allowed(true);
                         self.window_state = Some(window_state);
                     }
                     Err(error) => {
@@ -210,25 +213,12 @@ impl ApplicationHandler<RdpOutputEvent> for App {
             WindowEvent::DroppedFile(_) => {
                 // TODO(#110): File upload
             }
-            // WindowEvent::ReceivedCharacter(_) => {
-            // Sadly, we can't use this winit event to send RDP unicode events because
-            // of the several reasons:
-            // 1. `ReceivedCharacter` event doesn't provide a way to distinguish between
-            //    key press and key release, therefore the only way to use it is to send
-            //    a key press + release events sequentially, which will not allow to
-            //    handle long press and key repeat events.
-            // 2. This event do not fire for non-printable keys (e.g. Control, Alt, etc.)
-            // 3. This event fies BEFORE `KeyboardInput` event, so we can't make a
-            //    reasonable workaround for `1` and `2` by collecting physical key press
-            //    information first via `KeyboardInput` before processing `ReceivedCharacter`.
-            //
-            // However, all of these issues can be solved by updating `winit` to the
-            // newer version.
-            //
-            // TODO(#376): Update winit
-            // TODO(#376): Implement unicode input in native client
-            // }
             WindowEvent::KeyboardInput { event, .. } => {
+                if self.ime_preedit_active {
+                    trace!("Ignoring raw keyboard input while IME preedit is active");
+                    return;
+                }
+
                 if let Some(scancode) = event.physical_key.to_scancode() {
                     let scancode = match u16::try_from(scancode) {
                         Ok(scancode) => scancode,
@@ -249,7 +239,26 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                     send_fast_path_events(&self.input_event_sender, input_events);
                 }
             }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.ime_preedit_active = false;
+                let operations = unicode_text_operations(&text);
+                if !operations.is_empty() {
+                    let input_events = self.input_database.apply(operations);
+                    send_fast_path_events(&self.input_event_sender, input_events);
+                }
+            }
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                self.ime_preedit_active = !text.is_empty();
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                self.ime_preedit_active = false;
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
+                if self.ime_preedit_active {
+                    trace!("Ignoring modifier changes while IME preedit is active");
+                    return;
+                }
+
                 const SHIFT_LEFT: ironrdp::input::Scancode = ironrdp::input::Scancode::from_u8(false, 0x2A);
                 const CONTROL_LEFT: ironrdp::input::Scancode = ironrdp::input::Scancode::from_u8(false, 0x1D);
                 const ALT_LEFT: ironrdp::input::Scancode = ironrdp::input::Scancode::from_u8(false, 0x38);
@@ -382,7 +391,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
             | WindowEvent::HoveredFile(_)
             | WindowEvent::HoveredFileCancelled
             | WindowEvent::Focused(_)
-            | WindowEvent::Ime(_)
+            | WindowEvent::Ime(Ime::Enabled)
             | WindowEvent::CursorEntered { .. }
             | WindowEvent::CursorLeft { .. }
             | WindowEvent::PinchGesture { .. }
@@ -412,6 +421,12 @@ impl ApplicationHandler<RdpOutputEvent> for App {
             RdpOutputEvent::Image { buffer, width, height } => {
                 trace!(width = ?width, height = ?height, "Received image with size");
                 trace!(window_physical_size = ?window.inner_size(), "Drawing image to the window with size");
+                if !self.buffer.is_empty() {
+                    let recycled_buffer = core::mem::take(&mut self.buffer);
+                    let _ = self
+                        .input_event_sender
+                        .send(RdpInputEvent::RecycleFrameBuffer(recycled_buffer));
+                }
                 self.buffer_size = (width.get(), height.get());
                 self.buffer = buffer;
                 if self.surface_size != self.buffer_size {
@@ -493,5 +508,41 @@ fn send_fast_path_events(
 ) {
     if !input_events.is_empty() {
         let _ = input_event_sender.send(RdpInputEvent::FastPath(input_events));
+    }
+}
+
+fn unicode_text_operations(text: &str) -> smallvec::SmallVec<[ironrdp::input::Operation; 8]> {
+    let mut operations = smallvec::SmallVec::new();
+
+    for character in text.chars().filter(|character| !character.is_control()) {
+        operations.push(ironrdp::input::Operation::UnicodeKeyPressed(character));
+        operations.push(ironrdp::input::Operation::UnicodeKeyReleased(character));
+    }
+
+    operations
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp::input::Operation;
+
+    use super::unicode_text_operations;
+
+    #[test]
+    fn unicode_text_operations_emit_press_and_release_pairs() {
+        let operations = unicode_text_operations("A\u{1f642}\n");
+
+        assert_eq!(operations.len(), 4);
+        assert!(matches!(operations[0], Operation::UnicodeKeyPressed('A')));
+        assert!(matches!(operations[1], Operation::UnicodeKeyReleased('A')));
+        assert!(matches!(operations[2], Operation::UnicodeKeyPressed('\u{1f642}')));
+        assert!(matches!(operations[3], Operation::UnicodeKeyReleased('\u{1f642}')));
+    }
+
+    #[test]
+    fn unicode_text_operations_ignore_control_characters() {
+        let operations = unicode_text_operations("\r\n\t");
+
+        assert!(operations.is_empty());
     }
 }

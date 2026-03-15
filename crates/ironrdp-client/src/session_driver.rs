@@ -4,7 +4,8 @@
 //! into [`ActiveStage`] updates, turns GUI-originated input into protocol output,
 //! and forwards rendered image and pointer updates back to the window event loop.
 //! `rdp.rs` keeps connection establishment and reconnect policy, while this module
-//! owns the live-session driver.
+//! owns the live-session driver and the reusable packed-frame buffer used by the
+//! software presentation path.
 
 use core::num::NonZeroU16;
 
@@ -38,6 +39,7 @@ enum SessionDriverFlow {
 struct SessionDriver {
     image: DecodedImage,
     active_stage: ActiveStage,
+    reusable_frame_buffer: Vec<u32>,
 }
 
 impl SessionDriver {
@@ -50,7 +52,11 @@ impl SessionDriver {
 
         let active_stage = ActiveStage::new(connection_result);
 
-        Self { image, active_stage }
+        Self {
+            image,
+            active_stage,
+            reusable_frame_buffer: Vec::new(),
+        }
     }
 
     fn process_server_frame(
@@ -151,6 +157,14 @@ impl SessionDriver {
                     Ok(SessionDriverFlow::Outputs(Vec::new()))
                 }
             }
+            RdpInputEvent::RecycleFrameBuffer(mut buffer) => {
+                buffer.clear();
+                if buffer.capacity() >= self.reusable_frame_buffer.capacity() {
+                    self.reusable_frame_buffer = buffer;
+                }
+
+                Ok(SessionDriverFlow::Outputs(Vec::new()))
+            }
             RdpInputEvent::SendDvcMessages { channel_id, messages } => {
                 trace!(channel_id, ?messages, "Send DVC messages");
                 let frame = self.active_stage.encode_dvc_messages(messages)?;
@@ -245,18 +259,9 @@ impl SessionDriver {
         }
     }
 
-    fn emit_image_update(&self, event_loop_proxy: &EventLoopProxy<RdpOutputEvent>) -> SessionResult<()> {
-        let buffer: Vec<u32> = self
-            .image
-            .data()
-            .chunks_exact(4)
-            .map(|pixel| {
-                let r = pixel[0];
-                let g = pixel[1];
-                let b = pixel[2];
-                u32::from_be_bytes([0, r, g, b])
-            })
-            .collect();
+    fn emit_image_update(&mut self, event_loop_proxy: &EventLoopProxy<RdpOutputEvent>) -> SessionResult<()> {
+        let mut buffer = core::mem::take(&mut self.reusable_frame_buffer);
+        pack_rgba_frame(self.image.data(), &mut buffer)?;
 
         event_loop_proxy
             .send_event(RdpOutputEvent::Image {
@@ -365,4 +370,54 @@ where
     };
 
     Ok(RdpControlFlow::TerminatedGracefully(disconnect_reason))
+}
+
+fn pack_rgba_frame(image_data: &[u8], buffer: &mut Vec<u32>) -> SessionResult<()> {
+    let mut pixels = image_data.chunks_exact(4);
+    buffer.clear();
+    buffer.extend(pixels.by_ref().map(|pixel| {
+        let r = pixel[0];
+        let g = pixel[1];
+        let b = pixel[2];
+        u32::from_be_bytes([0, r, g, b])
+    }));
+
+    if !pixels.remainder().is_empty() {
+        return Err(session::general_err!("decoded image length is not divisible by four"));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pack_rgba_frame;
+
+    #[test]
+    fn pack_rgba_frame_converts_pixels_for_softbuffer() {
+        let image = [
+            0x11, 0x22, 0x33, 0xff, //
+            0x44, 0x55, 0x66, 0x77,
+        ];
+        let mut buffer = Vec::new();
+
+        pack_rgba_frame(&image, &mut buffer).expect("pack frame");
+
+        assert_eq!(buffer, vec![0x0011_2233, 0x0044_5566]);
+    }
+
+    #[test]
+    fn pack_rgba_frame_reuses_existing_capacity() {
+        let image = [
+            0x01, 0x02, 0x03, 0xff, //
+            0x04, 0x05, 0x06, 0xff,
+        ];
+        let mut buffer = Vec::with_capacity(8);
+        let initial_capacity = buffer.capacity();
+
+        pack_rgba_frame(&image, &mut buffer).expect("pack frame");
+
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer.capacity(), initial_capacity);
+    }
 }

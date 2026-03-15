@@ -69,6 +69,7 @@ pub enum RdpInputEvent {
     FastPath(SmallVec<[FastPathInputEvent; 2]>),
     Close,
     Clipboard(ClipboardMessage),
+    RecycleFrameBuffer(Vec<u32>),
     SendDvcMessages {
         channel_id: u32,
         messages: Vec<SvcMessage>,
