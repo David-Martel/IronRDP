@@ -4,7 +4,7 @@ version = "0.10.0"
 readme = "README.md"
 description = "Extendable skeleton for implementing custom RDP servers"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -61,3 +61,4 @@ tokio = { version = "1", features = ["sync"] }
 
 [lints]
 workspace = true
+

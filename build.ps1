@@ -701,18 +701,20 @@ function Invoke-RepoCargo {
         [Parameter(Mandatory)][string[]]$ArgumentList
     )
 
+    if ($script:UseCargoWrapper) {
+        $command = $ArgumentList[0]
+        $additionalArgs = if ($ArgumentList.Length -gt 1) { $ArgumentList[1..($ArgumentList.Length - 1)] } else { @() }
+        $exitCode = Invoke-CargoWrapper -Command $command -AdditionalArgs $additionalArgs -WorkingDirectory $RepoRoot
+        if ($exitCode -ne 0) {
+            throw "cargo $($ArgumentList -join ' ') failed with exit code $exitCode"
+        }
+
+        return
+    }
+
     $shouldRetryWithoutSccache = -not $env:SCCACHE_DISABLE -and -not [string]::IsNullOrWhiteSpace($env:RUSTC_WRAPPER)
 
     try {
-        if ($script:UseCargoWrapper) {
-            $exitCode = Invoke-CargoWrapper -ArgumentList $ArgumentList -WorkingDirectory $RepoRoot
-            if ($exitCode -ne 0) {
-                throw "cargo $($ArgumentList -join ' ') failed with exit code $exitCode"
-            }
-
-            return
-        }
-
         & cargo @ArgumentList
         if ($LASTEXITCODE -ne 0) {
             throw "cargo $($ArgumentList -join ' ') failed with exit code $LASTEXITCODE"
@@ -722,18 +724,11 @@ function Invoke-RepoCargo {
             throw
         }
 
-        Write-Warning "Cargo command failed with sccache enabled; retrying once without sccache."
+        Write-Warning "Cargo command failed with sccache enabled outside the CargoTools wrapper; retrying once without sccache."
         Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+        Remove-Item Env:CARGO_BUILD_RUSTC_WRAPPER -ErrorAction SilentlyContinue
+        Remove-Item Env:RUSTC_WORKSPACE_WRAPPER -ErrorAction SilentlyContinue
         $env:SCCACHE_DISABLE = '1'
-
-        if ($script:UseCargoWrapper) {
-            $exitCode = Invoke-CargoWrapper -ArgumentList $ArgumentList -WorkingDirectory $RepoRoot
-            if ($exitCode -ne 0) {
-                throw "cargo $($ArgumentList -join ' ') failed with exit code $exitCode after disabling sccache"
-            }
-
-            return
-        }
 
         & cargo @ArgumentList
         if ($LASTEXITCODE -ne 0) {
@@ -1033,9 +1028,9 @@ try {
     if ($NoSccache) {
         $script:UseCargoWrapper = $false
         Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+        Remove-Item Env:CARGO_BUILD_RUSTC_WRAPPER -ErrorAction SilentlyContinue
+        Remove-Item Env:RUSTC_WORKSPACE_WRAPPER -ErrorAction SilentlyContinue
         $env:SCCACHE_DISABLE = '1'
-    } else {
-        $null = Start-SccacheServer
     }
 
     if ($NativeCpu -and -not $script:UseCargoWrapper) {
@@ -1048,6 +1043,7 @@ try {
     Write-Host "Jobs: $env:CARGO_BUILD_JOBS" -ForegroundColor Cyan
     Write-Host "CargoTools wrapper: $script:UseCargoWrapper" -ForegroundColor Cyan
     Write-Host "RUSTC_WRAPPER: $($env:RUSTC_WRAPPER)" -ForegroundColor Cyan
+    Write-Host "CARGO_BUILD_RUSTC_WRAPPER: $($env:CARGO_BUILD_RUSTC_WRAPPER)" -ForegroundColor Cyan
     Write-Host "CARGO_USE_LLD: $($env:CARGO_USE_LLD)" -ForegroundColor Cyan
     Write-Host "CMAKE_GENERATOR: $($env:CMAKE_GENERATOR)" -ForegroundColor Cyan
     Write-Host "CARGO_TARGET_DIR: $($env:CARGO_TARGET_DIR)" -ForegroundColor Cyan

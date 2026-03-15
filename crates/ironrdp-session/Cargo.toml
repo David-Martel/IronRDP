@@ -4,7 +4,7 @@ version = "0.8.0"
 readme = "README.md"
 description = "State machines to drive an RDP session"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -37,3 +37,4 @@ zstd-safe = { version = "7.2", optional = true, features = ["std"] }
 
 [lints]
 workspace = true
+

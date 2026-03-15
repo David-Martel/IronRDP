@@ -541,15 +541,14 @@ where
                 if let Ok(x224_confirm) = ironrdp_core::decode::<
                     ironrdp::pdu::x224::X224<ironrdp::pdu::nego::ConnectionConfirm>,
                 >(&x224_connection_response)
+                    && let ironrdp::pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0
                 {
-                    if let ironrdp::pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0 {
-                        // Convert to negotiation failure instead of generic RDCleanPath error.
-                        let negotiation_failure = connector::NegotiationFailure::from(code);
-                        return Err(connector::ConnectorError::new(
-                            "RDP negotiation failed",
-                            connector::ConnectorErrorKind::Negotiation(negotiation_failure),
-                        ));
-                    }
+                    // Convert to negotiation failure instead of generic RDCleanPath error.
+                    let negotiation_failure = connector::NegotiationFailure::from(code);
+                    return Err(connector::ConnectorError::new(
+                        "RDP negotiation failed",
+                        connector::ConnectorErrorKind::Negotiation(negotiation_failure),
+                    ));
                 }
 
                 // Fallback to generic error if we can't decode the negotiation failure.

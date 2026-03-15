@@ -104,10 +104,10 @@ impl RdpsndClientHandler for RdpsndBackend {
             }));
         }
 
-        if let Some(ref tx) = self.tx {
-            if let Err(error) = tx.send(data.to_vec()) {
-                error!(%error);
-            }
+        if let Some(ref tx) = self.tx
+            && let Err(error) = tx.send(data.to_vec())
+        {
+            error!(%error);
         };
     }
 

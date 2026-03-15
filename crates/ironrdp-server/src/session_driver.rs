@@ -807,3 +807,75 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use core::future::{Ready, ready};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct VecWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl FramedWrite for VecWriter {
+        type WriteAllFut<'write>
+            = Ready<std::io::Result<()>>
+        where
+            Self: 'write;
+
+        fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+            self.writes.push(buf.to_vec());
+            ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn resize_display_update_requests_deactivation_reactivation() {
+        let original_size = DesktopSize {
+            width: 1024,
+            height: 768,
+        };
+        let resized = DesktopSize {
+            width: 1440,
+            height: 900,
+        };
+        let mut writer = VecWriter::default();
+        let mut scratch = Vec::new();
+        let encoder = UpdateEncoder::new(
+            original_size,
+            CmdFlags::empty(),
+            UpdateEncoderCodecs::new(),
+            crate::server::RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
+        )
+        .expect("encoder");
+
+        let (state, _encoder) = RdpServer::dispatch_display_update(
+            DisplayUpdate::Resize(resized),
+            &mut writer,
+            1001,
+            1003,
+            &mut scratch,
+            encoder,
+        )
+        .await
+        .expect("resize display update");
+
+        assert_eq!(state, RunState::DeactivationReactivation { desktop_size: resized });
+        assert_eq!(writer.writes.len(), 1);
+
+        let x224: X224<mcs::McsMessage<'_>> = decode(writer.writes[0].as_slice()).expect("decode x224");
+        let mcs::McsMessage::SendDataIndication(data) = x224.0 else {
+            panic!("expected SendDataIndication");
+        };
+        assert_eq!(data.initiator_id, 1001);
+        assert_eq!(data.channel_id, 1003);
+
+        let header: rdp::headers::ShareControlHeader = decode(data.user_data.as_ref()).expect("decode share control");
+        assert!(matches!(
+            header.share_control_pdu,
+            ShareControlPdu::ServerDeactivateAll(_)
+        ));
+    }
+}
