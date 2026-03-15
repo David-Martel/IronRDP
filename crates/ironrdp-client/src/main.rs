@@ -4,10 +4,14 @@ use anyhow::Context as _;
 use ironrdp_client::app::App;
 use ironrdp_client::config::{ClipboardType, Config};
 use ironrdp_client::rdp::{DvcPipeProxyFactory, RdpClient, RdpInputEvent, RdpOutputEvent};
+use mimalloc::MiMalloc;
 use tokio::runtime;
 use tracing::debug;
 use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoop;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     let mut config = Config::parse_args().context("CLI arguments parsing")?;

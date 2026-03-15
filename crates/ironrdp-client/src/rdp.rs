@@ -2,7 +2,7 @@
 //!
 //! This module owns transport establishment, gateway/WebSocket/TLS upgrade,
 //! static and dynamic channel wiring, and top-level reconnect behavior.
-//! The live session loop itself lives in [`crate::session_driver`].
+//! The live session loop itself lives in the crate-private `session_driver` module.
 
 use core::num::NonZeroU16;
 use std::sync::Arc;

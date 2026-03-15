@@ -46,6 +46,14 @@ enum DispatchDecision {
     Write(Vec<u8>),
 }
 
+#[expect(
+    clippy::allow_attributes,
+    reason = "clippy::multiple_inherent_impl is intentional here and cannot be attached with a fulfilled expect"
+)]
+#[allow(
+    clippy::multiple_inherent_impl,
+    reason = "server bootstrap and per-connection runtime stay split across modules on purpose"
+)]
 impl RdpServer {
     pub fn get_svc_processor<T: SvcProcessor + 'static>(&mut self) -> Option<&mut T> {
         self.static_channels
@@ -287,7 +295,7 @@ impl RdpServer {
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
-        let ev_receiver = self.ev_receiver.clone();
+        let ev_receiver = std::sync::Arc::clone(&self.ev_receiver);
         let s = Rc::new(Mutex::new(self));
 
         let this = Rc::clone(&s);

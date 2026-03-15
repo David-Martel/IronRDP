@@ -54,9 +54,24 @@ jobs:
       - name: typos (check)
         run: cargo xtask check typos -v
 
+  docs:
+    name: Check rustdoc
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.7.3
+
+      - name: Check native client rustdoc
+        run: cargo doc -p ironrdp-client --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   checks:
     name: Checks [${{ matrix.os }}]
-    needs: [formatting]
+    needs: [formatting, docs]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -111,7 +126,7 @@ jobs:
 
   fuzz:
     name: Fuzzing
-    needs: [formatting]
+    needs: [formatting, docs]
     runs-on: ubuntu-latest
 
     steps:
@@ -140,7 +155,7 @@ jobs:
 
   ffi:
     name: FFI
-    needs: [formatting]
+    needs: [formatting, docs]
     runs-on: windows-latest
 
     steps:
@@ -170,7 +185,7 @@ jobs:
   success:
     name: Success
     if: ${{ always() }}
-    needs: [formatting, typos, checks, fuzz, ffi]
+    needs: [formatting, typos, docs, checks, fuzz, ffi]
     runs-on: ubuntu-latest
 
     steps:

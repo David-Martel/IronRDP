@@ -17,7 +17,7 @@ use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{self, ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
 use ironrdp_core::WriteBuf;
-use ironrdp_tokio::{FramedWrite, TokioFramed, single_sequence_step_read, split_tokio_framed};
+use ironrdp_tokio::{FramedWrite as _, TokioFramed, single_sequence_step_read, split_tokio_framed};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};

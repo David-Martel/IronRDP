@@ -129,6 +129,20 @@ Do not modify them unless specifically working on fixing their compilation.
 - **Error handling:** Prefer explicit, composable error messages following `STYLE.md`
 - **Testing:** Use existing Rust tests + property tests/fuzzing patterns when relevant
 
+### Imported Rust Guidance
+
+This fork also adopts the Microsoft Pragmatic Rust Guidelines currently staged under
+`~/.agents/rust-guidelines.txt` and `~/.agents/rust-development-guide.md` on David-Martel machines.
+Use them as a secondary source of truth when they reinforce this repo's own style and architecture rules.
+The highest-value imported rules for this fork are:
+
+- Prefer idiomatic Rust APIs, strong types, and testable boundaries for AI- and human-friendly maintenance.
+- Keep public and module docs thorough, with clear summary sentences and explicit error/panic/safety sections when applicable.
+- Use structured logging and canonical error formatting consistently.
+- Treat unsound code as unacceptable; remove temporary unsound shortcuts instead of normalizing them.
+- For application binaries, prefer `mimalloc` as the global allocator unless a measured regression says otherwise.
+- Keep public APIs simple: avoid wrapper leakage, deeply nested generics, and constructor overloads when a builder is clearer.
+
 ### Key Style Conventions (from `STYLE.md`)
 
 - **Error messages:** lowercase, no trailing punctuation, use `crate_name::Result` (e.g., `anyhow::Result`) not bare `Result`.

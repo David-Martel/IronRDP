@@ -80,8 +80,12 @@ pub(crate) fn build_bindings(sh: &Shell, skip_dotnet_build: bool) -> anyhow::Res
     }
     let temp_generated_code_dir = cwd.join(temp_dotnet_generated_path);
     if temp_generated_code_dir.exists() {
-        fs::remove_dir_all(&temp_generated_code_dir)
-            .with_context(|| format!("failed to remove temporary directory {}", temp_generated_code_dir.display()))?;
+        fs::remove_dir_all(&temp_generated_code_dir).with_context(|| {
+            format!(
+                "failed to remove temporary directory {}",
+                temp_generated_code_dir.display()
+            )
+        })?;
     }
     create_dir_all(&temp_generated_code_dir)
         .with_context(|| format!("failed to create directory {}", temp_generated_code_dir.display()))?;
@@ -94,8 +98,12 @@ pub(crate) fn build_bindings(sh: &Shell, skip_dotnet_build: bool) -> anyhow::Res
         .run()?;
 
     replace_cs_files(&temp_generated_code_dir, &generated_code_dir)?;
-    fs::remove_dir_all(&temp_generated_code_dir)
-        .with_context(|| format!("failed to remove temporary directory {}", temp_generated_code_dir.display()))?;
+    fs::remove_dir_all(&temp_generated_code_dir).with_context(|| {
+        format!(
+            "failed to remove temporary directory {}",
+            temp_generated_code_dir.display()
+        )
+    })?;
 
     if skip_dotnet_build {
         return Ok(());
@@ -134,9 +142,8 @@ fn replace_cs_files(src_dir: &Path, dst_dir: &Path) -> anyhow::Result<()> {
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("cs") {
                 let destination = dst_dir.join(entry.file_name());
                 println!("Moving file: {} -> {}", path.display(), destination.display());
-                fs::rename(&path, &destination).with_context(|| {
-                    format!("failed to move {} to {}", path.display(), destination.display())
-                })?;
+                fs::rename(&path, &destination)
+                    .with_context(|| format!("failed to move {} to {}", path.display(), destination.display()))?;
             }
         }
     }
@@ -148,11 +155,7 @@ fn cargo_target_dir(root_dir: &Path) -> PathBuf {
     match std::env::var_os("CARGO_TARGET_DIR") {
         Some(dir) => {
             let dir = PathBuf::from(dir);
-            if dir.is_absolute() {
-                dir
-            } else {
-                root_dir.join(dir)
-            }
+            if dir.is_absolute() { dir } else { root_dir.join(dir) }
         }
         None => root_dir.join("target"),
     }
