@@ -2467,6 +2467,7 @@ dependencies = [
  "raw-window-handle",
  "semver",
  "smallvec",
+ "socket2 0.6.1",
  "softbuffer",
  "tap",
  "tokio",

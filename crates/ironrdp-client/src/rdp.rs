@@ -5,6 +5,7 @@
 //! The live session loop itself lives in the crate-private `session_driver` module.
 
 use core::num::NonZeroU16;
+use core::time::Duration;
 use std::sync::Arc;
 
 use ironrdp::cliprdr::backend::{ClipboardMessage, CliprdrBackendFactory};
@@ -28,6 +29,7 @@ use ironrdp_tokio::FramedWrite;
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use rdpdr::NoopRdpdrBackend;
 use smallvec::SmallVec;
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -181,6 +183,31 @@ impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite {}
 
 type UpgradedFramed = ironrdp_tokio::TokioFramed<Box<dyn AsyncReadWrite + Unpin + Send + Sync>>;
 
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+fn configure_tcp_stream(stream: &TcpStream) -> ConnectorResult<()> {
+    stream
+        .set_nodelay(true)
+        .map_err(|e| connector::custom_err!("set TCP_NODELAY", e))?;
+
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+
+    SockRef::from(stream)
+        .set_tcp_keepalive(&keepalive)
+        .map_err(|e| connector::custom_err!("set TCP keepalive", e))?;
+
+    debug!(
+        keepalive_time = ?TCP_KEEPALIVE_TIME,
+        keepalive_interval = ?TCP_KEEPALIVE_INTERVAL,
+        "Configured TCP socket"
+    );
+
+    Ok(())
+}
+
 async fn connect(
     config: &Config,
     cliprdr_factory: Option<&(dyn CliprdrBackendFactory + Send)>,
@@ -197,9 +224,7 @@ async fn connect(
         let stream = TcpStream::connect(dest)
             .await
             .map_err(|e| connector::custom_err!("TCP connect", e))?;
-        stream
-            .set_nodelay(true)
-            .map_err(|e| connector::custom_err!("set TCP_NODELAY", e))?;
+        configure_tcp_stream(&stream)?;
         let client_addr = stream
             .local_addr()
             .map_err(|e| connector::custom_err!("get socket local address", e))?;
@@ -315,9 +340,7 @@ async fn connect_ws(
         .await
         .map_err(|e| connector::custom_err!("TCP connect", e))?;
 
-    socket
-        .set_nodelay(true)
-        .map_err(|e| connector::custom_err!("set TCP_NODELAY", e))?;
+    configure_tcp_stream(&socket)?;
 
     let client_addr = socket
         .local_addr()
