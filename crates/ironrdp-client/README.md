@@ -23,6 +23,9 @@ the first connection and resize path more predictable for local demo use.
 The native input path now uses `winit` IME commit events for Unicode text entry while keeping
 scancode input for non-text keys, which closes a major Windows usability gap without changing
 the transport/session split.
+The client now also emits lightweight frame-path diagnostics through `tracing`: packed-frame
+conversion time, surface-present time, and resize/reconnect churn are visible at `trace`/`debug`
+level to guide the next GPU/render and multitransport work.
 
 ## Sample usage
 
@@ -45,6 +48,12 @@ The `IRONRDP_LOG` environment variable is used to set the log filter directives.
 
 ```shell
 IRONRDP_LOG="info,ironrdp_connector=trace" ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
+```
+
+For frame-path diagnostics on the Windows-native branch:
+
+```shell
+IRONRDP_LOG="info,ironrdp_client=trace" ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
 ```
 
 See [`tracing-subscriber`’s documentation][tracing-doc] for more details.

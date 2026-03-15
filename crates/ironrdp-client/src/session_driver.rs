@@ -5,9 +5,11 @@
 //! and forwards rendered image and pointer updates back to the window event loop.
 //! `rdp.rs` keeps connection establishment and reconnect policy, while this module
 //! owns the live-session driver and the reusable packed-frame buffer used by the
-//! software presentation path.
+//! software presentation path. It also emits lightweight frame-pack and reconnect
+//! diagnostics to guide the next render and transport optimization passes.
 
 use core::num::NonZeroU16;
+use std::time::Instant;
 
 use ironrdp::cliprdr;
 use ironrdp::cliprdr::backend::ClipboardMessage;
@@ -40,6 +42,8 @@ struct SessionDriver {
     image: DecodedImage,
     active_stage: ActiveStage,
     reusable_frame_buffer: Vec<u32>,
+    emitted_frame_count: u64,
+    reconnect_resize_count: u64,
 }
 
 impl SessionDriver {
@@ -56,6 +60,8 @@ impl SessionDriver {
             image,
             active_stage,
             reusable_frame_buffer: Vec::new(),
+            emitted_frame_count: 0,
+            reconnect_resize_count: 0,
         }
     }
 
@@ -92,6 +98,11 @@ impl SessionDriver {
                     debug!("Reconnecting with new size");
                     let width = u16::try_from(width).expect("always in the range");
                     let height = u16::try_from(height).expect("always in the range");
+                    self.reconnect_resize_count = self.reconnect_resize_count.saturating_add(1);
+                    debug!(
+                        reconnect_resize_count = self.reconnect_resize_count,
+                        width, height, "Resize requires reconnect"
+                    );
                     Ok(SessionDriverFlow::ReconnectWithNewSize { width, height })
                 }
             }
@@ -260,16 +271,28 @@ impl SessionDriver {
     }
 
     fn emit_image_update(&mut self, event_loop_proxy: &EventLoopProxy<RdpOutputEvent>) -> SessionResult<()> {
+        let started_at = Instant::now();
         let mut buffer = core::mem::take(&mut self.reusable_frame_buffer);
+        let pack_started_at = Instant::now();
         pack_rgba_frame(self.image.data(), &mut buffer)?;
+        let pack_duration = pack_started_at.elapsed();
+        let width = NonZeroU16::new(self.image.width()).ok_or_else(|| session::general_err!("width is zero"))?;
+        let height = NonZeroU16::new(self.image.height()).ok_or_else(|| session::general_err!("height is zero"))?;
 
         event_loop_proxy
-            .send_event(RdpOutputEvent::Image {
-                buffer,
-                width: NonZeroU16::new(self.image.width()).ok_or_else(|| session::general_err!("width is zero"))?,
-                height: NonZeroU16::new(self.image.height()).ok_or_else(|| session::general_err!("height is zero"))?,
-            })
+            .send_event(RdpOutputEvent::Image { buffer, width, height })
             .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
+
+        self.emitted_frame_count = self.emitted_frame_count.saturating_add(1);
+        trace!(
+            frame_id = self.emitted_frame_count,
+            width = width.get(),
+            height = height.get(),
+            pixels = usize::from(width.get()) * usize::from(height.get()),
+            pack_micros = pack_duration.as_micros(),
+            total_micros = started_at.elapsed().as_micros(),
+            "Emitted image update"
+        );
 
         Ok(())
     }

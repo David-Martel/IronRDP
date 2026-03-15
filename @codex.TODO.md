@@ -7,6 +7,7 @@ product contract. Priorities below are ordered for:
 - Windows-native runtime quality first
 - repeatable multi-machine deployment second
 - Intel x64 CPU baseline first, optional GPU acceleration second
+- GPU/render, multitransport, and reconnect quality ahead of gateway work
 - measured reliability/performance wins before speculative feature breadth
 
 ## Current product contract
@@ -137,7 +138,16 @@ Status: done for local package/install/smoke validation; remote `dtm-p1gen7` cop
 
 This is the next concrete implementation queue, not a wish list.
 
-1. Add focused runtime tests for the newer client/server session seams.
+1. Add lightweight client frame-path diagnostics before deeper render changes.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
+Why now:
+- GPU/render work should be driven by measured frame-pack and present costs
+- reconnect churn should be visible before changing transport policy
+Done when:
+- frame conversion and present timing can be sampled in traces
+- resize/reconnect churn is visible in logs or metrics
+
+2. Add focused runtime tests for the newer client/server session seams.
 Refs: `crates/ironrdp-testsuite-extra`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Why now:
 - recent reliability changes need narrow tests, not just broad smoke coverage
@@ -146,22 +156,13 @@ Why now:
 Done when:
 - backlog disconnect, display failure, and single-session behavior are pinned down
 
-2. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
+3. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
 Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`.
 Why now:
 - this turns the branch into a real product path instead of a local-only build
 Done when:
 - package output can be copied, launched, and verified remotely with one documented flow
 - the current local portable-bundle install/smoke flow is mirrored on `dtm-p1gen7`
-
-3. Add lightweight client frame-path diagnostics before deeper render changes.
-Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
-Why now:
-- buffer reuse removes one obvious churn source, so the next step is to measure what remains
-- this is the lowest-risk way to decide whether software-path tuning is enough before GPU work
-Done when:
-- frame conversion and present timing can be sampled in traces
-- resize/reconnect churn is visible in logs or metrics
 
 ## Priority 0: Lock the Windows build contract
 
@@ -362,10 +363,11 @@ Effort: large.
 ## Suggested execution order
 
 1. Lock the supported build matrix and artifact-class contract.
-2. Finish the `dtm-p1gen7` deploy-and-smoke-test path.
-3. Remove client graphics-copy overhead and add frame-path diagnostics.
-4. Extend Unicode/IME validation into end-to-end Windows smoke coverage and finish reconnect/shutdown clarity.
-5. Add focused runtime tests for display failure, backlog disconnect, and single-session behavior.
-6. Measure portable vs host-tuned Intel builds on both primary machines.
-7. Revisit optional LLVM/lld, oneAPI, Intel iGPU, EGFX, and CUDA work only after the CPU/software baseline is measured and stable.
+2. Add frame-path diagnostics and remove remaining client graphics-copy overhead.
+3. Finish reconnect/shutdown clarity and add focused runtime seam tests.
+4. Measure portable vs host-tuned Intel builds on both primary machines.
+5. Revisit optional Intel iGPU, EGFX, UDP/multitransport, LLVM/lld, oneAPI, and CUDA work only after the CPU/software baseline is measured and stable.
+6. Finish the `dtm-p1gen7` deploy-and-smoke-test path.
+7. Extend Unicode/IME validation into end-to-end Windows smoke coverage.
 8. Take on the next connector/session/FFI boundary cleanup.
+9. Keep gateway work in [gateway.TODO.md](C:/codedev/IronRDP/gateway.TODO.md) until the direct machine-to-machine path is stronger.

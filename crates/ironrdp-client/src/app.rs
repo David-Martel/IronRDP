@@ -3,6 +3,8 @@
 //! This module owns the `winit` application handler, softbuffer surface management,
 //! and translation from desktop-window input into [`RdpInputEvent`] values consumed
 //! by the active session driver, including IME commit handling for Unicode text.
+//! It also records lightweight surface-resize and software-present timings through
+//! `tracing` so render-path changes can be measured before deeper GPU work.
 //!
 //! [`RdpInputEvent`]: crate::rdp::RdpInputEvent
 
@@ -63,6 +65,8 @@ pub struct App {
     ime_preedit_active: bool,
     last_size: Option<PhysicalSize<u32>>,
     resize_timeout: Option<Instant>,
+    presented_frame_count: u64,
+    surface_resize_count: u64,
     exit_code: Code,
 }
 
@@ -83,6 +87,8 @@ impl App {
             ime_preedit_active: false,
             last_size: None,
             resize_timeout: None,
+            presented_frame_count: 0,
+            surface_resize_count: 0,
             exit_code: Code::SUCCESS,
         })
     }
@@ -129,6 +135,7 @@ impl App {
         let Some(window_state) = self.window_state.as_mut() else {
             return;
         };
+        let draw_started_at = Instant::now();
         let _keep_context_alive = &window_state.context;
         let mut sb_buffer = match window_state.surface_mut().buffer_mut() {
             Ok(buffer) => buffer,
@@ -145,10 +152,25 @@ impl App {
             );
             return;
         }
+        let copy_started_at = Instant::now();
         sb_buffer.copy_from_slice(self.buffer.as_slice());
+        let copy_duration = copy_started_at.elapsed();
+        let present_started_at = Instant::now();
         if let Err(error) = sb_buffer.present() {
             error!(%error, "Failed to present surface buffer");
+            return;
         }
+
+        self.presented_frame_count = self.presented_frame_count.saturating_add(1);
+        trace!(
+            frame_id = self.presented_frame_count,
+            width = self.buffer_size.0,
+            height = self.buffer_size.1,
+            copy_micros = copy_duration.as_micros(),
+            present_micros = present_started_at.elapsed().as_micros(),
+            total_micros = draw_started_at.elapsed().as_micros(),
+            "Presented frame"
+        );
     }
 }
 
@@ -439,6 +461,13 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                         return;
                     }
                     self.surface_size = self.buffer_size;
+                    self.surface_resize_count = self.surface_resize_count.saturating_add(1);
+                    debug!(
+                        surface_resize_count = self.surface_resize_count,
+                        width = self.surface_size.0,
+                        height = self.surface_size.1,
+                        "Resized presentation surface"
+                    );
                 }
 
                 window.request_redraw();
