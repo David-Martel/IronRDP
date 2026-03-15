@@ -49,6 +49,9 @@ smoke-test flow is documented in [docs/windows-native-install.md](./docs/windows
 and shipped inside the bundle under `docs/` and `tools/`.
 That bundle is the current shipping format; MSI/MSIX packaging remains a later
 layer once the artifact graph is stable.
+Package and publish modes now also embed a static MSVC CRT for the native
+Windows artifacts so the portable bundle does not depend on a separately
+installed Visual C++ Redistributable on a clean target machine.
 
 The script uses CargoTools machine settings for build job count, `sccache`,
 `CARGO_TARGET_DIR`, linker acceleration, and artifact publishing. Package and
@@ -82,6 +85,9 @@ pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode package -Release -SkipDotNet
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Install-IronRdpPackage.ps1
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-IronRdpSmokeTest.ps1 -InstallRoot $env:LOCALAPPDATA\Programs\IronRDP
 ```
+
+That portable install/smoke flow has now been validated against a clean
+Hyper-V Windows Server 2025 guest using the packaged bundle alone.
 
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 

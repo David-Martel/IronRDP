@@ -26,8 +26,10 @@ machine-scoped `bundles/` directory.
 
 - Windows x64
 - Open a PowerShell 7+ session when using the helper scripts
-- If the client fails to start with a missing Visual C++ runtime error, install
-  the current Microsoft Visual C++ Redistributable for Visual Studio
+
+Package and publish builds now embed a static MSVC CRT for the native Windows
+artifacts, so the portable bundle no longer assumes the Visual C++
+Redistributable is preinstalled on the target machine.
 
 ## Install from a packaged artifact root
 
@@ -70,6 +72,10 @@ This validates:
 - `ironrdp-client.exe --version` succeeds
 - `ironrdp-client.exe --help` succeeds
 - optional docs/FFI files are present when packaged
+
+The current portable bundle has been validated on a clean Hyper-V
+Windows Server 2025 guest using the same `Install-IronRdpPackage.ps1` and
+`Invoke-IronRdpSmokeTest.ps1` flow documented here.
 
 To launch the client as part of the smoke step:
 

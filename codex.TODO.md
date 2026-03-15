@@ -132,7 +132,7 @@ Status: done.
 
 18. A no-repo Windows deployment path now exists as a portable bundle with install and smoke-test helpers.
 Refs: `build.ps1`, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `docs/windows-native-install.md`, `README.md`, `xtask/README.md`.
-Status: done for local package/install/smoke validation; remote `dtm-p1gen7` copy/install remains.
+Status: done for local package/install/smoke validation and Hyper-V Windows Server 2025 guest validation; remote `dtm-p1gen7` copy/install remains.
 
 19. Lightweight client frame-path diagnostics now trace frame packing, surface present timing, and resize/reconnect churn to guide deeper render work.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/README.md`.
@@ -154,6 +154,10 @@ Status: done; `softbuffer` remains the default backend and still performs one ba
 Refs: `crates/ironrdp-client/src/config.rs`, `crates/ironrdp-session/src/x224/mod.rs`, `crates/ironrdp-client/src/presentation.rs`.
 Status: done; real UDP sideband transport and end-to-end runtime coverage still remain.
 
+24. Portable package and publish builds now embed a static MSVC CRT for the native Windows artifacts, and the no-repo install/smoke flow has been validated on a clean Hyper-V Windows Server 2025 guest.
+Refs: `build.ps1`, `docs/windows-native-install.md`, `README.md`, local Hyper-V validation logs.
+Status: done; `dtm-p1gen7` still needs the same deployment flow mirrored remotely.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -170,10 +174,10 @@ Done when:
 2. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
 Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`.
 Why now:
-- this turns the branch into a real product path instead of a local-only build
+- the portable bundle is now proven on a clean Windows Server guest, so the next deployment unknown is the real second machine
 Done when:
 - package output can be copied, launched, and verified remotely with one documented flow
-- the current local portable-bundle install/smoke flow is mirrored on `dtm-p1gen7`
+- the Hyper-V-validated portable install/smoke flow is mirrored on `dtm-p1gen7`
 
 3. Keep reconnect/shutdown behavior explicit before deeper transport work.
 Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/README.md`.
@@ -359,11 +363,11 @@ Effort: large and separate from the core RDP branch.
 
 ## Priority 4: Deployment and operator experience
 
-1. Add a local Hyper-V Windows Server validation target before broader remote rollout.
+1. Keep the local Hyper-V Windows Server validation target as a repeatable regression harness.
 Refs: local Hyper-V host tooling, `build.ps1`, portable bundle scripts.
 Do next:
-- use the Windows Server 2025 VM as the first no-repo guest install/smoke target
-- prefer PowerShell Direct + `Copy-Item -ToSession` over guest-service file copy
+- preserve the current Windows Server 2025 guest as the first clean-machine packaging regression target
+- replace the current offline bootstrap workaround with a cleaner host-side automation path when guest credentials or PowerShell Direct are available
 - keep the VM flow scriptable enough to become a repeatable host-side validation job
 Effort: medium.
 
@@ -414,9 +418,8 @@ Effort: large.
 3. Instrument emit-to-present latency and backend acquisition/conversion/present timing on the native client.
 4. Make multitransport groundwork explicit and measurable before real UDP work.
 5. Measure portable vs host-tuned Intel builds on both primary machines.
-6. Validate the no-repo install path in the local Hyper-V Windows Server VM.
-7. Then finish the `dtm-p1gen7` deploy-and-smoke-test path.
-8. Extend Unicode/IME validation into end-to-end Windows smoke coverage.
-9. Revisit optional Intel iGPU, EGFX, UDP/multitransport, LLVM/lld, oneAPI, and CUDA work only after the CPU/software baseline is measured and stable.
-10. Take on the next connector/session/FFI boundary cleanup.
-11. Keep gateway work in [gateway.TODO.md](C:/codedev/IronRDP/gateway.TODO.md) until the direct machine-to-machine path is stronger, and keep any Gemini-style custom streaming ideas out of the core RDP track until a separate subsystem is justified.
+6. Mirror the no-repo install path onto `dtm-p1gen7`.
+7. Extend Unicode/IME validation into end-to-end Windows smoke coverage.
+8. Revisit optional Intel iGPU, EGFX, UDP/multitransport, LLVM/lld, oneAPI, and CUDA work only after the CPU/software baseline is measured and stable.
+9. Take on the next connector/session/FFI boundary cleanup.
+10. Keep gateway work in [gateway.TODO.md](C:/codedev/IronRDP/gateway.TODO.md) until the direct machine-to-machine path is stronger, and keep any Gemini-style custom streaming ideas out of the core RDP track until a separate subsystem is justified.

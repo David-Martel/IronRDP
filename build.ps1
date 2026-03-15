@@ -1009,6 +1009,7 @@ function Write-BuildManifest {
             release = [bool]$Release
             nativeCpu = [bool]$NativeCpu
             class = if ($NativeCpu) { 'host-optimized' } else { 'portable' }
+            windowsRuntime = if ([string]::IsNullOrWhiteSpace($env:IRONRDP_WINDOWS_RUNTIME)) { 'default' } else { $env:IRONRDP_WINDOWS_RUNTIME }
         }
         environment = [ordered]@{
             cargoTargetDir = $env:CARGO_TARGET_DIR
@@ -1032,6 +1033,7 @@ function Write-BuildManifest {
             ironrdpArtifactRoot = $env:IRONRDP_ARTIFACT_ROOT
             ironrdpBuildClass = $env:IRONRDP_BUILD_CLASS
             ironrdpPrimaryNetworkGbps = $env:IRONRDP_PRIMARY_NETWORK_GBPS
+            ironrdpWindowsRuntime = $env:IRONRDP_WINDOWS_RUNTIME
         }
         modules = $script:ImportedModules
         cargoMachineConfig = $script:CargoMachineConfig
@@ -1110,6 +1112,12 @@ try {
         Add-RustFlag -Flags @('-C', 'target-cpu=native')
     }
 
+    $portableWindowsRuntimeModes = @('package', 'publish')
+    if ($portableWindowsRuntimeModes -contains $Mode) {
+        Add-RustFlag -Flags @('-C', 'target-feature=+crt-static')
+        $env:IRONRDP_WINDOWS_RUNTIME = 'static-msvc-crt'
+    }
+
     Write-Host "Mode: $Mode" -ForegroundColor Cyan
     Write-Host "Machine identity: $script:MachineIdentity" -ForegroundColor Cyan
     Write-Host "Artifact root: $script:ArtifactRoot" -ForegroundColor Cyan
@@ -1129,6 +1137,7 @@ try {
     Write-Host "oneAPI: $(Get-NestedValue $script:ToolchainInfo @('oneApi', 'root'))" -ForegroundColor Cyan
     Write-Host "CUDA: $(Get-NestedValue $script:ToolchainInfo @('cuda', 'root'))" -ForegroundColor Cyan
     Write-Host "Build class: $(Get-NestedValue $script:HardwareProfile @('buildClass'))" -ForegroundColor Cyan
+    Write-Host "Windows runtime: $(if ($env:IRONRDP_WINDOWS_RUNTIME) { $env:IRONRDP_WINDOWS_RUNTIME } else { 'default' })" -ForegroundColor Cyan
     Write-Host "Primary NIC: $(Get-NestedValue $script:HardwareProfile @('primaryNetworkAdapter', 'name')) @ $((Get-NestedValue $script:HardwareProfile @('primaryNetworkAdapter', 'linkSpeed')))" -ForegroundColor Cyan
     Write-Host "GPU vendors: $((@((Get-NestedValue $script:HardwareProfile @('gpus')) | ForEach-Object { $_.vendor }) | Where-Object { $_ } | Select-Object -Unique) -join ', ')" -ForegroundColor Cyan
     Write-Host "Machine config provider: $(if (Get-Command Get-MachineConfiguration -ErrorAction SilentlyContinue) { (Get-Command Get-MachineConfiguration).Source } else { 'unavailable' })" -ForegroundColor Cyan
