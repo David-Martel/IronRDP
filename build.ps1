@@ -99,25 +99,59 @@ function Invoke-RepoCargo {
         [Parameter(Mandatory)][string[]]$ArgumentList
     )
 
-    if ($script:UseCargoWrapper) {
-        $exitCode = Invoke-CargoWrapper -ArgumentList $ArgumentList -WorkingDirectory $RepoRoot
-        if ($exitCode -ne 0) {
-            throw "cargo $($ArgumentList -join ' ') failed with exit code $exitCode"
+    $shouldRetryWithoutSccache = -not $env:SCCACHE_DISABLE -and -not [string]::IsNullOrWhiteSpace($env:RUSTC_WRAPPER)
+
+    try {
+        if ($script:UseCargoWrapper) {
+            $exitCode = Invoke-CargoWrapper -ArgumentList $ArgumentList -WorkingDirectory $RepoRoot
+            if ($exitCode -ne 0) {
+                throw "cargo $($ArgumentList -join ' ') failed with exit code $exitCode"
+            }
+
+            return
         }
 
-        return
-    }
+        & cargo @ArgumentList
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo $($ArgumentList -join ' ') failed with exit code $LASTEXITCODE"
+        }
+    } catch {
+        if (-not $shouldRetryWithoutSccache) {
+            throw
+        }
 
-    & cargo @ArgumentList
-    if ($LASTEXITCODE -ne 0) {
-        throw "cargo $($ArgumentList -join ' ') failed with exit code $LASTEXITCODE"
+        Write-Warning "Cargo command failed with sccache enabled; retrying once without sccache."
+        Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+        $env:SCCACHE_DISABLE = '1'
+
+        if ($script:UseCargoWrapper) {
+            $exitCode = Invoke-CargoWrapper -ArgumentList $ArgumentList -WorkingDirectory $RepoRoot
+            if ($exitCode -ne 0) {
+                throw "cargo $($ArgumentList -join ' ') failed with exit code $exitCode after disabling sccache"
+            }
+
+            return
+        }
+
+        & cargo @ArgumentList
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo $($ArgumentList -join ' ') failed with exit code $LASTEXITCODE after disabling sccache"
+        }
     }
 }
 
 function Copy-FfiNativeBinary {
     param([Parameter(Mandatory)][string]$ProfileName)
 
-    $profileDir = Join-Path $RepoRoot "target\$ProfileName"
+    $targetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        Join-Path $RepoRoot 'target'
+    } elseif ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+        $env:CARGO_TARGET_DIR
+    } else {
+        Join-Path $RepoRoot $env:CARGO_TARGET_DIR
+    }
+
+    $profileDir = Join-Path $targetRoot $ProfileName
     $sourceDll = Join-Path $profileDir 'ironrdp.dll'
 
     if (-not (Test-Path $sourceDll)) {
@@ -222,6 +256,7 @@ try {
     }
 
     if ($NoSccache) {
+        $script:UseCargoWrapper = $false
         Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
         $env:SCCACHE_DISABLE = '1'
     } else {
@@ -254,7 +289,7 @@ try {
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs $ffiArgs -SupportsTimings)
             Copy-FfiNativeBinary -ProfileName $(if ($Release) { $FfiBuildProfile } else { 'debug' })
             Ensure-DiplomatTool
-            Invoke-RepoCargo -ArgumentList @('xtask', 'ffi', 'bindings', '-v')
+            Invoke-RepoCargo -ArgumentList @('xtask', 'ffi', 'bindings', '-v', '--skip-dotnet-build')
             Invoke-DotNetBuild
         }
         'test' {
@@ -283,7 +318,7 @@ try {
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ffi') + (Get-ProfileArgs $ffiProfile)) -SupportsTimings)
             Copy-FfiNativeBinary -ProfileName $(if ($Release) { $FfiBuildProfile } else { 'debug' })
             Ensure-DiplomatTool
-            Invoke-RepoCargo -ArgumentList @('xtask', 'ffi', 'bindings', '-v')
+            Invoke-RepoCargo -ArgumentList @('xtask', 'ffi', 'bindings', '-v', '--skip-dotnet-build')
             Invoke-DotNetBuild
 
             if ($UseNextest -or (Test-Tool 'cargo-nextest')) {

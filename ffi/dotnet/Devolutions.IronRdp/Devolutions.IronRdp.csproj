@@ -10,6 +10,8 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <SuppressDependenciesWhenPacking>false</SuppressDependenciesWhenPacking>
+    <NoWarn>$(NoWarn);CS0108;CS8603</NoWarn>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -17,5 +19,9 @@
     <NativeLibPath_win_x64>$(RuntimesPath)/win-x64/native/DevolutionsIronRdp.dll</NativeLibPath_win_x64>
   </PropertyGroup>
 
-  <Import Condition="!$(PackageId.EndsWith('iOS'))" Project="Devolutions.IronRdp.Build.props"/>
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <Import Project="Devolutions.IronRdp.Build.props"/>
 </Project>

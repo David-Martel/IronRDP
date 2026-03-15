@@ -32,7 +32,7 @@ pub(crate) fn build_dynamic_lib(sh: &Shell, release: bool) -> anyhow::Result<()>
     let profile_dir = if release { FFI_RELEASE_PROFILE } else { "debug" };
 
     let root_dir = sh.current_dir();
-    let target_dir = root_dir.join("target");
+    let target_dir = cargo_target_dir(&root_dir);
     let profile_dir = target_dir.join(profile_dir);
 
     let output_lib_path = profile_dir.join(OUTPUT_LIB_NAME);
@@ -68,6 +68,7 @@ pub(crate) fn build_bindings(sh: &Shell, skip_dotnet_build: bool) -> anyhow::Res
     }
 
     let dotnet_generated_path = "./dotnet/Devolutions.IronRdp/Generated/";
+    let temp_dotnet_generated_path = "./dotnet/Devolutions.IronRdp/Generated.tmp/";
     let diplomat_config = "./dotnet-interop-conf.toml";
 
     // Check if diplomat tool is installed
@@ -77,14 +78,24 @@ pub(crate) fn build_bindings(sh: &Shell, skip_dotnet_build: bool) -> anyhow::Res
     if !generated_code_dir.exists() {
         anyhow::bail!("The directory {} does not exist", generated_code_dir.display());
     }
-    remove_cs_files(&generated_code_dir)?;
+    let temp_generated_code_dir = cwd.join(temp_dotnet_generated_path);
+    if temp_generated_code_dir.exists() {
+        fs::remove_dir_all(&temp_generated_code_dir)
+            .with_context(|| format!("failed to remove temporary directory {}", temp_generated_code_dir.display()))?;
+    }
+    create_dir_all(&temp_generated_code_dir)
+        .with_context(|| format!("failed to create directory {}", temp_generated_code_dir.display()))?;
 
     sh.cmd("diplomat-tool")
         .arg("dotnet")
-        .arg(dotnet_generated_path)
+        .arg(temp_dotnet_generated_path)
         .arg("-l")
         .arg(diplomat_config)
         .run()?;
+
+    replace_cs_files(&temp_generated_code_dir, &generated_code_dir)?;
+    fs::remove_dir_all(&temp_generated_code_dir)
+        .with_context(|| format!("failed to remove temporary directory {}", temp_generated_code_dir.display()))?;
 
     if skip_dotnet_build {
         return Ok(());
@@ -111,4 +122,38 @@ fn remove_cs_files(dir: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn replace_cs_files(src_dir: &Path, dst_dir: &Path) -> anyhow::Result<()> {
+    remove_cs_files(dst_dir)?;
+
+    if src_dir.is_dir() {
+        for entry in fs::read_dir(src_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("cs") {
+                let destination = dst_dir.join(entry.file_name());
+                println!("Moving file: {} -> {}", path.display(), destination.display());
+                fs::rename(&path, &destination).with_context(|| {
+                    format!("failed to move {} to {}", path.display(), destination.display())
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cargo_target_dir(root_dir: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() {
+                dir
+            } else {
+                root_dir.join(dir)
+            }
+        }
+        None => root_dir.join("target"),
+    }
 }

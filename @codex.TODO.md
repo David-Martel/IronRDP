@@ -6,7 +6,7 @@ The upstream IronRDP codebase is now an input, not the deployment target: change
 Current baseline:
 - Branch: `windows-server-only`
 - Fork owner: `David-Martel`
-- Latest pushed commit at the time of this update: `e607b73a`
+- Latest pushed commit at the time of this update: `a5006bee`
 - Current release posture: signed commits, public fork, Windows-native build path centered on `build.ps1`, Rust native client, and the .NET/FFI surface
 
 ## Recently completed
@@ -56,13 +56,33 @@ Refs: Git history on `windows-server-only`.
 Status: done.
 Notes: the local worktree was cleaned, signed commits were pushed, and the Codex handoff context was refreshed.
 
+10. The Windows FFI/package build path is now quieter and more reliable.
+Refs: `build.ps1`, `xtask/src/ffi.rs`, `ffi/dotnet/Devolutions.IronRdp/Devolutions.IronRdp.csproj`, `ffi/dotnet/Devolutions.IronRdp/README.md`, `ffi/README.md`.
+Status: done.
+Notes: `build.ps1` now owns the managed build sequencing, the `--skip-dotnet-build` path is honored, generated binding refresh is atomic instead of destructive, package readme metadata is present, generated-warning noise is suppressed in the package project, and FFI artifact discovery now respects `CARGO_TARGET_DIR`.
+
+11. `dtm-p1gen7` access is now understood well enough to support deployment work.
+Refs: `C:/Users/david/.codex/config.toml`, `C:/Users/david/OneDrive/Documents/PowerShell/.codex/config.toml`, `C:/Users/david/.codex/tmp/dtm-p1gen7-config.toml`.
+Status: in progress.
+Notes: local `rust-mcp-filesystem` roots were expanded to all mounted drives, a Codex restart is still required for that MCP config to reload, WinRM transport is reachable but still unauthorized, SSH access works, and remote dot-directory sync is now an SSH-first operation rather than a WinRM dependency.
+
+12. The managed framing hot path was trimmed.
+Refs: `ffi/dotnet/Devolutions.IronRdp/src/Framed.cs`.
+Status: done.
+Notes: the .NET stream wrapper now uses an async-safe write lock, avoids rebuilding the live buffer list on every exact read, and reduces per-read buffer churn in the hot path.
+
+13. The .NET demo builds no longer depend on machine-local NuGet source state.
+Refs: `ffi/dotnet/NuGet.Config`, `ffi/README.md`.
+Status: done.
+Notes: the repo now carries a local NuGet source policy using `nuget.org` plus the standard Visual Studio offline cache, which avoids restore failures caused by broken host-specific package sources.
+
 ## Priority 1: Next practical wins
 
-1. Clean the remaining .NET generated/package warnings.
-Refs: `ffi/dotnet/Devolutions.IronRdp/Generated/*.cs`, `ffi/dotnet/Devolutions.IronRdp/Devolutions.IronRdp.csproj`.
-Problem: generated C# still carries warning noise around nullability and generated naming, which makes the main Windows packaging surface harder to trust.
-Recommendation: fix the generation/post-generation pipeline so generated bindings compile warning-clean or at least warning-minimal.
-Effort: small to medium.
+1. Finish the remaining .NET package metadata and hand-written C# hygiene.
+Refs: `ffi/dotnet/Devolutions.IronRdp/Devolutions.IronRdp.csproj`, `ffi/dotnet/Devolutions.IronRdp/src/*.cs`.
+Problem: the package build is now clean, but the csproj still lacks some publisher metadata for long-term distribution, and `ImplicitUsings` is still enabled with a FIXME because the hand-written sources have not been made explicit yet.
+Recommendation: add the remaining package metadata deliberately for the David-Martel fork, then add explicit usings in hand-written files and disable implicit usings in a separate pass.
+Effort: small.
 
 2. Finish the Windows-native client bootstrap basics.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/main.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/rdp.rs`.
@@ -90,17 +110,17 @@ Effort: medium.
 
 6. Unify the Windows deployment pipeline around one authoritative path.
 Refs: `build.ps1`, `xtask/src/ffi.rs`, `.github/workflows/nuget-publish.yml`, `ffi/dotnet/*`.
-Problem: build/deploy logic is improved but still split between local scripts and release automation.
-Recommendation: make `build.ps1` and `cargo xtask ffi build` the canonical local/CI entrypoints, then align publish workflows around them.
+Problem: the local path is better defined now, but release automation still does not fully consume the same contract.
+Recommendation: make `build.ps1` and `cargo xtask ffi build` the canonical local/CI entrypoints, then align publish workflows around them and document the single supported path.
+Effort: medium.
+
+7. Turn `dtm-p1gen7` into a repeatable demo/deployment target.
+Refs: `C:/Users/david/.codex/tmp/dtm-p1gen7-config.toml`, local `~/.ssh`, future deployment scripts.
+Problem: remote access works over SSH, but the current sync path is ad hoc and WinRM still is not authorized.
+Recommendation: finish the dot-directory sync, extract the Rust best-practice guidance into the local agent/tooling environment, and script the demo deployment path so the updated client/server builds can be exercised between this machine and `dtm-p1gen7`.
 Effort: medium.
 
 ## Priority 2: Boundary cleanup with deployment payoff
-
-7. Replace allocation-heavy managed framing with pooled buffering.
-Refs: `ffi/dotnet/Devolutions.IronRdp/src/Framed.cs`.
-Problem: repeated `ToArray`/`Take`/`Skip` patterns create avoidable churn in the Windows-managed path.
-Recommendation: move to a pooled/ring-buffer design.
-Effort: medium.
 
 8. Simplify the FFI connector API.
 Refs: `ffi/src/connector/mod.rs`, `ffi/src/connector/config.rs`.
@@ -146,24 +166,29 @@ Effort: large.
 Goal: one reproducible command for native Rust + FFI packaging on Windows.
 Primary refs: `build.ps1`, `xtask/src/ffi.rs`.
 
-2. Make the .NET package warning-clean and publish-ready.
-Goal: reliable reusable library output for David-Martel-owned tools across multiple machines.
+2. Finish the .NET package metadata and make distribution semantics explicit.
+Goal: reliable reusable library output for David-Martel-owned tools across multiple machines with a clear Windows-only identity.
 Primary refs: `ffi/dotnet/Devolutions.IronRdp/*`.
 
-3. Add installer-oriented packaging once the runtime surface settles.
+3. Turn `dtm-p1gen7` into the first repeatable demo/deployment target.
+Goal: validate real client/server builds and deployment steps across multiple David-Martel machines.
+Primary refs: local SSH/deployment scripts, `build.ps1`, remote host config.
+
+4. Add installer-oriented packaging once the runtime surface settles.
 Goal: support self-contained EXE plus installer packaging from a stable build graph.
 Primary refs: `build.ps1`, future packaging project/scripts.
 
-4. Add CI validation for the David-Martel deployment path only.
+5. Add CI validation for the David-Martel deployment path only.
 Goal: validate the Windows/server fork directly instead of carrying upstream surface area that is no longer relevant.
 Primary refs: `.github/workflows/*`, `build.ps1`.
 
 ## Suggested execution order
 
-1. Clean the generated .NET warnings and unify the FFI/package build path.
+1. Finish the remaining .NET package metadata and hand-written C# hygiene.
 2. Finish Windows-native client bootstrap polish.
 3. Add focused runtime tests for server input, display update, and server-event routing.
 4. Make display/bitmap limits and server connection behavior explicit.
-5. Simplify the FFI connector and managed framing path.
-6. Narrow `connector`/`session` responsibilities.
-7. Treat `ironrdp-pdu` and `ironrdp-graphics` as the next major refactor track after the Windows deployment path is stable.
+5. Script and validate the `dtm-p1gen7` demo/deployment path.
+6. Simplify the FFI connector path.
+7. Narrow `connector`/`session` responsibilities.
+8. Treat `ironrdp-pdu` and `ironrdp-graphics` as the next major refactor track after the Windows deployment path is stable.

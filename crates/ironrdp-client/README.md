@@ -11,13 +11,15 @@ and winit for windowing.
 The native client is split into a few coarse responsibilities:
 
 - `main.rs`: CLI bootstrap, logging, Tokio runtime startup, and top-level app wiring.
-- `app.rs`: window creation, rendering, and translation of `winit` events into client input events.
+- `app.rs`: window creation, initial sizing, resize/DPI handling, rendering, and translation of `winit` events into client input events.
 - `rdp.rs`: connection establishment, transport upgrades, channel wiring, and reconnect policy.
 - `session_driver.rs`: active-session runtime that drives an established connection and translates
   protocol output into window events.
 
 That split keeps the live session loop separate from connection setup, which makes the runtime easier
 to reason about and reduces coupling between transport code and window/rendering code.
+The native window now starts at the configured desktop size instead of a hard-coded fallback, which makes
+the first connection and resize path more predictable for local demo use.
 
 ## Sample usage
 

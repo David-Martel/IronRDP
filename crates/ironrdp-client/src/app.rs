@@ -24,6 +24,8 @@ use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes};
 
 use crate::rdp::{RdpInputEvent, RdpOutputEvent};
 
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
+
 struct WindowState {
     surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
     context: softbuffer::Context<Arc<Window>>,
@@ -51,6 +53,7 @@ impl WindowState {
 
 pub struct App {
     input_event_sender: mpsc::UnboundedSender<RdpInputEvent>,
+    initial_size: PhysicalSize<u32>,
     window_state: Option<WindowState>,
     buffer: Vec<u32>,
     buffer_size: (u16, u16),
@@ -60,10 +63,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(input_event_sender: &mpsc::UnboundedSender<RdpInputEvent>) -> anyhow::Result<Self> {
+    pub fn new(
+        input_event_sender: &mpsc::UnboundedSender<RdpInputEvent>,
+        initial_size: PhysicalSize<u32>,
+    ) -> anyhow::Result<Self> {
         let input_database = ironrdp::input::Database::new();
         Ok(Self {
             input_event_sender: input_event_sender.clone(),
+            initial_size,
             window_state: None,
             buffer: Vec::new(),
             buffer_size: (0, 0),
@@ -127,7 +134,9 @@ impl ApplicationHandler<RdpOutputEvent> for App {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window_attributes = WindowAttributes::default().with_title("IronRDP");
+        let window_attributes = WindowAttributes::default()
+            .with_title("IronRDP")
+            .with_inner_size(self.initial_size);
         match event_loop.create_window(window_attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
@@ -160,7 +169,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
         match event {
             WindowEvent::Resized(size) => {
                 self.last_size = Some(size);
-                self.resize_timeout = Some(Instant::now() + Duration::from_secs(1));
+                self.resize_timeout = Some(Instant::now() + RESIZE_DEBOUNCE);
             }
             WindowEvent::CloseRequested => {
                 if self.input_event_sender.send(RdpInputEvent::Close).is_err() {
@@ -353,10 +362,13 @@ impl ApplicationHandler<RdpOutputEvent> for App {
             | WindowEvent::TouchpadPressure { .. }
             | WindowEvent::AxisMotion { .. }
             | WindowEvent::Touch(_)
-            | WindowEvent::ScaleFactorChanged { .. }
             | WindowEvent::ThemeChanged(_)
             | WindowEvent::Occluded(_) => {
                 // ignore
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.last_size = Some(window.inner_size());
+                self.resize_timeout = Some(Instant::now() + RESIZE_DEBOUNCE);
             }
         }
     }
