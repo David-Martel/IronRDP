@@ -1,233 +1,357 @@
 # Codex TODO
 
-This file tracks David-Martel-owned follow-up work for the Windows/server-focused fork.
-The upstream IronRDP codebase is now an input, not the deployment target: changes here should improve the quality, maintainability, and deployability of the Windows-only fork across multiple machines.
+This file tracks David-Martel-owned follow-up work for the Windows-native
+`windows-server-only` fork. Upstream IronRDP is now source material, not the
+product contract. Priorities below are ordered for:
 
-Current baseline:
-- Branch: `windows-server-only`
+- Windows-native runtime quality first
+- repeatable multi-machine deployment second
+- Intel x64 CPU baseline first, optional GPU acceleration second
+- measured reliability/performance wins before speculative feature breadth
+
+## Current product contract
+
 - Fork owner: `David-Martel`
-- Latest pushed commit at the time of this update: `a5006bee`
-- Current release posture: signed commits, public fork, Windows-native build path centered on `build.ps1`, Rust native client, and the .NET/FFI surface
+- Branch: `windows-server-only`
+- Primary product surfaces:
+  - native Rust client: `crates/ironrdp-client`
+  - native Rust server skeleton: `crates/ironrdp-server`
+  - Windows FFI/.NET surface: `ffi/`, `ffi/dotnet/`
+  - Windows build/package entrypoint: `build.ps1`
+- Primary deployment target: `dtm-p1gen7`
+- Primary validation environment:
+  - Intel x64 CPU baseline
+  - optional Intel iGPU
+  - optional NVIDIA discrete GPU
+  - mixed 1 GbE / 10 GbE / virtual NIC / VPN paths
+
+## Platform assumptions
+
+These assumptions are deliberate and should drive implementation choices.
+
+1. CPU baseline: Intel x64 first.
+Meaning:
+- portable release artifacts must run on normal modern Intel Windows systems
+- workstation-only `target-cpu=native` builds remain opt-in
+- build/reliability work should assume high core-count Intel hosts are common
+
+2. GPU posture: software render/decode remains the default shipping path.
+Meaning:
+- Intel iGPU and NVIDIA GPU are acceleration opportunities, not requirements
+- the branch must stay usable on CPU-only systems
+- GPU work must not become a hidden build/runtime dependency
+
+3. Toolchain posture: MSVC is the default shipping toolchain.
+Meaning:
+- CargoTools + MSVC + .NET is the primary supported path
+- LLVM/lld is a preferred acceleration overlay when installed
+- oneAPI and CUDA are optional measured overlays, not required setup
+
+4. Network posture: both LAN and WAN behavior matter.
+Meaning:
+- this fork is no longer “local workstation only”
+- session stability, keepalive, jitter tolerance, reconnect behavior, and packet sizing matter
+- demo flows between this machine and `dtm-p1gen7` are a first-class target
+
+5. Packaging posture: portable artifacts must stay distinct from host-tuned artifacts.
+Meaning:
+- portable `win-x64` builds should remain conservative
+- host-tuned builds may use `NativeCpu` and machine-local toolchain advantages
+- manifests and docs must keep the two classes explicit
 
 ## Recently completed
 
-1. Platform-specific CI/build drift was cleaned up.
+1. Platform-specific CI/build drift cleanup.
 Refs: `xtask/src/main.rs`, `xtask/src/cov.rs`, `xtask/src/check.rs`, `ARCHITECTURE.md`, `Cargo.toml`.
 Status: done.
-Notes: `cargo xtask ci` no longer assumes removed web-era paths or old platform behavior, stale coverage filters were removed, and the repo metadata better reflects the trimmed fork.
 
-2. Excluded crates were reclassified away from generic “fix compilation” debt.
+2. Excluded crates were reclassified as legacy/unmaintained surfaces instead of fake “fix compilation” debt.
 Refs: `Cargo.toml`, `AGENTS.md`, `ARCHITECTURE.md`.
 Status: done.
-Notes: the fork now treats these as intentionally parked/legacy surfaces instead of pretending they are active near-term work.
 
-3. The Windows build/deployment path was upgraded.
-Refs: `build.ps1`, `.cargo/config.toml`, `Cargo.toml`, `xtask/src/ffi.rs`.
+3. `build.ps1` became the optimized Windows build entrypoint using CargoTools-managed environment/config.
+Refs: `build.ps1`, `.cargo/config.toml`, `xtask/src/ffi.rs`.
 Status: done.
-Notes: `build.ps1` now uses the CargoTools environment for optimized Windows builds, `sccache`/linker acceleration, and FFI helper setup.
 
 4. FFI boundary hardening landed.
 Refs: `ffi/src/log.rs`, `ffi/src/connector/mod.rs`, `ffi/dotnet/Devolutions.IronRdp/src/Connection.cs`.
 Status: mostly done.
-Notes: panic-prone paths were removed from the exposed FFI surface, and the managed connection helper no longer blindly accepts any TLS certificate by default.
 
-5. The foundational `std`/`no_std` story was clarified instead of left misleading.
-Refs: `crates/ironrdp-propertyset/Cargo.toml`, `crates/ironrdp-svc/Cargo.toml`, `crates/ironrdp-svc/src/lib.rs`, `crates/ironrdp-dvc/Cargo.toml`, `crates/ironrdp-rdpsnd/Cargo.toml`.
+5. The old absolute `no_std` messaging was corrected.
+Refs: `ARCHITECTURE.md`, `CLAUDE.md`, `AGENTS.md`, foundational crate manifests.
 Status: done.
-Notes: manifest/runtime feature wiring now better matches actual code paths.
 
-6. The unsound native client window/display lifetime workaround was removed.
+6. Native client window/render lifetime handling was fixed.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/main.rs`.
 Status: done.
-Notes: window, `softbuffer` context, and surface ownership now live in a dedicated state boundary without the fake `'static` lifetime hack.
 
-7. The client runtime was split into clearer responsibilities.
-Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/README.md`.
+7. Client and server runtimes were split into bootstrap vs session-driver boundaries.
+Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/src/session_driver.rs`.
 Status: done.
-Notes: connection/bootstrap and live session processing are now separated.
 
-8. The server runtime was split and the event dispatcher was isolated.
-Refs: `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-server/README.md`.
+8. The Windows FFI/package path became quieter and more reproducible.
+Refs: `build.ps1`, `xtask/src/ffi.rs`, `ffi/README.md`, `ffi/dotnet/NuGet.Config`, `ffi/dotnet/Devolutions.IronRdp/*.csproj`.
 Status: done.
-Notes: listener/bootstrap logic is separated from accepted-session runtime, and the event-routing path now has narrower internal helpers.
 
-9. The fork is now in a clean signed state suitable for continued development.
-Refs: Git history on `windows-server-only`.
+9. Native client bootstrap/runtime polish moved forward.
+Refs: `crates/ironrdp-client/src/config.rs`, `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/main.rs`, `crates/ironrdp-client/src/rdp.rs`.
 Status: done.
-Notes: the local worktree was cleaned, signed commits were pushed, and the Codex handoff context was refreshed.
 
-10. The Windows FFI/package build path is now quieter and more reliable.
-Refs: `build.ps1`, `xtask/src/ffi.rs`, `ffi/dotnet/Devolutions.IronRdp/Devolutions.IronRdp.csproj`, `ffi/dotnet/Devolutions.IronRdp/README.md`, `ffi/README.md`.
-Status: done.
-Notes: `build.ps1` now owns the managed build sequencing, the `--skip-dotnet-build` path is honored, generated binding refresh is atomic instead of destructive, package readme metadata is present, generated-warning noise is suppressed in the package project, and FFI artifact discovery now respects `CARGO_TARGET_DIR`.
-
-11. `dtm-p1gen7` access is now understood well enough to support deployment work.
-Refs: `C:/Users/david/.codex/config.toml`, `C:/Users/david/OneDrive/Documents/PowerShell/.codex/config.toml`, `C:/Users/david/.codex/tmp/dtm-p1gen7-config.toml`.
-Status: in progress.
-Notes: local `rust-mcp-filesystem` roots were expanded to all mounted drives, a Codex restart is still required for that MCP config to reload, WinRM transport is reachable but still unauthorized, SSH access works, and remote dot-directory sync is now an SSH-first operation rather than a WinRM dependency.
-
-12. The managed framing hot path was trimmed.
-Refs: `ffi/dotnet/Devolutions.IronRdp/src/Framed.cs`.
-Status: done.
-Notes: the .NET stream wrapper now uses an async-safe write lock, avoids rebuilding the live buffer list on every exact read, and reduces per-read buffer churn in the hot path.
-
-13. The .NET demo builds no longer depend on machine-local NuGet source state.
-Refs: `ffi/dotnet/NuGet.Config`, `ffi/README.md`.
-Status: done.
-Notes: the repo now carries a local NuGet source policy using `nuget.org` plus the standard Visual Studio offline cache, which avoids restore failures caused by broken host-specific package sources.
-
-14. Shared Rust guidance from `dtm-p1gen7` is now reflected in the fork itself.
-Refs: `C:/Users/david/.agents/rust-guidelines.txt`, `C:/Users/david/.agents/rust-development-guide.md`, `AGENTS.md`, `.github/workflows/ci.yml`, `crates/ironrdp-client/src/main.rs`.
-Status: done.
-Notes: the imported Microsoft/agent guidance is now reflected in repo guidance, native-client rustdoc is enforced in CI, and the client now uses `mimalloc` for the app binary path.
-
-15. Native client bootstrap and runtime polish moved forward.
-Refs: `crates/ironrdp-cfg/src/lib.rs`, `crates/ironrdp-client/src/config.rs`, `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/main.rs`, `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/README.md`.
-Status: done.
-Notes: the client now accepts explicit `--width`/`--height`, consumes `.rdp` `desktopwidth`/`desktopheight`, propagates real process exit codes on connection/runtime failures, avoids unnecessary softbuffer resizes, and enables `TCP_NODELAY` on the direct TCP path.
-
-16. Server-side reliability and encoder scratch-buffer reuse improved.
+10. Server reliability and encoder scratch-buffer reuse improved.
 Refs: `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-server/src/encoder/mod.rs`.
 Status: done.
-Notes: display backend update failures now terminate the session instead of warning forever, backlog X.224 replay can now stop a session cleanly, and bitmap/RemoteFX handlers reuse scratch buffers instead of allocating fresh workspaces on every update.
 
-17. The Windows build framework is now machine-aware.
+11. Build manifests now record machine-scoped artifact metadata.
 Refs: `build.ps1`.
 Status: done.
-Notes: `build.ps1` now consumes CargoTools machine config by default, opportunistically reads ProfileUtilities machine/profile config, sets target/cache/sccache/NuGet roots from machine-specific settings, exposes package/publish modes, emits build version metadata into the environment, and writes machine-scoped artifact manifests for multi-machine deployment.
 
-## Priority 1: Next practical wins
+12. Windows client socket setup now applies both `TCP_NODELAY` and TCP keepalive on direct TCP and WebSocket bootstrap paths.
+Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/Cargo.toml`.
+Status: done.
 
-1. Add real Unicode/IME text input to the native client.
-Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/config.rs`.
-Problem: the client still relies on scancode-only input and ignores `WindowEvent::Ime`, which is the largest remaining usability gap for day-to-day Windows use.
-Recommendation: introduce a Unicode-capable input path for IME commit text and stale-comment cleanup around the old winit limitation.
-Effort: medium.
+13. The build framework now records hardware and toolchain profile data and can emit a manifest without compiling via `build.ps1 -Mode doctor`.
+Refs: `build.ps1`, `README.md`.
+Status: done.
 
-2. Finish the remaining .NET package metadata and hand-written C# hygiene.
-Refs: `ffi/dotnet/Devolutions.IronRdp/Devolutions.IronRdp.csproj`, `ffi/dotnet/Devolutions.IronRdp/src/*.cs`.
-Problem: the package build is now clean, but the csproj still lacks some publisher metadata for long-term distribution, and `ImplicitUsings` is still enabled with a FIXME because the hand-written sources have not been made explicit yet.
-Recommendation: add the remaining package metadata deliberately for the David-Martel fork, then add explicit usings in hand-written files and disable implicit usings in a separate pass.
+## Immediate next batch
+
+This is the next concrete implementation queue, not a wish list.
+
+1. Eliminate the native client’s avoidable full-frame copy/repack churn.
+Refs: `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`.
+Why now:
+- this is the clearest CPU bottleneck on Intel systems
+- it affects both GPU-present and software-only machines
+- it should move perf more than speculative GPU work
+Done when:
+- frame conversion reuses buffers or hands off a reusable pixel buffer
+- per-frame heap churn is reduced measurably
+
+2. Finish native-client Unicode/IME input.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
+Why now:
+- this is still one of the biggest Windows usability gaps vs `mstsc`
+- it matters more than deeper protocol refactors for real demos
+Done when:
+- `WindowEvent::Ime` is handled correctly
+- committed Unicode text input works in normal Windows use
+
+3. Add focused runtime tests for the newer client/server session seams.
+Refs: `crates/ironrdp-testsuite-extra`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-client/src/session_driver.rs`.
+Why now:
+- recent reliability changes need narrow tests, not just broad smoke coverage
+Done when:
+- backlog disconnect, display failure, and single-session behavior are pinned down
+
+4. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
+Refs: `build.ps1`, emitted artifact manifests, remote deploy scripts to be added.
+Why now:
+- this turns the branch into a real product path instead of a local-only build
+Done when:
+- package output can be copied, launched, and verified remotely with one documented flow
+
+## Priority 0: Lock the Windows build contract
+
+1. Publish one crisp support matrix.
+Refs: `README.md`, `xtask/README.md`, `ffi/README.md`, `build.ps1`.
+Do next:
+- define required vs optional Windows build tools
+- document portable vs host-tuned artifact classes
+- document when LLVM/lld, oneAPI, CUDA are only advisory
 Effort: small.
 
-3. Finish the Windows-native client reconnect and panic-removal pass.
-Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/main.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/rdp.rs`.
-Problem: explicit sizing/exit behavior is better now, but reconnect UX is still silent, some UI/render failures still log-and-return instead of presenting a clearer shutdown path, and text input still needs the Unicode path above.
-Recommendation: add reconnect state surfacing, finish remaining panic-to-error conversions, and complete the user-visible startup/reconnect path before deeper internal refactors.
+2. Guarantee FFI demo outputs are self-contained for another Windows machine.
+Refs: `build.ps1`, `xtask/src/ffi.rs`, `ffi/dotnet/Devolutions.IronRdp.targets`, `ffi/dotnet/Devolutions.IronRdp.ConnectExample/*.csproj`.
+Do next:
+- validate the native DLL inclusion contract
+- validate publish folder layout
+- add a manifest check for required runtime files
 Effort: medium.
 
-4. Add focused tests around the server runtime seam.
-Refs: `crates/ironrdp-testsuite-extra/tests/mod.rs`, `crates/ironrdp-server/src/session_driver.rs`.
-Problem: integration coverage exists, but it still does not directly assert input delivery, clipboard/audio server events, or the new display-update/backlog failure paths.
-Recommendation: add focused tests for input handler delivery, event dispatch families, backlog disconnect handling, and display backend failure behavior.
+3. Finish the CargoTools/ProfileUtilities/MachineConfiguration contract for this fork.
+Refs: `build.ps1`, local module environment, emitted manifests.
+Do next:
+- document which module provides which setting on each machine
+- keep fallback behavior deterministic when optional modules are missing or broken
+- confirm cache/artifact roots across this machine and `dtm-p1gen7`
 Effort: medium.
 
-5. Make display and bitmap limitations fail explicitly instead of degrading implicitly.
-Refs: `crates/ironrdp-displaycontrol/src/client.rs`, `crates/ironrdp-server/src/encoder/bitmap.rs`, `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/src/encoder/mod.rs`.
-Problem: unsupported display layouts and bitmap edge cases are still handled too late or too implicitly.
-Recommendation: reject unsupported combinations earlier, clamp where safe, document the enforced constraints in the server README/API docs, and address the remaining non-4-aligned bitmap path.
-Effort: medium.
+4. Keep portable release settings distinct from workstation-only tuning.
+Refs: `build.ps1`, `.cargo/config.toml`.
+Do next:
+- reserve `target-cpu=native` for machine-local builds
+- keep portable `win-x64` outputs conservative
+- mark the class clearly in artifact manifests and docs
+Effort: small.
 
-6. Make the server connection model a first-class contract.
+5. Pin the Windows developer toolchain story.
+Refs: `rust-toolchain.toml`, `build.ps1`, `ffi/dotnet/*`.
+Do next:
+- decide on a repo `global.json` for .NET SDK pinning
+- state the expected MSVC/NASM/Ninja/Clang availability by build mode
+- keep oneAPI/CUDA documented as optional overlays
+Effort: small.
+
+## Priority 1: Runtime correctness before acceleration
+
+1. Make single-session server behavior an explicit fork contract.
 Refs: `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/README.md`.
-Problem: `RdpServer::run()` is still effectively single-client, but that behavior is not yet the explicit product contract for this fork.
-Recommendation: either document and embrace single-session behavior for David-Martel’s use case, or move to task-per-connection deliberately.
+Effort: small to medium.
+
+2. Finish focused runtime tests around the session seams.
+Refs: `crates/ironrdp-testsuite-extra/tests/*`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-server/src/session_driver.rs`.
 Effort: medium.
 
-7. Unify the Windows deployment pipeline around one authoritative path.
-Refs: `build.ps1`, `xtask/src/ffi.rs`, `.github/workflows/nuget-publish.yml`, `ffi/dotnet/*`.
-Problem: the local path is now machine-aware, but CI/release automation still does not fully consume the same contract and the optional `MachineConfiguration` module is still miswired on this workstation.
-Recommendation: make `build.ps1` and `cargo xtask ffi build` the canonical local/CI entrypoints, fix the local `MachineConfiguration` import path, then align publish workflows around the same contract and document the supported deployment matrix and artifact manifest contract.
+3. Make display and bitmap constraints fail early and clearly.
+Refs: `crates/ironrdp-server/src/encoder/bitmap.rs`, `crates/ironrdp-server/src/encoder/mod.rs`, `crates/ironrdp-server/src/session_driver.rs`.
 Effort: medium.
 
-8. Turn `dtm-p1gen7` into a repeatable demo/deployment target.
-Refs: `C:/Users/david/.codex/tmp/dtm-p1gen7-config.toml`, local `~/.ssh`, future deployment scripts.
-Problem: remote access works over SSH, but the current sync path is ad hoc and WinRM still is not authorized.
-Recommendation: finish the dot-directory sync, extract the Rust best-practice guidance into the local agent/tooling environment, and script the demo deployment path so the updated client/server builds can be exercised between this machine and `dtm-p1gen7`.
+4. Finish Unicode/IME input.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Effort: medium.
 
-9. Validate published demo artifacts on a second machine, not just local build output.
-Refs: `build.ps1`, `ffi/dotnet/Devolutions.IronRdp/*.csproj`, `T:/RustCache/artifacts/IronRDP/windows-server-only/*/build-manifest.json`.
-Problem: the package path now emits machine-scoped artifacts and manifests, but the fork still lacks an end-to-end check that those artifacts run on another machine without local source-tree assumptions.
-Recommendation: deploy the packaged native client and FFI outputs to `dtm-p1gen7`, confirm the manifest is sufficient to reconstruct the build context, and add a lightweight smoke-deploy script around that path.
+5. Finish reconnect/shutdown clarity.
+Refs: `crates/ironrdp-client/src/main.rs`, `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Effort: medium.
 
-## Priority 2: Boundary cleanup with deployment payoff
+## Priority 2: Windows performance and acceleration
 
-10. Simplify the FFI connector API.
-Refs: `ffi/src/connector/mod.rs`, `ffi/src/connector/config.rs`.
-Problem: the connector surface still exposes too much consumed-state machinery and internal ownership detail.
-Recommendation: introduce clearer attach/build semantics and reduce exported stateful take/replace patterns.
+1. Remove avoidable client graphics-copy overhead.
+Refs: `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`.
+Problem:
+- the client still repacks a full decoded frame and then copies it again into `softbuffer`
+- this is likely the top CPU bottleneck on Intel machines
 Effort: medium.
 
-11. Reduce client rendering/event hot-path churn further.
-Refs: `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-session/src/fast_path.rs`, `crates/ironrdp-server/src/encoder/rfx.rs`.
-Problem: the client still rebuilds a packed framebuffer for every image update, and session/graphics code still has avoidable copies and temporary allocations in compressed update and RFX paths.
-Recommendation: add reusable packed-frame scratch storage in the client, remove the remaining decompression clone, and reuse RFX workspaces across frames.
-Effort: medium.
-
-12. Move presentation/rendering knobs out of `connector::Config`.
-Refs: `crates/ironrdp-connector/src/lib.rs`, `crates/ironrdp-client/src/config.rs`, `ffi/src/connector/config.rs`.
-Problem: client-specific rendering and pointer settings still leak into lower-level connector configuration.
-Recommendation: move them into a higher-level client/session config boundary.
-Effort: medium.
-
-13. Reduce `ironrdp-session` coupling to `ironrdp-connector`.
-Refs: `crates/ironrdp-session/Cargo.toml`, `crates/ironrdp-session/src/lib.rs`.
-Problem: activation/session responsibilities are still not as cleanly separated as they should be.
-Recommendation: extract the minimum shared activation/session state and narrow the dependency boundary.
-Effort: medium.
-
-14. Decide which unpublished crates are intentionally private in this fork.
-Refs: `crates/ironrdp-propertyset/Cargo.toml`, `crates/ironrdp-cfg/Cargo.toml`, `crates/ironrdp-mstsgu/Cargo.toml`, `crates/ironrdp-rdpfile/Cargo.toml`, `crates/ironrdp-egfx/Cargo.toml`.
-Problem: several crates still read as unresolved “publish later” debt.
-Recommendation: replace the vague TODOs with an explicit private/internal policy where appropriate.
+2. Add lightweight graphics/runtime diagnostics before deep render changes.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
+Do next:
+- trace frame conversion time
+- trace present time
+- count resize/reconnect and cursor churn
 Effort: small.
 
-## Priority 3: Strategic refactors
+3. Baseline CPU-first performance on Intel hardware before chasing GPU work.
+Refs: `build.ps1`, `crates/ironrdp-client`, `crates/ironrdp-server/src/encoder/*`, `benches/`.
+Do next:
+- compare portable vs host-tuned builds
+- validate allocator/linker/job-count choices against wall-clock data
+- capture baseline scenarios for this machine and `dtm-p1gen7`
+Effort: medium.
 
-15. Turn broad `ironrdp-pdu` architecture debt into scoped tracked work.
-Refs: `ARCHITECTURE.md`, `crates/ironrdp-pdu/Cargo.toml`, `crates/ironrdp-pdu/README.md`.
-Problem: the crate is still too broad and still carries dependency debt described only in broad terms.
-Recommendation: split the work into discrete dependency-removal and module-boundary tasks.
+4. Add network-aware tuning guidance and measurements.
+Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-server/src/encoder/mod.rs`.
+Do next:
+- define LAN vs WAN profiles
+- review flush cadence, request sizing, batching, and reconnect behavior
+- expose only the knobs that are stable enough to support
+Effort: medium.
+
+5. Improve audio latency and underrun behavior on Windows.
+Refs: `crates/ironrdp-rdpsnd-native/src/cpal.rs`.
+Do next:
+- make buffer sizing configurable or adaptive
+- validate playback stability on different Windows endpoints
+- add metrics around underruns
+Effort: medium.
+
+6. Evaluate Intel iGPU acceleration as a scoped experiment, not a default path.
+Refs: future Windows-native render/encode experimentation.
+Guardrails:
+- no hard dependency in the default build
+- no regression for CPU-only systems
+- keep the experiment separate from the portable baseline
+Effort: medium.
+
+7. Keep NVIDIA/CUDA optional and isolated.
+Refs: future packaging/docs/experiments.
+Guardrails:
+- do not require CUDA for normal builds
+- only pursue if CPU and software-path wins are exhausted first
+Effort: small.
+
+8. Decide where LLVM/lld and oneAPI materially help, using measurements.
+Refs: `build.ps1`, local machine configuration, future benchmark notes.
+Effort: medium.
+
+## Priority 3: Windows-native feature parity and usability
+
+1. Add real Windows device redirection beyond the current `NoopRdpdrBackend`.
+Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-rdpdr`, `crates/ironrdp-rdpdr-native`.
+Initial scope:
+- drive redirection
+- printer redirection if practical
+- smartcard cleanup if already close
 Effort: medium to large.
 
-16. Split `ironrdp-graphics` into smaller crates and remove legacy helpers.
-Refs: `ARCHITECTURE.md`, `crates/ironrdp-graphics/Cargo.toml`, `crates/ironrdp-graphics/src/lib.rs`.
-Problem: graphics remains oversized and still mixes several concerns.
-Recommendation: isolate codec- or format-specific code, then tighten local invariants and lint posture.
+2. Define the Windows-only strategy for USB-class or vendor-specific devices.
+Refs: `crates/ironrdp-dvc-com-plugin`, `crates/ironrdp-dvc-pipe-proxy`.
+Likely direction:
+- DVC/COM plugin bridge instead of trying to force everything through generic `RDPDR`
+Effort: medium.
+
+3. Decide whether end-to-end EGFX/H.264 becomes a first-class Windows track.
+Refs: `crates/ironrdp-server/src/gfx.rs`, `crates/ironrdp-egfx`, native client graphics path.
+Guardrails:
+- prove value on Windows workloads
+- keep classic bitmap/RemoteFX compatibility paths intact
+Effort: medium to large.
+
+4. Evaluate UDP/multitransport support.
+Refs: client runtime, transport stack, session-driver notes.
+Problem:
+- this is still a major gap vs native Windows RDP on lossy or higher-latency links
 Effort: large.
 
-## Deployment roadmap
+## Priority 4: Deployment and operator experience
 
-1. Stabilize the current local build path.
-Goal: one reproducible command for native Rust + FFI packaging on Windows.
-Primary refs: `build.ps1`, `xtask/src/ffi.rs`.
+1. Turn `dtm-p1gen7` into a repeatable smoke-deploy target.
+Refs: SSH deploy path, `build.ps1`, emitted manifests.
+Effort: medium.
 
-2. Finish the .NET package metadata and make distribution semantics explicit.
-Goal: reliable reusable library output for David-Martel-owned tools across multiple machines with a clear Windows-only identity.
-Primary refs: `ffi/dotnet/Devolutions.IronRdp/*`.
+2. Finish the .NET package and demo-distribution story.
+Refs: `ffi/dotnet/Devolutions.IronRdp/*.csproj`, `ffi/README.md`.
+Effort: medium.
 
-3. Turn `dtm-p1gen7` into the first repeatable demo/deployment target.
-Goal: validate real client/server builds and deployment steps across multiple David-Martel machines.
-Primary refs: local SSH/deployment scripts, `build.ps1`, remote host config.
+3. Add installer-oriented packaging only after the artifact graph stabilizes.
+Refs: `build.ps1`, future packaging scripts/project.
+Effort: medium.
 
-4. Add installer-oriented packaging once the runtime surface settles.
-Goal: support self-contained EXE plus installer packaging from a stable build graph.
-Primary refs: `build.ps1`, future packaging project/scripts.
+## Priority 5: Boundary cleanup with clear payoff
 
-5. Add CI validation for the David-Martel deployment path only.
-Goal: validate the Windows/server fork directly instead of carrying upstream surface area that is no longer relevant.
-Primary refs: `.github/workflows/*`, `build.ps1`.
+1. Simplify the FFI connector API.
+Refs: `ffi/src/connector/mod.rs`, `ffi/src/connector/config.rs`.
+Effort: medium.
+
+2. Move presentation-specific knobs out of `connector::Config`.
+Refs: `crates/ironrdp-connector/src/lib.rs`, `crates/ironrdp-client/src/config.rs`, `ffi/src/connector/config.rs`.
+Effort: medium.
+
+3. Reduce `ironrdp-session` coupling to `ironrdp-connector`.
+Refs: `crates/ironrdp-session/Cargo.toml`, `crates/ironrdp-session/src/lib.rs`.
+Effort: medium.
+
+4. Decide which unpublished crates stay intentionally private in this fork.
+Refs: `crates/ironrdp-propertyset/Cargo.toml`, `crates/ironrdp-cfg/Cargo.toml`, `crates/ironrdp-mstsgu/Cargo.toml`, `crates/ironrdp-rdpfile/Cargo.toml`, `crates/ironrdp-egfx/Cargo.toml`.
+Effort: small.
+
+## Deferred strategic refactors
+
+1. Turn `ironrdp-pdu` debt into scoped tracked work.
+Refs: `ARCHITECTURE.md`, `crates/ironrdp-pdu/Cargo.toml`, `crates/ironrdp-pdu/README.md`.
+Effort: medium to large.
+
+2. Split `ironrdp-graphics` into smaller crates only after the Windows deployment path settles.
+Refs: `ARCHITECTURE.md`, `crates/ironrdp-graphics/Cargo.toml`, `crates/ironrdp-graphics/src/lib.rs`.
+Effort: large.
 
 ## Suggested execution order
 
-1. Add Unicode/IME input support to the native client.
-2. Finish client reconnect and panic-removal polish.
-3. Add focused runtime tests for server input, display update, backlog disconnect, and server-event routing.
-4. Make display/bitmap limits and server connection behavior explicit.
-5. Finish aligning CI/release automation with the machine-aware `build.ps1` contract.
-6. Validate package/publish artifacts on `dtm-p1gen7` and script the smoke-deploy path.
-7. Simplify the FFI connector path.
-8. Narrow `connector`/`session` responsibilities.
-9. Treat `ironrdp-pdu` and `ironrdp-graphics` as the next major refactor track after the Windows deployment path is stable.
+1. Lock the supported build matrix and artifact-class contract.
+2. Finish the `dtm-p1gen7` deploy-and-smoke-test path.
+3. Remove client graphics-copy overhead and add frame-path diagnostics.
+4. Finish Unicode/IME input and reconnect/shutdown clarity.
+5. Add focused runtime tests for display failure, backlog disconnect, and single-session behavior.
+6. Measure portable vs host-tuned Intel builds on both primary machines.
+7. Revisit optional LLVM/lld, oneAPI, Intel iGPU, EGFX, and CUDA work only after the CPU/software baseline is measured and stable.
+8. Take on the next connector/session/FFI boundary cleanup.

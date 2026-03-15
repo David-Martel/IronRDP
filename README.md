@@ -37,6 +37,7 @@ they are available on the workstation.
 Typical local flows:
 
 ```pwsh
+pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode doctor
 pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode test -UseNextest
 pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode package -Release
 pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode publish -Release -TargetMachine dtm-p1gen7
@@ -46,6 +47,12 @@ The script uses CargoTools machine settings for build job count, `sccache`,
 `CARGO_TARGET_DIR`, linker acceleration, and artifact publishing. Package and
 publish modes also emit a machine-scoped `build-manifest.json` alongside the
 generated artifacts so deployment decisions can be reproduced across machines.
+When newer Visual Studio toolchains are installed, `build.ps1` prefers the
+latest compatible MSVC toolset automatically, including Preview or Insiders
+channels when they are present. LLVM/lld, Intel oneAPI, and CUDA are treated as
+optional overlays and are recorded in the emitted manifest rather than becoming
+hard dependencies for normal builds. Portable release artifacts remain distinct
+from host-tuned `-NativeCpu` builds.
 
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 
