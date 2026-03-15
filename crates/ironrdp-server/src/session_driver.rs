@@ -342,7 +342,7 @@ impl RdpServer {
                         break Ok(RunState::Disconnect);
                     }
                     Err(error) => {
-                        warn!(error = format!("{error:#}"), "next_updated failed");
+                        break Err(error).context("display update stream failed");
                     }
                 }
             }
@@ -396,13 +396,17 @@ impl RdpServer {
 
         if !result.input_events.is_empty() {
             debug!("Handling input event backlog from acceptor sequence");
-            self.handle_input_backlog(
-                writer,
-                result.io_channel_id,
-                result.user_channel_id,
-                result.input_events,
-            )
-            .await?;
+            if self
+                .handle_input_backlog(
+                    writer,
+                    result.io_channel_id,
+                    result.user_channel_id,
+                    result.input_events,
+                )
+                .await?
+            {
+                return Ok(RunState::Disconnect);
+            }
         }
 
         self.static_channels = result.static_channels;
@@ -514,7 +518,7 @@ impl RdpServer {
         io_channel_id: u16,
         user_channel_id: u16,
         frames: Vec<Vec<u8>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         for frame in frames {
             match Action::from_fp_output_header(frame[0]) {
                 Ok(Action::FastPath) => {
@@ -523,7 +527,9 @@ impl RdpServer {
                 }
 
                 Ok(Action::X224) => {
-                    let _ = self.handle_x224(writer, io_channel_id, user_channel_id, &frame).await;
+                    if self.handle_x224(writer, io_channel_id, user_channel_id, &frame).await? {
+                        return Ok(true);
+                    }
                 }
 
                 // the frame here is always valid, because otherwise it would
@@ -532,7 +538,7 @@ impl RdpServer {
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     async fn handle_fastpath(&mut self, input: FastPathInput) {

@@ -17,6 +17,37 @@ use url::Url;
 const DEFAULT_WIDTH: u16 = 1920;
 const DEFAULT_HEIGHT: u16 = 1080;
 
+fn resolve_desktop_size(
+    width: Option<u16>,
+    height: Option<u16>,
+    property_width: Option<i64>,
+    property_height: Option<i64>,
+) -> anyhow::Result<connector::DesktopSize> {
+    match (width, height) {
+        (Some(width), Some(height)) => {
+            return Ok(connector::DesktopSize { width, height });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("desktop width and height must be provided together");
+        }
+        (None, None) => {}
+    }
+
+    match (property_width, property_height) {
+        (Some(width), Some(height)) => Ok(connector::DesktopSize {
+            width: u16::try_from(width).context("desktop width from .rdp file")?,
+            height: u16::try_from(height).context("desktop height from .rdp file")?,
+        }),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("desktop width and height from .rdp file must both be present");
+        }
+        (None, None) => Ok(connector::DesktopSize {
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+        }),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub log_file: Option<String>,
@@ -269,6 +300,14 @@ struct Args {
     #[clap(long)]
     color_depth: Option<u32>,
 
+    /// Initial desktop width to request from the server.
+    #[clap(long, requires("height"))]
+    width: Option<u16>,
+
+    /// Initial desktop height to request from the server.
+    #[clap(long, requires("width"))]
+    height: Option<u16>,
+
     /// Ignore mouse pointer messages sent by the server. Increases performance when enabled, as the
     /// client could skip costly software rendering of the pointer with alpha blending
     #[clap(long)]
@@ -468,6 +507,13 @@ impl Config {
             None
         };
 
+        let desktop_size = resolve_desktop_size(
+            args.width,
+            args.height,
+            properties.desktop_width(),
+            properties.desktop_height(),
+        )?;
+
         let connector = connector::Config {
             credentials: Credentials::UsernamePassword { username, password },
             domain: args.domain,
@@ -479,10 +525,7 @@ impl Config {
             keyboard_functional_keys_count: args.keyboard_functional_keys_count,
             ime_file_name: args.ime_file_name,
             dig_product_id: args.dig_product_id,
-            desktop_size: connector::DesktopSize {
-                width: DEFAULT_WIDTH,
-                height: DEFAULT_HEIGHT,
-            },
+            desktop_size,
             desktop_scale_factor: 0, // Default to 0 per FreeRDP
             bitmap: Some(bitmap),
             client_build: semver::Version::parse(env!("CARGO_PKG_VERSION"))
@@ -532,5 +575,36 @@ impl Config {
             #[cfg(windows)]
             dvc_plugins: args.dvc_plugin,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_desktop_size;
+
+    #[test]
+    fn resolve_desktop_size_prefers_cli_values() {
+        let size = resolve_desktop_size(Some(1600), Some(900), Some(1280), Some(720)).expect("desktop size");
+
+        assert_eq!(size.width, 1600);
+        assert_eq!(size.height, 900);
+    }
+
+    #[test]
+    fn resolve_desktop_size_uses_rdp_file_values() {
+        let size = resolve_desktop_size(None, None, Some(1366), Some(768)).expect("desktop size");
+
+        assert_eq!(size.width, 1366);
+        assert_eq!(size.height, 768);
+    }
+
+    #[test]
+    fn resolve_desktop_size_rejects_partial_values() {
+        let error = resolve_desktop_size(Some(1280), None, None, None).expect_err("partial cli size must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("desktop width and height must be provided together")
+        );
     }
 }

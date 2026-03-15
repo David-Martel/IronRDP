@@ -79,6 +79,9 @@ fn main() -> anyhow::Result<()> {
 
     debug!("Run App");
     event_loop.run_app(&mut app)?;
+    if app.exit_code().is_err() {
+        app.exit_code().process_exit();
+    }
     Ok(())
 }
 

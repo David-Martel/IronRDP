@@ -27,6 +27,26 @@ A full-fledged RDP client based on IronRDP crates suite, and implemented using n
 cargo run --bin ironrdp-client -- <HOSTNAME> --username <USERNAME> --password <PASSWORD>
 ```
 
+## Windows Build And Deployment
+
+This fork carries a Windows-focused build entrypoint at [`build.ps1`](./build.ps1).
+It is intended to run with the local `CargoTools` PowerShell module, and it
+opportunistically consumes `ProfileUtilities` and `MachineConfiguration` when
+they are available on the workstation.
+
+Typical local flows:
+
+```pwsh
+pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode test -UseNextest
+pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode package -Release
+pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode publish -Release -TargetMachine dtm-p1gen7
+```
+
+The script uses CargoTools machine settings for build job count, `sccache`,
+`CARGO_TARGET_DIR`, linker acceleration, and artifact publishing. Package and
+publish modes also emit a machine-scoped `build-manifest.json` alongside the
+generated artifacts so deployment decisions can be reproduced across machines.
+
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 
 Example of utilizing IronRDP in a blocking, synchronous fashion.

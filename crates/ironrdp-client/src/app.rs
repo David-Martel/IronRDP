@@ -13,6 +13,7 @@ use core::time::Duration;
 use std::sync::Arc;
 use std::time::Instant;
 
+use proc_exit::Code;
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 use winit::application::ApplicationHandler;
@@ -57,9 +58,11 @@ pub struct App {
     window_state: Option<WindowState>,
     buffer: Vec<u32>,
     buffer_size: (u16, u16),
+    surface_size: (u16, u16),
     input_database: ironrdp::input::Database,
     last_size: Option<PhysicalSize<u32>>,
     resize_timeout: Option<Instant>,
+    exit_code: Code,
 }
 
 impl App {
@@ -74,10 +77,21 @@ impl App {
             window_state: None,
             buffer: Vec::new(),
             buffer_size: (0, 0),
+            surface_size: (0, 0),
             input_database,
             last_size: None,
             resize_timeout: None,
+            exit_code: Code::SUCCESS,
         })
+    }
+
+    pub fn exit_code(&self) -> Code {
+        self.exit_code
+    }
+
+    fn exit_with_code(&mut self, event_loop: &ActiveEventLoop, code: Code) {
+        self.exit_code = code;
+        event_loop.exit();
     }
 
     fn send_resize_event(&mut self) {
@@ -114,9 +128,25 @@ impl App {
             return;
         };
         let _keep_context_alive = &window_state.context;
-        let mut sb_buffer = window_state.surface_mut().buffer_mut().expect("surface buffer");
+        let mut sb_buffer = match window_state.surface_mut().buffer_mut() {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                error!(%error, "Failed to acquire surface buffer");
+                return;
+            }
+        };
+        if sb_buffer.len() != self.buffer.len() {
+            error!(
+                surface_pixels = sb_buffer.len(),
+                frame_pixels = self.buffer.len(),
+                "Surface and framebuffer sizes diverged"
+            );
+            return;
+        }
         sb_buffer.copy_from_slice(self.buffer.as_slice());
-        sb_buffer.present().expect("buffer present");
+        if let Err(error) = sb_buffer.present() {
+            error!(%error, "Failed to present surface buffer");
+        }
     }
 }
 
@@ -146,13 +176,13 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                     }
                     Err(error) => {
                         error!(%error, "Failed to create drawing surface");
-                        event_loop.exit();
+                        self.exit_with_code(event_loop, proc_exit::sysexits::TEMP_FAIL);
                     }
                 }
             }
             Err(error) => {
                 error!(%error, "Failed to create window");
-                event_loop.exit();
+                self.exit_with_code(event_loop, proc_exit::sysexits::TEMP_FAIL);
             }
         }
     }
@@ -174,7 +204,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
             WindowEvent::CloseRequested => {
                 if self.input_event_sender.send(RdpInputEvent::Close).is_err() {
                     error!("Failed to send graceful shutdown event, closing the window");
-                    event_loop.exit();
+                    self.exit_with_code(event_loop, Code::FAILURE);
                 }
             }
             WindowEvent::DroppedFile(_) => {
@@ -384,21 +414,27 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                 trace!(window_physical_size = ?window.inner_size(), "Drawing image to the window with size");
                 self.buffer_size = (width.get(), height.get());
                 self.buffer = buffer;
-                window_state
-                    .surface_mut()
-                    .resize(NonZeroU32::from(width), NonZeroU32::from(height))
-                    .expect("surface resize");
+                if self.surface_size != self.buffer_size {
+                    if let Err(error) = window_state
+                        .surface_mut()
+                        .resize(NonZeroU32::from(width), NonZeroU32::from(height))
+                    {
+                        error!(%error, "Failed to resize drawing surface");
+                        self.exit_with_code(event_loop, proc_exit::sysexits::TEMP_FAIL);
+                        return;
+                    }
+                    self.surface_size = self.buffer_size;
+                }
 
                 window.request_redraw();
             }
             RdpOutputEvent::ConnectionFailure(error) => {
                 error!(?error);
                 eprintln!("Connection error: {}", error.report());
-                // TODO set proc_exit::sysexits::PROTOCOL_ERR.as_raw());
-                event_loop.exit();
+                self.exit_with_code(event_loop, proc_exit::sysexits::PROTOCOL_ERR);
             }
             RdpOutputEvent::Terminated(result) => {
-                let _exit_code = match result {
+                let exit_code = match result {
                     Ok(reason) => {
                         println!("Terminated gracefully: {reason}");
                         proc_exit::sysexits::OK
@@ -409,8 +445,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                         proc_exit::sysexits::PROTOCOL_ERR
                     }
                 };
-                // TODO set exit_code.as_raw());
-                event_loop.exit();
+                self.exit_with_code(event_loop, exit_code);
             }
             RdpOutputEvent::PointerHidden => {
                 window.set_cursor_visible(false);
@@ -426,8 +461,18 @@ impl ApplicationHandler<RdpOutputEvent> for App {
             }
             RdpOutputEvent::PointerBitmap(pointer) => {
                 debug!(width = ?pointer.width, height = ?pointer.height, "Received pointer bitmap");
+                let pointer = match Arc::try_unwrap(pointer) {
+                    Ok(pointer) => pointer,
+                    Err(pointer) => ironrdp::graphics::pointer::DecodedPointer {
+                        width: pointer.width,
+                        height: pointer.height,
+                        hotspot_x: pointer.hotspot_x,
+                        hotspot_y: pointer.hotspot_y,
+                        bitmap_data: pointer.bitmap_data.clone(),
+                    },
+                };
                 match CustomCursor::from_rgba(
-                    pointer.bitmap_data.clone(),
+                    pointer.bitmap_data,
                     pointer.width,
                     pointer.height,
                     pointer.hotspot_x,

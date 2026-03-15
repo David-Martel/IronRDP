@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('check', 'client', 'ffi', 'test', 'coverage', 'fmt', 'lints', 'all')]
+    [ValidateSet('check', 'client', 'ffi', 'test', 'coverage', 'fmt', 'lints', 'package', 'publish', 'all')]
     [string]$Mode = 'all',
 
     [switch]$Release,
@@ -12,6 +12,9 @@ param(
     [switch]$NativeCpu,
     [switch]$NoSccache,
     [switch]$SkipDotNet,
+    [string]$ArtifactRoot,
+    [string]$DeploymentName,
+    [string]$TargetMachine,
     [int]$Jobs
 )
 
@@ -25,6 +28,69 @@ $FfiOutputDll = Join-Path $FfiOutputDir 'DevolutionsIronRdp.dll'
 $FfiBuildProfile = 'production-ffi'
 $ClientBuildProfile = 'production'
 $script:UseCargoWrapper = $true
+$script:CargoMachineConfig = $null
+$script:ProfileMachineConfig = $null
+$script:ProfileConfig = $null
+$script:MachineIdentity = $null
+$script:VersionInfo = $null
+$script:ArtifactRoot = $null
+$script:DeploymentName = $null
+
+function Set-DefaultEnvVar {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value) -or -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($Name))) {
+        return
+    }
+
+    [Environment]::SetEnvironmentVariable($Name, $Value)
+}
+
+function Import-OptionalModule {
+    param([Parameter(Mandatory)][string]$Name)
+
+    try {
+        Import-Module $Name -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Warning "Optional module '$Name' could not be loaded: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-NestedValue {
+    param(
+        [Parameter(Mandatory)]$InputObject,
+        [Parameter(Mandatory)][string[]]$Path
+    )
+
+    $current = $InputObject
+    foreach ($segment in $Path) {
+        if ($null -eq $current) {
+            return $null
+        }
+
+        if ($current -is [System.Collections.IDictionary]) {
+            if (-not $current.Contains($segment)) {
+                return $null
+            }
+            $current = $current[$segment]
+            continue
+        }
+
+        $property = $current.PSObject.Properties[$segment]
+        if (-not $property) {
+            return $null
+        }
+
+        $current = $property.Value
+    }
+
+    return $current
+}
 
 function Add-RustFlag {
     param([Parameter(Mandatory)][string[]]$Flags)
@@ -143,15 +209,11 @@ function Invoke-RepoCargo {
 function Copy-FfiNativeBinary {
     param([Parameter(Mandatory)][string]$ProfileName)
 
-    $targetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
-        Join-Path $RepoRoot 'target'
-    } elseif ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
-        $env:CARGO_TARGET_DIR
-    } else {
-        Join-Path $RepoRoot $env:CARGO_TARGET_DIR
+    $configuration = if ($ProfileName -eq 'debug') { 'Debug' } else { 'Release' }
+    $profileDir = Resolve-CargoTargetDirectory -ProjectDir $RepoRoot -Configuration $configuration
+    if ($ProfileName -ne 'debug' -and -not $profileDir.EndsWith($ProfileName, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $profileDir = Join-Path (Split-Path -Parent $profileDir) $ProfileName
     }
-
-    $profileDir = Join-Path $targetRoot $ProfileName
     $sourceDll = Join-Path $profileDir 'ironrdp.dll'
 
     if (-not (Test-Path $sourceDll)) {
@@ -220,9 +282,153 @@ function Get-ProfileArgs {
     return @('--profile', $Profile)
 }
 
+function Initialize-MachineBuildContext {
+    $script:MachineIdentity = Get-MachineIdentity
+    $script:CargoMachineConfig = Get-MachineConfig
+
+    if (-not [string]::IsNullOrWhiteSpace($TargetMachine)) {
+        $script:MachineIdentity = $TargetMachine
+    }
+
+    if (Get-Command Get-MachineConfiguration -ErrorAction SilentlyContinue) {
+        $script:ProfileMachineConfig = Get-MachineConfiguration
+    }
+
+    if (Get-Command Get-ProfileConfiguration -ErrorAction SilentlyContinue) {
+        $script:ProfileConfig = Get-ProfileConfiguration
+    }
+
+    Set-DefaultEnvVar -Name 'CARGO_TARGET_DIR' -Value (Get-NestedValue $script:CargoMachineConfig @('CargoTargetDir'))
+    Set-DefaultEnvVar -Name 'SCCACHE_DIR' -Value (Get-NestedValue $script:CargoMachineConfig @('SccacheDir'))
+    Set-DefaultEnvVar -Name 'SCCACHE_CACHE_SIZE' -Value (Get-NestedValue $script:CargoMachineConfig @('SccacheCacheSize'))
+    Set-DefaultEnvVar -Name 'SCCACHE_IDLE_TIMEOUT' -Value ("$(Get-NestedValue $script:CargoMachineConfig @('SccacheIdleTimeout'))")
+    Set-DefaultEnvVar -Name 'NUGET_PACKAGES' -Value $(if ($script:CargoMachineConfig) { Join-Path $script:CargoMachineConfig.CacheRoot 'nuget-packages' } else { $null })
+
+    if ([string]::IsNullOrWhiteSpace($DeploymentName)) {
+        $DeploymentName = 'windows-server-only'
+    }
+    $script:DeploymentName = $DeploymentName
+
+    if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
+        $artifactRoots = @(
+            (Get-NestedValue $script:ProfileMachineConfig @('paths', 'artifactRoot')),
+            (Get-NestedValue $script:ProfileMachineConfig @('paths', 'deployRoot')),
+            (Get-NestedValue $script:ProfileConfig @('paths', 'artifactRoot')),
+            (Get-NestedValue $script:ProfileConfig @('paths', 'deployRoot')),
+            $(if ($script:CargoMachineConfig) { Join-Path $script:CargoMachineConfig.CacheRoot 'artifacts' } else { $null }),
+            (Join-Path $RepoRoot 'artifacts')
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+        $ArtifactRoot = $artifactRoots[0]
+    }
+
+    $script:ArtifactRoot = Join-Path $ArtifactRoot (Join-Path 'IronRDP' (Join-Path $DeploymentName $script:MachineIdentity))
+    $script:VersionInfo = Get-BuildVersionInfo -RepoRoot $RepoRoot -DefaultVersion '0.0.0-dev' -TagPrefix 'v'
+    Set-BuildVersionEnvironment -VersionInfo $script:VersionInfo -Prefixes @('IRONRDP')
+}
+
+function Publish-RepoArtifact {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$RelativeDirectory,
+        [string]$DestinationFileName,
+        [string]$ArtifactKind = 'native'
+    )
+
+    $destinationDirectory = Join-Path $script:ArtifactRoot $RelativeDirectory
+    Publish-BuildArtifact -SourcePath $SourcePath `
+        -DestinationDirectory $destinationDirectory `
+        -DestinationFileName $DestinationFileName `
+        -VersionInfo $script:VersionInfo `
+        -ArtifactKind $ArtifactKind | Out-Null
+
+    [pscustomobject]@{
+        kind = $ArtifactKind
+        source = $SourcePath
+        destination = Join-Path $destinationDirectory $(if ($DestinationFileName) { $DestinationFileName } else { Split-Path -Leaf $SourcePath })
+    }
+}
+
+function Publish-BuildOutputs {
+    $publishedArtifacts = New-Object System.Collections.Generic.List[object]
+    $clientProfile = if ($Release) { $ClientBuildProfile } else { 'debug' }
+    $ffiProfile = if ($Release) { $FfiBuildProfile } else { 'debug' }
+    $configuration = if ($Release) { 'Release' } else { 'Debug' }
+
+    $clientDir = Resolve-CargoTargetDirectory -ProjectDir $RepoRoot -Configuration $configuration
+    if ($clientProfile -ne 'debug' -and -not $clientDir.EndsWith($clientProfile, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $clientDir = Join-Path (Split-Path -Parent $clientDir) $clientProfile
+    }
+    $clientExe = Join-Path $clientDir 'ironrdp-client.exe'
+    if (Test-Path $clientExe) {
+        $publishedArtifacts.Add((Publish-RepoArtifact -SourcePath $clientExe -RelativeDirectory 'client' -ArtifactKind 'native-client'))
+    }
+
+    $ffiDir = Resolve-CargoTargetDirectory -ProjectDir $RepoRoot -Configuration $configuration
+    if ($ffiProfile -ne 'debug' -and -not $ffiDir.EndsWith($ffiProfile, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $ffiDir = Join-Path (Split-Path -Parent $ffiDir) $ffiProfile
+    }
+    $ffiDll = Join-Path $ffiDir 'ironrdp.dll'
+    if (Test-Path $ffiDll) {
+        $publishedArtifacts.Add((Publish-RepoArtifact -SourcePath $ffiDll -RelativeDirectory 'ffi' -DestinationFileName 'DevolutionsIronRdp.dll' -ArtifactKind 'ffi-native'))
+    }
+
+    if (-not $SkipDotNet) {
+        $dotnetConfiguration = if ($Release) { 'Release' } else { 'Debug' }
+        $dotnetOutDir = Join-Path $RepoRoot "ffi\dotnet\Devolutions.IronRdp\bin\$dotnetConfiguration"
+        if (Test-Path $dotnetOutDir) {
+            $packages = Get-ChildItem $dotnetOutDir -Filter 'Devolutions.IronRdp*.nupkg' -Recurse -File -ErrorAction SilentlyContinue
+            foreach ($package in $packages) {
+                $publishedArtifacts.Add((Publish-RepoArtifact -SourcePath $package.FullName -RelativeDirectory 'nuget' -ArtifactKind 'nuget-package'))
+            }
+        }
+    }
+
+    return $publishedArtifacts
+}
+
+function Write-BuildManifest {
+    param([object[]]$Artifacts = @())
+
+    New-Item -ItemType Directory -Force -Path $script:ArtifactRoot | Out-Null
+
+    $manifest = [ordered]@{
+        generatedAt = (Get-Date).ToString('o')
+        repoRoot = $RepoRoot
+        deploymentName = $script:DeploymentName
+        machineIdentity = $script:MachineIdentity
+        targetMachine = $TargetMachine
+        version = $script:VersionInfo
+        environment = [ordered]@{
+            cargoTargetDir = $env:CARGO_TARGET_DIR
+            sccacheDir = $env:SCCACHE_DIR
+            sccacheCacheSize = $env:SCCACHE_CACHE_SIZE
+            sccacheIdleTimeout = $env:SCCACHE_IDLE_TIMEOUT
+            nugetPackages = $env:NUGET_PACKAGES
+            cargoBuildJobs = $env:CARGO_BUILD_JOBS
+            cargoUseLld = $env:CARGO_USE_LLD
+            cargoUseNextest = $env:CARGO_USE_NEXTEST
+        }
+        cargoMachineConfig = $script:CargoMachineConfig
+        profileMachineConfig = $script:ProfileMachineConfig
+        profileConfig = [ordered]@{
+            module = Get-NestedValue $script:ProfileConfig @('module')
+            defaults = Get-NestedValue $script:ProfileConfig @('defaults')
+            paths = Get-NestedValue $script:ProfileConfig @('paths')
+        }
+        artifacts = $Artifacts
+    }
+
+    $manifestPath = Join-Path $script:ArtifactRoot 'build-manifest.json'
+    $manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $manifestPath -Encoding utf8
+    Write-Host "Build manifest: $manifestPath" -ForegroundColor Cyan
+}
+
 Push-Location $RepoRoot
 try {
     Import-Module CargoTools -ErrorAction Stop
+    $null = Import-OptionalModule -Name 'ProfileUtilities'
+    $null = Import-OptionalModule -Name 'MachineConfiguration'
 
     if ($BootstrapTools) {
         Install-RustTool -ExecutableName 'cargo-nextest' -PackageName 'cargo-nextest'
@@ -233,6 +439,7 @@ try {
     }
 
     Initialize-CargoEnv
+    Initialize-MachineBuildContext
     $buildEnvironment = Test-BuildEnvironment -Detailed
 
     $machineDeps = $buildEnvironment.Results.MachineDeps
@@ -242,7 +449,12 @@ try {
     }
 
     if ($Jobs -le 0) {
-        $Jobs = [int](Get-OptimalBuildJobs)
+        $configuredBuildJobs = Get-NestedValue $script:CargoMachineConfig @('BuildJobs')
+        if ($configuredBuildJobs) {
+            $Jobs = [int]$configuredBuildJobs
+        } else {
+            $Jobs = [int](Get-OptimalBuildJobs)
+        }
     }
     $env:CARGO_BUILD_JOBS = "$Jobs"
 
@@ -268,11 +480,18 @@ try {
     }
 
     Write-Host "Mode: $Mode" -ForegroundColor Cyan
+    Write-Host "Machine identity: $script:MachineIdentity" -ForegroundColor Cyan
+    Write-Host "Artifact root: $script:ArtifactRoot" -ForegroundColor Cyan
     Write-Host "Jobs: $env:CARGO_BUILD_JOBS" -ForegroundColor Cyan
     Write-Host "CargoTools wrapper: $script:UseCargoWrapper" -ForegroundColor Cyan
     Write-Host "RUSTC_WRAPPER: $($env:RUSTC_WRAPPER)" -ForegroundColor Cyan
     Write-Host "CARGO_USE_LLD: $($env:CARGO_USE_LLD)" -ForegroundColor Cyan
     Write-Host "CMAKE_GENERATOR: $($env:CMAKE_GENERATOR)" -ForegroundColor Cyan
+    Write-Host "CARGO_TARGET_DIR: $($env:CARGO_TARGET_DIR)" -ForegroundColor Cyan
+    Write-Host "SCCACHE_DIR: $($env:SCCACHE_DIR)" -ForegroundColor Cyan
+    Write-Host "NUGET_PACKAGES: $($env:NUGET_PACKAGES)" -ForegroundColor Cyan
+    Write-Host "Machine config provider: $(if (Get-Command Get-MachineConfiguration -ErrorAction SilentlyContinue) { (Get-Command Get-MachineConfiguration).Source } else { 'unavailable' })" -ForegroundColor Cyan
+    Write-Host "Profile config provider: $(if (Get-Command Get-ProfileConfiguration -ErrorAction SilentlyContinue) { (Get-Command Get-ProfileConfiguration).Source } else { 'unavailable' })" -ForegroundColor Cyan
 
     switch ($Mode) {
         'check' {
@@ -326,6 +545,36 @@ try {
             } else {
                 Invoke-RepoCargo -ArgumentList @('test', '--workspace')
             }
+        }
+        'package' {
+            $Release = $true
+            $ffiProfile = $FfiBuildProfile
+            $clientProfile = $ClientBuildProfile
+
+            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile)) -SupportsTimings)
+            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ffi') + (Get-ProfileArgs $ffiProfile)) -SupportsTimings)
+            Copy-FfiNativeBinary -ProfileName $ffiProfile
+            Ensure-DiplomatTool
+            Invoke-RepoCargo -ArgumentList @('xtask', 'ffi', 'bindings', '-v', '--skip-dotnet-build')
+            Invoke-DotNetBuild
+            $artifacts = Publish-BuildOutputs
+            Write-BuildManifest -Artifacts $artifacts
+        }
+        'publish' {
+            $Release = $true
+            $env:CARGO_USE_NEXTEST = '1'
+
+            Invoke-RepoCargo -ArgumentList @('nextest', 'run', '--workspace', '--no-fail-fast')
+            $ffiProfile = $FfiBuildProfile
+            $clientProfile = $ClientBuildProfile
+            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile)) -SupportsTimings)
+            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ffi') + (Get-ProfileArgs $ffiProfile)) -SupportsTimings)
+            Copy-FfiNativeBinary -ProfileName $ffiProfile
+            Ensure-DiplomatTool
+            Invoke-RepoCargo -ArgumentList @('xtask', 'ffi', 'bindings', '-v', '--skip-dotnet-build')
+            Invoke-DotNetBuild
+            $artifacts = Publish-BuildOutputs
+            Write-BuildManifest -Artifacts $artifacts
         }
     }
 } finally {

@@ -197,6 +197,9 @@ async fn connect(
         let stream = TcpStream::connect(dest)
             .await
             .map_err(|e| connector::custom_err!("TCP connect", e))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| connector::custom_err!("set TCP_NODELAY", e))?;
         let client_addr = stream
             .local_addr()
             .map_err(|e| connector::custom_err!("get socket local address", e))?;

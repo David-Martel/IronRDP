@@ -27,6 +27,15 @@ the first connection and resize path more predictable for local demo use.
 ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
 ```
 
+For repeatable demo sizing on Windows, you can also request an initial desktop size explicitly:
+
+```shell
+ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD> --width 1600 --height 900
+```
+
+If you provide an `.rdp` file, `desktopwidth` and `desktopheight` are now used as the initial
+desktop request when explicit CLI sizing is not supplied.
+
 ## Configuring log filter directives
 
 The `IRONRDP_LOG` environment variable is used to set the log filter directives. 
