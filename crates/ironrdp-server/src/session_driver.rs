@@ -40,6 +40,12 @@ pub(crate) enum RunState {
     DeactivationReactivation { desktop_size: DesktopSize },
 }
 
+enum DispatchDecision {
+    Continue,
+    Disconnect,
+    Write(Vec<u8>),
+}
+
 impl RdpServer {
     pub fn get_svc_processor<T: SvcProcessor + 'static>(&mut self) -> Option<&mut T> {
         self.static_channels
@@ -92,117 +98,176 @@ impl RdpServer {
         let mut wave_limit = 4;
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
-            match event {
-                ServerEvent::Quit(reason) => {
-                    debug!("Got quit event: {reason}");
-                    return Ok(RunState::Disconnect);
-                }
-                ServerEvent::GetLocalAddr(tx) => {
-                    let _ = tx.send(self.local_addr);
-                }
-                ServerEvent::SetCredentials(creds) => {
-                    self.set_credentials(Some(creds));
-                }
-                ServerEvent::Rdpsnd(s) => {
-                    let Some(rdpsnd) = self.get_svc_processor::<RdpsndServer>() else {
-                        warn!("No rdpsnd channel, dropping event");
-                        continue;
-                    };
-                    let msgs = match s {
-                        RdpsndServerMessage::Wave(data, ts) => {
-                            if wave_limit == 0 {
-                                debug!("Dropping wave");
-                                continue;
-                            }
-                            wave_limit -= 1;
-                            rdpsnd.wave(data, ts)
-                        }
-                        RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),
-                        RdpsndServerMessage::Close => rdpsnd.close(),
-                        RdpsndServerMessage::Error(error) => {
-                            error!(?error, "Handling rdpsnd event");
-                            continue;
-                        }
-                    }
-                    .context("failed to send rdpsnd event")?;
-                    let channel_id = self
-                        .get_channel_id_by_type::<RdpsndServer>()
-                        .context("SVC channel not found")?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
-                    writer.write_all(&data).await?;
-                }
-                ServerEvent::Clipboard(c) => {
-                    let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
-                        warn!("No clipboard channel, dropping event");
-                        continue;
-                    };
-                    let msgs = match c {
-                        ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
-                        ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
-                        ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
-                        ClipboardMessage::SendLockClipboard { clip_data_id } => cliprdr.lock_clipboard(clip_data_id),
-                        ClipboardMessage::SendUnlockClipboard { clip_data_id } => {
-                            cliprdr.unlock_clipboard(clip_data_id)
-                        }
-                        ClipboardMessage::SendFileContentsRequest(request) => cliprdr.request_file_contents(request),
-                        ClipboardMessage::SendFileContentsResponse(response) => cliprdr.submit_file_contents(response),
-                        ClipboardMessage::Error(error) => {
-                            error!(?error, "Handling clipboard event");
-                            continue;
-                        }
-                    }
-                    .context("failed to send clipboard event")?;
-                    let channel_id = self
-                        .get_channel_id_by_type::<CliprdrServer>()
-                        .context("SVC channel not found")?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
-                    writer.write_all(&data).await?;
-                }
-                ServerEvent::Echo(msg) => match msg {
-                    EchoServerMessage::SendRequest { payload } => {
-                        let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
-                            warn!("No drdynvc channel, dropping ECHO request");
-                            continue;
-                        };
-
-                        let Some(echo_channel_id) = drdynvc.get_channel_id_by_type::<EchoDvcBridge>() else {
-                            warn!("No ECHO dynamic channel, dropping ECHO request");
-                            continue;
-                        };
-
-                        if !drdynvc.is_channel_opened(echo_channel_id) {
-                            warn!("ECHO dynamic channel not yet opened, dropping ECHO request");
-                            continue;
-                        }
-
-                        self.echo_handle.on_request_sent(&payload);
-
-                        let request = build_echo_request(payload)?;
-                        let messages =
-                            dvc::encode_dvc_messages(echo_channel_id, vec![request], ChannelFlags::SHOW_PROTOCOL)?;
-
-                        let drdynvc_channel_id = self
-                            .get_channel_id_by_type::<dvc::DrdynvcServer>()
-                            .context("DRDYNVC channel not found")?;
-
-                        let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
-                        writer.write_all(&data).await?;
-                    }
-                },
-                #[cfg(feature = "egfx")]
-                ServerEvent::Egfx(msg) => match msg {
-                    EgfxServerMessage::SendMessages { messages } => {
-                        let drdynvc_channel_id = self
-                            .get_channel_id_by_type::<dvc::DrdynvcServer>()
-                            .context("DRDYNVC channel not found")?;
-                        let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
-                        writer.write_all(&data).await?;
-                    }
-                },
+            match self.dispatch_server_event(event, user_channel_id, &mut wave_limit)? {
+                DispatchDecision::Continue => continue,
+                DispatchDecision::Disconnect => return Ok(RunState::Disconnect),
+                DispatchDecision::Write(data) => writer.write_all(&data).await?,
             }
         }
 
         Ok(RunState::Continue)
+    }
+
+    fn dispatch_server_event(
+        &mut self,
+        event: ServerEvent,
+        user_channel_id: u16,
+        wave_limit: &mut usize,
+    ) -> Result<DispatchDecision> {
+        match event {
+            ServerEvent::Quit(reason) => {
+                debug!("Got quit event: {reason}");
+                Ok(DispatchDecision::Disconnect)
+            }
+            ServerEvent::GetLocalAddr(tx) => {
+                let _ = tx.send(self.local_addr);
+                Ok(DispatchDecision::Continue)
+            }
+            ServerEvent::SetCredentials(creds) => {
+                self.set_credentials(Some(creds));
+                Ok(DispatchDecision::Continue)
+            }
+            ServerEvent::Rdpsnd(msg) => self.dispatch_rdpsnd_event(msg, user_channel_id, wave_limit),
+            ServerEvent::Clipboard(msg) => self.dispatch_clipboard_event(msg, user_channel_id),
+            ServerEvent::Echo(msg) => self.dispatch_echo_event(msg, user_channel_id),
+            #[cfg(feature = "egfx")]
+            ServerEvent::Egfx(msg) => self.dispatch_egfx_event(msg, user_channel_id),
+        }
+    }
+
+    fn dispatch_rdpsnd_event(
+        &mut self,
+        msg: RdpsndServerMessage,
+        user_channel_id: u16,
+        wave_limit: &mut usize,
+    ) -> Result<DispatchDecision> {
+        let Some(msgs) = ({
+            let Some(rdpsnd) = self.get_svc_processor::<RdpsndServer>() else {
+                warn!("No rdpsnd channel, dropping event");
+                return Ok(DispatchDecision::Continue);
+            };
+
+            match msg {
+                RdpsndServerMessage::Wave(data, ts) => {
+                    if *wave_limit == 0 {
+                        debug!("Dropping wave");
+                        return Ok(DispatchDecision::Continue);
+                    }
+                    *wave_limit -= 1;
+                    Some(rdpsnd.wave(data, ts))
+                }
+                RdpsndServerMessage::SetVolume { left, right } => Some(rdpsnd.set_volume(left, right)),
+                RdpsndServerMessage::Close => Some(rdpsnd.close()),
+                RdpsndServerMessage::Error(error) => {
+                    error!(?error, "Handling rdpsnd event");
+                    None
+                }
+            }
+        }) else {
+            return Ok(DispatchDecision::Continue);
+        };
+
+        let channel_id = self
+            .get_channel_id_by_type::<RdpsndServer>()
+            .context("SVC channel not found")?;
+        let data = server_encode_svc_messages(
+            msgs.context("failed to send rdpsnd event")?.into(),
+            channel_id,
+            user_channel_id,
+        )?;
+
+        Ok(DispatchDecision::Write(data))
+    }
+
+    fn dispatch_clipboard_event(&mut self, msg: ClipboardMessage, user_channel_id: u16) -> Result<DispatchDecision> {
+        let Some(msgs) = ({
+            let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
+                warn!("No clipboard channel, dropping event");
+                return Ok(DispatchDecision::Continue);
+            };
+
+            match msg {
+                ClipboardMessage::SendInitiateCopy(formats) => Some(cliprdr.initiate_copy(&formats)),
+                ClipboardMessage::SendFormatData(data) => Some(cliprdr.submit_format_data(data)),
+                ClipboardMessage::SendInitiatePaste(format) => Some(cliprdr.initiate_paste(format)),
+                ClipboardMessage::SendLockClipboard { clip_data_id } => Some(cliprdr.lock_clipboard(clip_data_id)),
+                ClipboardMessage::SendUnlockClipboard { clip_data_id } => Some(cliprdr.unlock_clipboard(clip_data_id)),
+                ClipboardMessage::SendFileContentsRequest(request) => Some(cliprdr.request_file_contents(request)),
+                ClipboardMessage::SendFileContentsResponse(response) => Some(cliprdr.submit_file_contents(response)),
+                ClipboardMessage::Error(error) => {
+                    error!(?error, "Handling clipboard event");
+                    None
+                }
+            }
+        }) else {
+            return Ok(DispatchDecision::Continue);
+        };
+
+        let channel_id = self
+            .get_channel_id_by_type::<CliprdrServer>()
+            .context("SVC channel not found")?;
+        let data = server_encode_svc_messages(
+            msgs.context("failed to send clipboard event")?.into(),
+            channel_id,
+            user_channel_id,
+        )?;
+
+        Ok(DispatchDecision::Write(data))
+    }
+
+    fn dispatch_echo_event(&mut self, msg: EchoServerMessage, user_channel_id: u16) -> Result<DispatchDecision> {
+        match msg {
+            EchoServerMessage::SendRequest { payload } => {
+                let Some(messages) = ({
+                    let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+                        warn!("No drdynvc channel, dropping ECHO request");
+                        return Ok(DispatchDecision::Continue);
+                    };
+
+                    let Some(echo_channel_id) = drdynvc.get_channel_id_by_type::<EchoDvcBridge>() else {
+                        warn!("No ECHO dynamic channel, dropping ECHO request");
+                        return Ok(DispatchDecision::Continue);
+                    };
+
+                    if !drdynvc.is_channel_opened(echo_channel_id) {
+                        warn!("ECHO dynamic channel not yet opened, dropping ECHO request");
+                        return Ok(DispatchDecision::Continue);
+                    }
+
+                    self.echo_handle.on_request_sent(&payload);
+                    let request = build_echo_request(payload)?;
+
+                    Some(dvc::encode_dvc_messages(
+                        echo_channel_id,
+                        vec![request],
+                        ChannelFlags::SHOW_PROTOCOL,
+                    )?)
+                }) else {
+                    return Ok(DispatchDecision::Continue);
+                };
+
+                let drdynvc_channel_id = self
+                    .get_channel_id_by_type::<dvc::DrdynvcServer>()
+                    .context("DRDYNVC channel not found")?;
+                let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
+
+                Ok(DispatchDecision::Write(data))
+            }
+        }
+    }
+
+    #[cfg(feature = "egfx")]
+    fn dispatch_egfx_event(&mut self, msg: EgfxServerMessage, user_channel_id: u16) -> Result<DispatchDecision> {
+        match msg {
+            EgfxServerMessage::SendMessages { messages } => {
+                let drdynvc_channel_id = self
+                    .get_channel_id_by_type::<dvc::DrdynvcServer>()
+                    .context("DRDYNVC channel not found")?;
+                let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
+
+                Ok(DispatchDecision::Write(data))
+            }
+        }
     }
 
     async fn client_loop<R, W>(
@@ -463,8 +528,8 @@ impl RdpServer {
     }
 
     async fn handle_fastpath(&mut self, input: FastPathInput) {
+        let mut handler = self.handler.lock().await;
         for event in input.input_events().iter().copied() {
-            let mut handler = self.handler.lock().await;
             match event {
                 FastPathInputEvent::KeyboardEvent(flags, key) => {
                     handler.keyboard((key, flags).into());
@@ -562,8 +627,8 @@ impl RdpServer {
     }
 
     async fn handle_input_event(&mut self, input: InputEventPdu) {
+        let mut handler = self.handler.lock().await;
         for event in input.0 {
-            let mut handler = self.handler.lock().await;
             match event {
                 ironrdp_pdu::input::InputEvent::ScanCode(key) => {
                     handler.keyboard((key.key_code, key.flags).into());
@@ -594,7 +659,11 @@ impl RdpServer {
         }
     }
 
-    pub(crate) async fn accept_finalize<S>(&mut self, mut framed: TokioFramed<S>, mut acceptor: Acceptor) -> Result<TokioFramed<S>>
+    pub(crate) async fn accept_finalize<S>(
+        &mut self,
+        mut framed: TokioFramed<S>,
+        mut acceptor: Acceptor,
+    ) -> Result<TokioFramed<S>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Sync + Send + Unpin,
     {
@@ -668,11 +737,7 @@ impl RdpServer {
     }
 }
 
-async fn deactivate_all(
-    io_channel_id: u16,
-    user_channel_id: u16,
-    writer: &mut impl FramedWrite,
-) -> Result<()> {
+async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut impl FramedWrite) -> Result<()> {
     let pdu = ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll);
     let pdu = rdp::headers::ShareControlHeader {
         share_id: 0,
