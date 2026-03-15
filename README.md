@@ -118,6 +118,27 @@ The current observed Hyper-V live-connect profile is:
 - advertising experimental multitransport did not trigger a server-side UDP request in this environment
 - the dominant client-side present cost is still the `softbuffer` conversion step rather than the session-driver frame copy
 
+The packaged toolset also now includes a richer Hyper-V e2e suite:
+
+```pwsh
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Mode hyperv-suite -HyperVScenarioSet quick
+```
+
+That suite captures:
+
+- connection-established, first-image, and first-frame timing
+- frame cadence and image cadence summaries
+- software present timing and overwritten-frame counts
+- compression mix and bitmap characteristics
+- bounded resize, mouse-input, and outage scenarios against the running guest
+
+Current measured Hyper-V e2e findings on this branch:
+
+- connection establishment is about `~130 ms`
+- first image and first frame are about `~700 ms`
+- the guest still prefers `Rdp61`/bitmap traffic over EGFX/H.264 on this path
+- the native client is overwriting almost every queued frame under this workload, so present-path pacing and coalescing are the next render priority
+
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 
 Example of utilizing IronRDP in a blocking, synchronous fashion.

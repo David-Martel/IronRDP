@@ -167,20 +167,48 @@ Status: done. Current observed baseline:
 - `softbuffer` conversion remains the dominant client-side present cost
 - experimental multitransport advertising did not trigger a UDP sideband request from the guest in this environment
 
+26. The Hyper-V lab now includes a richer e2e scenario suite that captures connection latency, frame cadence, compression mix, overwritten-frame counts, bounded resize/input behavior, and workload-launch metadata from packaged artifacts.
+Refs: `build.ps1`, `scripts/windows/Invoke-HyperVE2ESuite.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `docs/windows-native-install.md`, local Hyper-V suite logs under `%TEMP%\ironrdp-hyperv-suite-*`.
+Status: done for the first regression-ready pass. Current observed baseline:
+- connection establishment is roughly `~130 ms`
+- first-image and first-frame latencies are roughly `~700 ms`
+- the guest still prefers `Rdp61`/bitmap traffic, especially `16`-bpp RLE streams
+- the native client is overwriting almost every queued frame under this workload, so present-path pacing/coalescing is now the highest-value render optimization
+- resize scenarios do not currently trigger reconnects, but they do amplify backend-total present spikes
+- scheduled interactive workload launch is rejected on this VM account model, so the suite currently falls back to non-interactive process-start timing in session `0`
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
 
-1. Add focused runtime tests for the newer client/server session seams.
+1. Use the Hyper-V suite data to reduce overwritten frames and present-path waste in the native client.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/session_driver.rs`, local Hyper-V suite summaries.
+Why now:
+- the current software path is dropping queued frames almost continuously under the guest workload
+- present timing is still dominated by backend-local conversion/present work even after removing the extra staging buffer
+Done when:
+- overwritten-frame counts fall materially under the same Hyper-V baseline
+- end-to-end frame cadence improves without regressing connection stability
+
+2. Add focused runtime tests for the newer client/server session seams.
 Refs: `crates/ironrdp-testsuite-extra`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Why now:
 - recent reliability changes need narrow tests, not just broad smoke coverage
-- the frame-buffer reuse and IME work now have unit coverage
+- the new Hyper-V suite now covers live behavior, so the missing layer is precise protocol/runtime assertions
 - server seam tests now cover resize reactivation, display-write failure, and disconnect parsing, but integration coverage is still thin
 Done when:
 - backlog disconnect, display failure, and single-session behavior are pinned down
 
-2. Mirror the now-validated Hyper-V deployment and live-connect flow onto `dtm-p1gen7`.
+3. Make the Hyper-V e2e suite a better Windows interaction lab before mirroring it to a second machine.
+Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, `scripts/windows/Invoke-HyperVLiveConnectTest.ps1`, `docs/windows-native-install.md`.
+Why now:
+- the suite is already producing useful transport/render data
+- the current workload launcher still lands in session `0`, so app-start timing is real but not yet interactive-desktop representative
+Done when:
+- workload launch reaches the active interactive guest session or an equivalent UI-driving path
+- the `full` scenario set covers outage/recovery and multitransport observations in a repeatable way
+
+4. Mirror the now-validated Hyper-V deployment and live-connect flow onto `dtm-p1gen7`.
 Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `scripts/windows/Invoke-HyperVLiveConnectTest.ps1`.
 Why now:
 - the portable bundle and bounded live client session are now proven locally, so the next deployment unknown is the real second machine
@@ -188,16 +216,17 @@ Done when:
 - package output can be copied, launched, and verified remotely with one documented flow
 - the Hyper-V-validated install/smoke/live-connect flow is mirrored on `dtm-p1gen7`
 
-3. Use the new live-connect logs to drive the next standards-first render and transport optimizations.
-Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-server/src/gfx.rs`, local Hyper-V live-connect logs.
+5. Use the Hyper-V live/e2e logs to drive the next standards-first render and transport optimizations.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-server/src/gfx.rs`, local Hyper-V live-connect and suite logs.
 Why now:
-- the first bounded Hyper-V session traces now show where the client and server are actually spending time
+- the Hyper-V traces now show where the client and server are actually spending time
 - the observed workload is still software bitmap heavy, so deeper work should stay grounded in measured data
 Done when:
 - there is a clear follow-up plan for the `16`-bpp bitmap path, `softbuffer` backend conversion, and EGFX/H.264 readiness
 - reconnect causes and graceful vs hard termination stay explicit in logs/tests
+- the reason multitransport remains TCP-only in this environment is explicitly understood, not just observed
 
-4. Split the Windows acceleration plan into two tracks and keep them separate in implementation.
+6. Split the Windows acceleration plan into two tracks and keep them separate in implementation.
 Refs: `crates/ironrdp-client`, `crates/ironrdp-server/src/gfx.rs`, `crates/ironrdp-egfx`, future Windows-only streaming experiments.
 Why now:
 - the repo already supports standards-based acceleration ideas such as EGFX and multitransport negotiation

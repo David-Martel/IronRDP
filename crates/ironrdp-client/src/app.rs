@@ -60,6 +60,7 @@ pub struct App {
     resize_timeout: Option<Instant>,
     presented_frame_count: u64,
     surface_resize_count: u64,
+    overwritten_frame_count: u64,
     exit_code: Code,
 }
 
@@ -82,6 +83,7 @@ impl App {
             resize_timeout: None,
             presented_frame_count: 0,
             surface_resize_count: 0,
+            overwritten_frame_count: 0,
             exit_code: Code::SUCCESS,
         })
     }
@@ -431,6 +433,13 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                 trace!(width = ?width, height = ?height, "Received image with size");
                 trace!(window_physical_size = ?window.inner_size(), "Drawing image to the window with size");
                 if !self.buffer.is_empty() {
+                    self.overwritten_frame_count = self.overwritten_frame_count.saturating_add(1);
+                    trace!(
+                        overwritten_frame_count = self.overwritten_frame_count,
+                        buffered_width = self.buffer_size.0,
+                        buffered_height = self.buffer_size.1,
+                        "Overwriting unpresented frame buffer"
+                    );
                     let recycled_buffer = core::mem::take(&mut self.buffer);
                     let _ = self
                         .input_event_sender

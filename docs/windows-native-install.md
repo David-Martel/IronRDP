@@ -24,6 +24,7 @@ A packaged artifact root contains:
 - `tools/Invoke-IronRdpSmokeTest.ps1`
 - `tools/Invoke-HyperVInstallerTest.ps1`
 - `tools/Invoke-HyperVLiveConnectTest.ps1`
+- `tools/Invoke-HyperVE2ESuite.ps1`
 
 `build.ps1` also emits:
 
@@ -223,6 +224,34 @@ The current observed Hyper-V baseline is:
 - the remaining dominant client-side render cost is the `softbuffer` backend
   conversion step, which currently measures around `~0.95-1.1 ms` per presented
   frame on this workstation
+
+For richer diagnostics, the packaged toolset now includes a repeatable
+Hyper-V e2e suite:
+
+```pwsh
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-HyperVE2ESuite.ps1 -PackageRoot . -ScenarioSet quick
+```
+
+Or through the repo build entrypoint:
+
+```pwsh
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Mode hyperv-suite -HyperVScenarioSet quick
+```
+
+The suite currently drives:
+
+- a bounded baseline session
+- resize and input automation against the live client window
+- optional temporary host-side outage simulation by blocking outbound `3389`
+- per-scenario screenshots, client logs, CPU samples, and JSON summaries
+
+The current measured Hyper-V e2e baseline is:
+
+- connection establishment is about `~130 ms`
+- first image and first frame are about `~700 ms`
+- the active guest path is still dominated by `Rdp61` plus `16`-bpp RLE bitmap updates
+- the native client is overwriting queued unpresented frames under this workload, so render-path pacing is a known optimization target
+- guest workload launch currently falls back to a non-interactive process in session `0` because scheduled interactive task registration is rejected on this VM account model
 
 ## Uninstall
 

@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('check', 'client', 'ffi', 'test', 'coverage', 'fmt', 'lints', 'package', 'publish', 'doctor', 'hyperv-live', 'all')]
+    [ValidateSet('check', 'client', 'ffi', 'test', 'coverage', 'fmt', 'lints', 'package', 'publish', 'doctor', 'hyperv-live', 'hyperv-suite', 'all')]
     [string]$Mode = 'all',
 
     [switch]$Release,
@@ -28,7 +28,12 @@ param(
     [string]$HyperVPassword = 'TempIronRdp!2026',
     [int]$ConnectSeconds = 20,
     [ValidateSet('off', 'prefer-reliable', 'reliable', 'prefer-lossy', 'lossy')]
-    [string]$LiveTestMultitransport = 'off'
+    [string]$LiveTestMultitransport = 'off',
+    [ValidateSet('quick', 'full')]
+    [string]$HyperVScenarioSet = 'quick',
+    [int]$SuiteDurationSeconds = 30,
+    [int]$SuiteSampleIntervalMs = 500,
+    [string]$HyperVGuestWorkload = 'notepad'
 )
 
 Set-StrictMode -Version Latest
@@ -971,6 +976,11 @@ function Publish-DeploymentSupportFiles {
             ArtifactKind = 'deployment-tool'
         },
         @{
+            SourcePath = Join-Path $RepoRoot 'scripts\windows\Invoke-HyperVE2ESuite.ps1'
+            RelativeDirectory = 'tools'
+            ArtifactKind = 'deployment-tool'
+        },
+        @{
             SourcePath = Join-Path $RepoRoot 'docs\windows-native-install.md'
             RelativeDirectory = 'docs'
             ArtifactKind = 'deployment-doc'
@@ -1323,6 +1333,28 @@ try {
                 -Password $HyperVPassword `
                 -ConnectSeconds $ConnectSeconds `
                 -Multitransport $LiveTestMultitransport
+        }
+        'hyperv-suite' {
+            $suiteScript = Join-Path $RepoRoot 'scripts\windows\Invoke-HyperVE2ESuite.ps1'
+            if (-not (Test-Path -LiteralPath $suiteScript -PathType Leaf)) {
+                throw "Hyper-V e2e suite script not found: $suiteScript"
+            }
+
+            $manifestPath = Join-Path $script:ArtifactRoot 'build-manifest.json'
+            if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+                throw "package root not found at '$($script:ArtifactRoot)'; run build.ps1 -Mode package -Release first or pass -ArtifactRoot"
+            }
+
+            & $suiteScript `
+                -PackageRoot $script:ArtifactRoot `
+                -VmName $HyperVVmName `
+                -Username $HyperVUsername `
+                -Password $HyperVPassword `
+                -ScenarioSet $HyperVScenarioSet `
+                -DurationSeconds $SuiteDurationSeconds `
+                -SampleIntervalMs $SuiteSampleIntervalMs `
+                -Multitransport $LiveTestMultitransport `
+                -GuestWorkload $HyperVGuestWorkload
         }
         'all' {
             $clientProfile = if ($Release) { $ClientBuildProfile } else { '' }
