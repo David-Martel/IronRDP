@@ -125,6 +125,10 @@ Status: done.
 Refs: `README.md`, `ARCHITECTURE.md`, `crates/ironrdp-client/README.md`, `crates/ironrdp-session/README.md`, `crates/ironrdp-server/README.md`.
 Status: done.
 
+17. The Windows toolchain and crate patch lines were refreshed around Rust 1.94, CargoTools/sccache wrapper behavior was aligned with the module's current daemon/queue model, and stable-format noise was removed from `rustfmt.toml`.
+Refs: `rust-toolchain.toml`, `clippy.toml`, `Cargo.lock`, `build.ps1`, `rustfmt.toml`, crate manifests, targeted protocol/runtime fixes.
+Status: done.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -193,6 +197,7 @@ Do next:
 - decide on a repo `global.json` for .NET SDK pinning
 - state the expected MSVC/NASM/Ninja/Clang availability by build mode
 - keep oneAPI/CUDA documented as optional overlays
+- make `build.ps1 -Mode doctor` explicitly surface `stable`-alias drift because CargoTools wrapper paths currently use `rustup run stable cargo`
 Effort: small.
 
 ## Priority 1: Runtime correctness before acceleration

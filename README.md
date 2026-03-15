@@ -54,6 +54,14 @@ optional overlays and are recorded in the emitted manifest rather than becoming
 hard dependencies for normal builds. Portable release artifacts remain distinct
 from host-tuned `-NativeCpu` builds.
 
+CargoTools currently routes wrapped builds through `rustup run stable cargo`, so
+each Windows machine should keep the `stable` toolchain updated to the repo's
+pinned Rust version before relying on `build.ps1`:
+
+```pwsh
+rustup update stable
+```
+
 On the Windows-native branch, the current client path remains CPU/software-first:
 `winit` drives input and window lifecycle, `softbuffer` presents the decoded
 desktop, IME commit events are translated into Unicode fast-path input, and the
