@@ -158,6 +158,15 @@ Status: done; real UDP sideband transport and end-to-end runtime coverage still 
 Refs: `build.ps1`, `docs/windows-native-install.md`, `README.md`, local Hyper-V validation logs.
 Status: done; `dtm-p1gen7` still needs the same deployment flow mirrored remotely.
 
+25. The Windows deployment tooling now includes bounded live-connect validation against the running Hyper-V guest, and the native client emits explicit connection/first-frame markers for log-driven smoke automation.
+Refs: `build.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `scripts/windows/Invoke-HyperVLiveConnectTest.ps1`, `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`, local Hyper-V live-connect logs.
+Status: done. Current observed baseline:
+- host reaches the guest over the Hyper-V Default Switch address, not the current `dtm-net-switch` address
+- `session-rendering` is reliable on the Hyper-V path
+- software bitmap traffic still dominates, including many `16`-bpp RLE bitmap updates
+- `softbuffer` conversion remains the dominant client-side present cost
+- experimental multitransport advertising did not trigger a UDP sideband request from the guest in this environment
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -171,22 +180,22 @@ Why now:
 Done when:
 - backlog disconnect, display failure, and single-session behavior are pinned down
 
-2. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
-Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`.
+2. Mirror the now-validated Hyper-V deployment and live-connect flow onto `dtm-p1gen7`.
+Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `scripts/windows/Invoke-HyperVLiveConnectTest.ps1`.
 Why now:
-- the portable bundle is now proven on a clean Windows Server guest, so the next deployment unknown is the real second machine
+- the portable bundle and bounded live client session are now proven locally, so the next deployment unknown is the real second machine
 Done when:
 - package output can be copied, launched, and verified remotely with one documented flow
-- the Hyper-V-validated portable install/smoke flow is mirrored on `dtm-p1gen7`
+- the Hyper-V-validated install/smoke/live-connect flow is mirrored on `dtm-p1gen7`
 
-3. Keep reconnect/shutdown behavior explicit before deeper transport work.
-Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/README.md`.
+3. Use the new live-connect logs to drive the next standards-first render and transport optimizations.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-server/src/gfx.rs`, local Hyper-V live-connect logs.
 Why now:
-- UDP/multitransport and GPU work should build on a predictable runtime contract
-- resize-triggered reconnects should fail clearly when the negotiated size never changes
+- the first bounded Hyper-V session traces now show where the client and server are actually spending time
+- the observed workload is still software bitmap heavy, so deeper work should stay grounded in measured data
 Done when:
-- reconnect causes are explicit in logs/tests
-- graceful close and hard session failure remain distinct at the top-level client boundary
+- there is a clear follow-up plan for the `16`-bpp bitmap path, `softbuffer` backend conversion, and EGFX/H.264 readiness
+- reconnect causes and graceful vs hard termination stay explicit in logs/tests
 
 4. Split the Windows acceleration plan into two tracks and keep them separate in implementation.
 Refs: `crates/ironrdp-client`, `crates/ironrdp-server/src/gfx.rs`, `crates/ironrdp-egfx`, future Windows-only streaming experiments.
@@ -364,12 +373,13 @@ Effort: large and separate from the core RDP branch.
 ## Priority 4: Deployment and operator experience
 
 1. Keep the local Hyper-V Windows Server validation target as a repeatable regression harness.
-Refs: local Hyper-V host tooling, `build.ps1`, `scripts/windows/Invoke-HyperVInstallerTest.ps1`.
+Refs: local Hyper-V host tooling, `build.ps1`, `scripts/windows/Invoke-HyperVInstallerTest.ps1`, `scripts/windows/Invoke-HyperVLiveConnectTest.ps1`.
 Do next:
 - preserve the current Windows Server 2025 guest as the first clean-machine packaging regression target
 - keep the VM powered on after installer validation unless a reboot or offline staging step is actually required
 - keep the PowerShell Direct validation path working with the temporary local admin test account
-- add richer runtime validation on the live guest: guest logs, service state, port reachability, and eventually real client session traces
+- keep collecting richer live-connect data: guest logs, service state, port reachability, first-frame timing, and transport/codec behavior
+- keep tracking which guest IP/path is actually reachable from the host so later `dtm-p1gen7` smoke runs use the same discipline
 Effort: medium.
 
 2. Turn `dtm-p1gen7` into a repeatable smoke-deploy target.

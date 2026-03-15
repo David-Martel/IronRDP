@@ -97,6 +97,7 @@ Installer-backed validation now also exists:
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Install-IronRdpPackage.ps1 -InstallerPath .\IronRDP.msix -CertificatePath .\IronRDP-test-signing.cer
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-IronRdpSmokeTest.ps1 -MsixPackageName DavidMartel.IronRDP
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-HyperVInstallerTest.ps1 -MsiPath .\IronRDP.msi
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-HyperVLiveConnectTest.ps1 -PackageRoot T:\RustCache\artifacts\IronRDP\windows-server-only\DTM-WORK -ConnectSeconds 25
 ```
 
 The current validation baseline is:
@@ -106,6 +107,16 @@ The current validation baseline is:
 - MSI install inside the Hyper-V Windows Server 2025 guest
 - guest-side `ironrdp-client --version` and `--help`
 - guest `TermService` availability and host-visible port `3389`
+- a bounded live IronRDP client session from the host into the running Hyper-V guest
+
+The current observed Hyper-V live-connect profile is:
+
+- the host reaches the guest reliably over the Hyper-V Default Switch IPv4 path
+- the alternate `dtm-net-switch` guest address is not currently host-reachable for RDP
+- the session renders successfully through the packaged client with bounded shutdown
+- Windows Server 2025 is currently negotiating software bitmap updates on this path, including frequent `16`-bpp RLE bitmaps
+- advertising experimental multitransport did not trigger a server-side UDP request in this environment
+- the dominant client-side present cost is still the `softbuffer` conversion step rather than the session-driver frame copy
 
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 

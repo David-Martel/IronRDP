@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use proc_exit::Code;
 use tokio::sync::mpsc;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, PhysicalSize};
 use winit::event::{self, Ime, WindowEvent};
@@ -141,6 +141,13 @@ impl App {
         };
 
         self.presented_frame_count = self.presented_frame_count.saturating_add(1);
+        if self.presented_frame_count == 1 {
+            info!(
+                width = self.buffer_size.0,
+                height = self.buffer_size.1,
+                "First frame presented to the window"
+            );
+        }
         trace!(
             frame_id = self.presented_frame_count,
             width = self.buffer_size.0,

@@ -23,6 +23,7 @@ A packaged artifact root contains:
 - `tools/Install-IronRdpPackage.ps1`
 - `tools/Invoke-IronRdpSmokeTest.ps1`
 - `tools/Invoke-HyperVInstallerTest.ps1`
+- `tools/Invoke-HyperVLiveConnectTest.ps1`
 
 `build.ps1` also emits:
 
@@ -113,11 +114,32 @@ This validates:
 - optional docs/FFI files are present when packaged
 - installed MSIX layout when validating by package name
 
+If you also provide connection credentials, the smoke helper can run a bounded
+live session probe and return timing/log data instead of just launching the
+client:
+
+```pwsh
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-IronRdpSmokeTest.ps1 `
+  -InstallRoot $env:LOCALAPPDATA\Programs\IronRDP `
+  -LaunchHost 10.0.0.20 `
+  -Username alice `
+  -Password secret `
+  -ConnectSeconds 20
+```
+
+The live-connect result currently records:
+
+- whether the client reached connection setup, image emission, and frame present
+- client log path and tail
+- frame counts
+- copy/present timing summaries from the software render path
+- reconnect and multitransport-abort counts
+
 The current portable bundle has been validated on a clean Hyper-V
 Windows Server 2025 guest using the same `Install-IronRdpPackage.ps1` and
 `Invoke-IronRdpSmokeTest.ps1` flow documented here.
 
-To launch the client as part of the smoke step:
+To launch the client without bounded validation:
 
 ```pwsh
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-IronRdpSmokeTest.ps1 -InstallRoot $env:LOCALAPPDATA\Programs\IronRDP -LaunchHost 10.0.0.20 -Username alice
@@ -179,6 +201,28 @@ The current baseline validated by this fork is:
 - `TermService`, `WinRM`, and `sshd` running
 - guest IP discovery
 - RDP port `3389` reachable from the host
+
+There is now also a host-to-guest live session harness that keeps the guest
+running and uses the packaged client to connect back into the VM:
+
+```pwsh
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-HyperVLiveConnectTest.ps1 -PackageRoot . -ConnectSeconds 25
+```
+
+The current observed Hyper-V baseline is:
+
+- the running guest is reachable from the host over the Hyper-V Default Switch
+  address (`172.23.x.x` in the current lab)
+- the `dtm-net-switch` guest address (`10.10.20.250` in the current lab) is
+  not yet host-reachable for RDP on this machine
+- the native client reaches `session-rendering` status reliably against the VM
+- the guest is currently sending software-compressed bitmap updates, including
+  many `16`-bpp RLE bitmap streams, not EGFX/H.264
+- advertising multitransport with `prefer-reliable` did not trigger a server
+  UDP sideband request on this path
+- the remaining dominant client-side render cost is the `softbuffer` backend
+  conversion step, which currently measures around `~0.95-1.1 ms` per presented
+  frame on this workstation
 
 ## Uninstall
 

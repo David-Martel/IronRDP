@@ -27,7 +27,7 @@ use ironrdp_core::WriteBuf;
 use ironrdp_tokio::{FramedWrite as _, TokioFramed, single_sequence_step_read, split_tokio_framed};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use winit::event_loop::EventLoopProxy;
 
 use crate::rdp::{RdpInputEvent, RdpOutputEvent};
@@ -296,6 +296,9 @@ impl SessionDriver {
             .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
 
         self.emitted_frame_count = self.emitted_frame_count.saturating_add(1);
+        if self.emitted_frame_count == 1 {
+            info!(width = width.get(), height = height.get(), "First image update emitted");
+        }
         trace!(
             frame_id = self.emitted_frame_count,
             width = width.get(),

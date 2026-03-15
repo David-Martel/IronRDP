@@ -375,6 +375,13 @@ async fn connect(
     )
     .await?;
 
+    info!(
+        desktop_width = connection_result.desktop_size.width,
+        desktop_height = connection_result.desktop_size.height,
+        io_channel_id = connection_result.io_channel_id,
+        user_channel_id = connection_result.user_channel_id,
+        "Connection established"
+    );
     debug!(?connection_result);
 
     Ok((connection_result, upgraded_framed))
