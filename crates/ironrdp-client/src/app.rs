@@ -1,10 +1,11 @@
 //! Native windowing and rendering bridge for the IronRDP client.
 //!
-//! This module owns the `winit` application handler, softbuffer surface management,
-//! and translation from desktop-window input into [`RdpInputEvent`] values consumed
-//! by the active session driver, including IME commit handling for Unicode text.
-//! It also records lightweight surface-resize and software-present timings through
-//! `tracing` so render-path changes can be measured before deeper GPU work.
+//! This module owns the `winit` application handler, presentation backend
+//! selection, and translation from desktop-window input into [`RdpInputEvent`]
+//! values consumed by the active session driver, including IME commit handling
+//! for Unicode text. It also records lightweight surface-resize and software-
+//! present timings through `tracing` so render-path changes can be measured
+//! before deeper GPU work.
 //!
 //! [`RdpInputEvent`]: crate::rdp::RdpInputEvent
 
@@ -25,32 +26,24 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::platform::scancode::PhysicalKeyExtScancode as _;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes};
 
+use crate::presentation::{PresentationBackend, SoftbufferBackend};
 use crate::rdp::{RdpInputEvent, RdpOutputEvent};
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 struct WindowState {
-    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
-    context: softbuffer::Context<Arc<Window>>,
     window: Arc<Window>,
+    presenter: Box<dyn PresentationBackend>,
 }
 
 impl WindowState {
     fn new(window: Arc<Window>) -> anyhow::Result<Self> {
-        let context = softbuffer::Context::new(Arc::clone(&window))
-            .map_err(|e| anyhow::anyhow!("unable to initialize softbuffer context: {e}"))?;
-        let surface = softbuffer::Surface::new(&context, Arc::clone(&window))
-            .map_err(|e| anyhow::anyhow!("unable to initialize softbuffer surface: {e}"))?;
+        let presenter = SoftbufferBackend::new(Arc::clone(&window))?;
 
         Ok(Self {
-            surface,
-            context,
             window,
+            presenter: Box::new(presenter),
         })
-    }
-
-    fn surface_mut(&mut self) -> &mut softbuffer::Surface<Arc<Window>, Arc<Window>> {
-        &mut self.surface
     }
 }
 
@@ -58,7 +51,7 @@ pub struct App {
     input_event_sender: mpsc::UnboundedSender<RdpInputEvent>,
     initial_size: PhysicalSize<u32>,
     window_state: Option<WindowState>,
-    buffer: Vec<u32>,
+    buffer: Vec<u8>,
     buffer_size: (u16, u16),
     surface_size: (u16, u16),
     input_database: ironrdp::input::Database,
@@ -136,38 +129,25 @@ impl App {
             return;
         };
         let draw_started_at = Instant::now();
-        let _keep_context_alive = &window_state.context;
-        let mut sb_buffer = match window_state.surface_mut().buffer_mut() {
-            Ok(buffer) => buffer,
+        let stats = match window_state
+            .presenter
+            .present_rgba(&self.buffer, self.buffer_size.0, self.buffer_size.1)
+        {
+            Ok(stats) => stats,
             Err(error) => {
-                error!(%error, "Failed to acquire surface buffer");
+                error!(%error, "Failed to present surface buffer");
                 return;
             }
         };
-        if sb_buffer.len() != self.buffer.len() {
-            error!(
-                surface_pixels = sb_buffer.len(),
-                frame_pixels = self.buffer.len(),
-                "Surface and framebuffer sizes diverged"
-            );
-            return;
-        }
-        let copy_started_at = Instant::now();
-        sb_buffer.copy_from_slice(self.buffer.as_slice());
-        let copy_duration = copy_started_at.elapsed();
-        let present_started_at = Instant::now();
-        if let Err(error) = sb_buffer.present() {
-            error!(%error, "Failed to present surface buffer");
-            return;
-        }
 
         self.presented_frame_count = self.presented_frame_count.saturating_add(1);
         trace!(
             frame_id = self.presented_frame_count,
             width = self.buffer_size.0,
             height = self.buffer_size.1,
-            copy_micros = copy_duration.as_micros(),
-            present_micros = present_started_at.elapsed().as_micros(),
+            convert_micros = stats.convert_micros,
+            present_micros = stats.present_micros,
+            backend_total_micros = stats.total_micros,
             total_micros = draw_started_at.elapsed().as_micros(),
             "Presented frame"
         );
@@ -453,7 +433,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                 self.buffer = buffer;
                 if self.surface_size != self.buffer_size {
                     if let Err(error) = window_state
-                        .surface_mut()
+                        .presenter
                         .resize(NonZeroU32::from(width), NonZeroU32::from(height))
                     {
                         error!(%error, "Failed to resize drawing surface");

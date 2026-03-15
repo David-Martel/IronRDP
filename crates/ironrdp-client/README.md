@@ -11,10 +11,11 @@ and winit for windowing.
 The native client is split into a few coarse responsibilities:
 
 - `main.rs`: CLI bootstrap, logging, Tokio runtime startup, and top-level app wiring.
-- `app.rs`: window creation, initial sizing, resize/DPI handling, software presentation, IME/unicode translation, and translation of `winit` events into client input events.
+- `app.rs`: window creation, initial sizing, resize/DPI handling, presentation backend dispatch, IME/unicode translation, and translation of `winit` events into client input events.
+- `presentation.rs`: presentation backend seam; the current implementation converts RGBA frames directly into the `softbuffer` surface so the client no longer builds an extra packed `Vec<u32>` staging buffer.
 - `rdp.rs`: connection establishment, transport upgrades, channel wiring, and reconnect policy.
 - `session_driver.rs`: active-session runtime that drives an established connection and translates
-  protocol output into window events while reusing packed frame buffers to reduce render-path churn.
+  protocol output into window events while reusing RGBA frame buffers to reduce render-path churn.
 
 That split keeps the live session loop separate from connection setup, which makes the runtime easier
 to reason about and reduces coupling between transport code and window/rendering code.
@@ -30,8 +31,8 @@ The native client can now also advertise experimental multitransport policy thro
 it still responds with a standards-compliant `E_ABORT` until a real UDP sideband transport is
 implemented. This keeps protocol negotiation visible without pretending the Windows-native client
 already supports multitransport data flow.
-The client now also emits lightweight frame-path diagnostics through `tracing`: packed-frame
-conversion time, surface-present time, and resize/reconnect churn are visible at `trace`/`debug`
+The client now also emits lightweight frame-path diagnostics through `tracing`: frame-copy
+time, backend conversion/present time, and resize/reconnect churn are visible at `trace`/`debug`
 level to guide the next GPU/render and multitransport work.
 
 ## Sample usage

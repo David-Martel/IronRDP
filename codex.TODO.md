@@ -146,6 +146,10 @@ Status: partially done; broader reconnect and single-session integration coverag
 Refs: `crates/ironrdp-client/src/config.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-session/src/active_stage.rs`, `crates/ironrdp-session/src/x224/mod.rs`, `crates/ironrdp-client/README.md`.
 Status: groundwork done; real UDP sideband transport is still not implemented.
 
+22. The native client now has an internal presentation-backend seam and passes reusable RGBA frames directly to the backend, removing the extra packed `Vec<u32>` staging buffer from the software render path.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/README.md`.
+Status: done; `softbuffer` remains the default backend and still performs one backend-local surface conversion.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -251,18 +255,18 @@ Effort: medium.
 
 ## Priority 2: Windows performance, acceleration, and transport groundwork
 
-1. Remove avoidable client graphics-copy overhead.
-Refs: `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`.
+1. Instrument and reduce the remaining backend-local surface conversion cost.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`.
 Problem:
-- packed-frame allocation churn is fixed, but the client still copies the packed frame into `softbuffer`
-- the remaining full-frame copy is likely still the top CPU bottleneck on Intel machines
+- the extra packed staging buffer is gone, but `softbuffer` still requires a full RGBA-to-surface-word conversion during present
+- that backend-local conversion is likely the next top CPU bottleneck on Intel machines
 Effort: medium.
 
-2. Introduce a presentation-backend seam around the current `softbuffer` path.
-Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
+2. Keep the presentation backend seam stable and use it as the entry point for Windows acceleration experiments.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`.
 Do next:
-- isolate surface ownership and present logic behind an internal backend boundary
 - keep `softbuffer` as the default implementation
+- add diagnostics that compare backend conversion vs total frame present cost
 - make later Windows GPU experiments additive rather than another app rewrite
 Effort: medium.
 

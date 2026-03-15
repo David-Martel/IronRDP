@@ -4,8 +4,8 @@
 //! into [`ActiveStage`] updates, turns GUI-originated input into protocol output,
 //! and forwards rendered image and pointer updates back to the window event loop.
 //! `rdp.rs` keeps connection establishment and reconnect policy, while this module
-//! owns the live-session driver and the reusable packed-frame buffer used by the
-//! software presentation path. It also emits lightweight frame-pack and reconnect
+//! owns the live-session driver and the reusable RGBA frame buffer used by the
+//! software presentation path. It also emits lightweight frame-copy and reconnect
 //! diagnostics to guide the next render and transport optimization passes.
 //! Multitransport requests are currently answered explicitly with `E_ABORT` on the
 //! TCP control path so negotiation remains standards-complete until a real UDP
@@ -45,7 +45,7 @@ enum SessionDriverFlow {
 struct SessionDriver {
     image: DecodedImage,
     active_stage: ActiveStage,
-    reusable_frame_buffer: Vec<u32>,
+    reusable_frame_buffer: Vec<u8>,
     emitted_frame_count: u64,
     reconnect_resize_count: u64,
 }
@@ -285,9 +285,9 @@ impl SessionDriver {
     fn emit_image_update(&mut self, event_loop_proxy: &EventLoopProxy<RdpOutputEvent>) -> SessionResult<()> {
         let started_at = Instant::now();
         let mut buffer = core::mem::take(&mut self.reusable_frame_buffer);
-        let pack_started_at = Instant::now();
-        pack_rgba_frame(self.image.data(), &mut buffer)?;
-        let pack_duration = pack_started_at.elapsed();
+        let copy_started_at = Instant::now();
+        copy_rgba_frame(self.image.data(), &mut buffer)?;
+        let copy_duration = copy_started_at.elapsed();
         let width = NonZeroU16::new(self.image.width()).ok_or_else(|| session::general_err!("width is zero"))?;
         let height = NonZeroU16::new(self.image.height()).ok_or_else(|| session::general_err!("height is zero"))?;
 
@@ -301,7 +301,7 @@ impl SessionDriver {
             width = width.get(),
             height = height.get(),
             pixels = usize::from(width.get()) * usize::from(height.get()),
-            pack_micros = pack_duration.as_micros(),
+            copy_micros = copy_duration.as_micros(),
             total_micros = started_at.elapsed().as_micros(),
             "Emitted image update"
         );
@@ -407,42 +407,37 @@ where
     Ok(RdpControlFlow::TerminatedGracefully(disconnect_reason))
 }
 
-fn pack_rgba_frame(image_data: &[u8], buffer: &mut Vec<u32>) -> SessionResult<()> {
-    let mut pixels = image_data.chunks_exact(4);
-    buffer.clear();
-    buffer.extend(pixels.by_ref().map(|pixel| {
-        let r = pixel[0];
-        let g = pixel[1];
-        let b = pixel[2];
-        u32::from_be_bytes([0, r, g, b])
-    }));
-
+fn copy_rgba_frame(image_data: &[u8], buffer: &mut Vec<u8>) -> SessionResult<()> {
+    let pixels = image_data.chunks_exact(4);
     if !pixels.remainder().is_empty() {
         return Err(session::general_err!("decoded image length is not divisible by four"));
     }
+
+    buffer.clear();
+    buffer.extend_from_slice(image_data);
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pack_rgba_frame;
+    use super::copy_rgba_frame;
 
     #[test]
-    fn pack_rgba_frame_converts_pixels_for_softbuffer() {
+    fn copy_rgba_frame_preserves_rgba_bytes() {
         let image = [
             0x11, 0x22, 0x33, 0xff, //
             0x44, 0x55, 0x66, 0x77,
         ];
         let mut buffer = Vec::new();
 
-        pack_rgba_frame(&image, &mut buffer).expect("pack frame");
+        copy_rgba_frame(&image, &mut buffer).expect("copy frame");
 
-        assert_eq!(buffer, vec![0x0011_2233, 0x0044_5566]);
+        assert_eq!(buffer, image);
     }
 
     #[test]
-    fn pack_rgba_frame_reuses_existing_capacity() {
+    fn copy_rgba_frame_reuses_existing_capacity() {
         let image = [
             0x01, 0x02, 0x03, 0xff, //
             0x04, 0x05, 0x06, 0xff,
@@ -450,9 +445,9 @@ mod tests {
         let mut buffer = Vec::with_capacity(8);
         let initial_capacity = buffer.capacity();
 
-        pack_rgba_frame(&image, &mut buffer).expect("pack frame");
+        copy_rgba_frame(&image, &mut buffer).expect("copy frame");
 
-        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer.len(), image.len());
         assert_eq!(buffer.capacity(), initial_capacity);
     }
 }

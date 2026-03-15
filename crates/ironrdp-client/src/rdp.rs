@@ -42,7 +42,7 @@ use crate::session_driver::{RdpControlFlow, run_active_session};
 #[derive(Debug)]
 pub enum RdpOutputEvent {
     Image {
-        buffer: Vec<u32>,
+        buffer: Vec<u8>,
         width: NonZeroU16,
         height: NonZeroU16,
     },
@@ -69,7 +69,7 @@ pub enum RdpInputEvent {
     FastPath(SmallVec<[FastPathInputEvent; 2]>),
     Close,
     Clipboard(ClipboardMessage),
-    RecycleFrameBuffer(Vec<u32>),
+    RecycleFrameBuffer(Vec<u8>),
     SendDvcMessages {
         channel_id: u32,
         messages: Vec<SvcMessage>,
