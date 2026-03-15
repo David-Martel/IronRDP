@@ -244,7 +244,8 @@ fn encode_io_channel_pdu<T: Encode>(
 mod tests {
     use ironrdp_connector::legacy::decode_send_data_indication;
     use ironrdp_core::{WriteBuf, decode};
-    use ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu;
+    use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+    use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu, RequestedProtocol};
 
     use super::encode_io_channel_pdu;
 
@@ -264,5 +265,30 @@ mod tests {
         let decoded = decode::<MultitransportResponsePdu>(data_ctx.user_data).expect("decode multitransport response");
         assert_eq!(decoded.request_id, 42);
         assert_eq!(decoded.hr_response, MultitransportResponsePdu::E_ABORT);
+    }
+
+    #[test]
+    fn encode_io_channel_pdu_preserves_multitransport_request_payload() {
+        let mut output = WriteBuf::new();
+        let request = MultitransportRequestPdu {
+            security_header: BasicSecurityHeader {
+                flags: BasicSecurityHeaderFlags::TRANSPORT_REQ,
+            },
+            request_id: 7,
+            requested_protocol: RequestedProtocol::UdpFecL,
+            security_cookie: [0xAB; 16],
+        };
+
+        let written = encode_io_channel_pdu(1003, 1001, &mut output, &request).expect("encode multitransport request");
+        assert!(written > 0);
+
+        let data_ctx = decode_send_data_indication(output.filled()).expect("decode send-data indication");
+        assert_eq!(data_ctx.initiator_id, 1003);
+        assert_eq!(data_ctx.channel_id, 1001);
+
+        let decoded = decode::<MultitransportRequestPdu>(data_ctx.user_data).expect("decode multitransport request");
+        assert_eq!(decoded.request_id, 7);
+        assert_eq!(decoded.requested_protocol, RequestedProtocol::UdpFecL);
+        assert_eq!(decoded.security_cookie, [0xAB; 16]);
     }
 }

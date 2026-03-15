@@ -70,42 +70,44 @@ impl PresentationBackend for SoftbufferBackend {
 }
 
 fn write_rgba_to_surface_words(rgba: &[u8], width: u16, height: u16, dst: &mut [u32]) -> anyhow::Result<()> {
-    let pixels = rgba.chunks_exact(4);
-    if !pixels.remainder().is_empty() {
+    let (pixels, remainder) = rgba.as_chunks::<4>();
+    if !remainder.is_empty() {
         anyhow::bail!("decoded image length is not divisible by four");
     }
 
     let expected_pixels = usize::from(width) * usize::from(height);
-    if expected_pixels != rgba.len() / 4 {
+    if expected_pixels != pixels.len() {
         anyhow::bail!(
             "frame dimensions and pixel payload diverged: width={}, height={}, frame_pixels={}",
             width,
             height,
-            rgba.len() / 4
+            pixels.len()
         );
     }
 
-    if dst.len() != rgba.len() / 4 {
+    if dst.len() != pixels.len() {
         anyhow::bail!(
             "surface and framebuffer sizes diverged: surface_pixels={}, frame_pixels={}",
             dst.len(),
-            rgba.len() / 4
+            pixels.len()
         );
     }
 
-    for (pixel, dst_word) in rgba.chunks_exact(4).zip(dst.iter_mut()) {
-        let r = pixel[0];
-        let g = pixel[1];
-        let b = pixel[2];
-        *dst_word = u32::from_be_bytes([0, r, g, b]);
+    for (&[r, g, b, _alpha], dst_word) in pixels.iter().zip(dst.iter_mut()) {
+        *dst_word = pack_softbuffer_rgb(r, g, b);
     }
 
     Ok(())
 }
 
+#[inline]
+fn pack_softbuffer_rgb(r: u8, g: u8, b: u8) -> u32 {
+    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::write_rgba_to_surface_words;
+    use super::{pack_softbuffer_rgb, write_rgba_to_surface_words};
 
     #[test]
     fn write_rgba_to_surface_words_converts_pixels_for_softbuffer() {
@@ -150,5 +152,10 @@ mod tests {
                 .to_string()
                 .contains("frame dimensions and pixel payload diverged")
         );
+    }
+
+    #[test]
+    fn pack_softbuffer_rgb_uses_expected_channel_layout() {
+        assert_eq!(pack_softbuffer_rgb(0x11, 0x22, 0x33), 0x0011_2233);
     }
 }

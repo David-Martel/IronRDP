@@ -618,9 +618,10 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
     use ironrdp::pdu::gcc::MultiTransportFlags;
 
-    use super::{MultitransportMode, multitransport_flags_from_mode, resolve_desktop_size};
+    use super::{Args, MultitransportMode, multitransport_flags_from_mode, resolve_desktop_size};
 
     #[test]
     fn resolve_desktop_size_prefers_cli_values() {
@@ -661,5 +662,33 @@ mod tests {
         assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED));
         assert!(flags.contains(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP));
         assert!(!flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL));
+    }
+
+    #[test]
+    fn multitransport_mode_lossy_sets_only_lossy_flag() {
+        let flags = multitransport_flags_from_mode(MultitransportMode::Lossy).expect("flags should be set");
+
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL));
+        assert!(!flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR));
+        assert!(!flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED));
+        assert!(!flags.contains(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP));
+    }
+
+    #[test]
+    fn multitransport_mode_prefer_lossy_sets_expected_flags() {
+        let flags = multitransport_flags_from_mode(MultitransportMode::PreferLossy).expect("flags should be set");
+
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL));
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED));
+        assert!(flags.contains(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP));
+        assert!(!flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR));
+    }
+
+    #[test]
+    fn cli_parser_accepts_multitransport_mode() {
+        let args = Args::try_parse_from(["ironrdp-client", "server.example", "--multitransport", "prefer-lossy"])
+            .expect("multitransport CLI parse");
+
+        assert_eq!(args.multitransport, MultitransportMode::PreferLossy);
     }
 }

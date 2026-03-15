@@ -150,6 +150,10 @@ Status: groundwork done; real UDP sideband transport is still not implemented.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/README.md`.
 Status: done; `softbuffer` remains the default backend and still performs one backend-local surface conversion.
 
+23. Focused multitransport unit coverage now pins client-side advertisement mapping and IO-channel request/abort wrapping, and the `softbuffer` presenter now uses a simpler validated RGBA packing loop.
+Refs: `crates/ironrdp-client/src/config.rs`, `crates/ironrdp-session/src/x224/mod.rs`, `crates/ironrdp-client/src/presentation.rs`.
+Status: done; real UDP sideband transport and end-to-end runtime coverage still remain.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -255,18 +259,19 @@ Effort: medium.
 
 ## Priority 2: Windows performance, acceleration, and transport groundwork
 
-1. Instrument and reduce the remaining backend-local surface conversion cost.
+1. Instrument and measure the remaining backend-local surface conversion cost end to end.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`.
 Problem:
-- the extra packed staging buffer is gone, but `softbuffer` still requires a full RGBA-to-surface-word conversion during present
-- that backend-local conversion is likely the next top CPU bottleneck on Intel machines
+- the extra packed staging buffer is gone, and the current presenter loop has been simplified
+- `softbuffer` still requires a full RGBA-to-surface-word conversion during present
+- queue latency, surface acquisition, and backend conversion cost now need to be separated before deeper GPU work
 Effort: medium.
 
 2. Keep the presentation backend seam stable and use it as the entry point for Windows acceleration experiments.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`.
 Do next:
 - keep `softbuffer` as the default implementation
-- add diagnostics that compare backend conversion vs total frame present cost
+- add diagnostics that compare emit-to-present latency, backend acquisition, backend conversion, and present cost
 - make later Windows GPU experiments additive rather than another app rewrite
 Effort: medium.
 
@@ -297,7 +302,7 @@ Effort: medium.
 6. Make standards-based transport acceleration real before custom transport ideas.
 Refs: `crates/ironrdp-client/src/config.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-session/src/active_stage.rs`.
 Do next:
-- add focused tests around the new multitransport advertise/abort path
+- extend focused tests around the multitransport advertise/abort path into runtime coverage
 - decide the first real UDP posture to support (`UDP_FECR` first, lossy later)
 - keep unsupported cases explicit on the TCP control path
 Effort: medium to large.
@@ -406,12 +411,12 @@ Effort: large.
 
 1. Lock the supported build matrix and artifact-class contract.
 2. Finish reconnect/shutdown clarity and add focused runtime seam tests.
-3. Remove the remaining client graphics-copy overhead and isolate the presentation backend boundary.
+3. Instrument emit-to-present latency and backend acquisition/conversion/present timing on the native client.
 4. Make multitransport groundwork explicit and measurable before real UDP work.
 5. Measure portable vs host-tuned Intel builds on both primary machines.
-6. Revisit optional Intel iGPU, EGFX, UDP/multitransport, LLVM/lld, oneAPI, and CUDA work only after the CPU/software baseline is measured and stable.
-7. Validate the no-repo install path in the local Hyper-V Windows Server VM.
-8. Then finish the `dtm-p1gen7` deploy-and-smoke-test path.
-9. Extend Unicode/IME validation into end-to-end Windows smoke coverage.
+6. Validate the no-repo install path in the local Hyper-V Windows Server VM.
+7. Then finish the `dtm-p1gen7` deploy-and-smoke-test path.
+8. Extend Unicode/IME validation into end-to-end Windows smoke coverage.
+9. Revisit optional Intel iGPU, EGFX, UDP/multitransport, LLVM/lld, oneAPI, and CUDA work only after the CPU/software baseline is measured and stable.
 10. Take on the next connector/session/FFI boundary cleanup.
 11. Keep gateway work in [gateway.TODO.md](C:/codedev/IronRDP/gateway.TODO.md) until the direct machine-to-machine path is stronger, and keep any Gemini-style custom streaming ideas out of the core RDP track until a separate subsystem is justified.
