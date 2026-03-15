@@ -1,129 +1,169 @@
 # Codex TODO
 
-This file prioritizes the easiest remaining fixes after the Windows/server-focused trim of the repository.
-The recommendations were assembled from parallel read-only analysis passes over the workspace, runtime code, and Rust/.NET packaging surface.
-The Windows/.NET packaging pass used the `rust-dll-csharp-cli` skill because the trimmed repo now leans heavily on the FFI path.
+This file tracks David-Martel-owned follow-up work for the Windows/server-focused fork.
+The upstream IronRDP codebase is now an input, not the deployment target: changes here should improve the quality, maintainability, and deployability of the Windows-only fork across multiple machines.
 
-## Priority 1: Small, high-payoff fixes
+Current baseline:
+- Branch: `windows-server-only`
+- Fork owner: `David-Martel`
+- Latest pushed commit at the time of this update: `e607b73a`
+- Current release posture: signed commits, public fork, Windows-native build path centered on `build.ps1`, Rust native client, and the .NET/FFI surface
 
-1. Align `cargo xtask ci` with the actual CI contract.
-Refs: `xtask/src/main.rs`, `xtask/src/ffi.rs`, `.github/workflows/ci.yml`.
-Problem: `cargo xtask ci` now unconditionally runs Windows-only FFI steps even though the repo still runs generic checks on both Windows and Linux.
-Recommendation: gate the FFI branch on Windows with an explicit skip elsewhere, or split `ci` into platform-neutral and Windows-specific variants.
-Effort: small.
+## Recently completed
 
-2. Remove stale web-era coverage and documentation drift.
-Refs: `xtask/src/cov.rs`, `ARCHITECTURE.md`, `crates/ironrdp-rdcleanpath/Cargo.toml`, `AGENTS.md`.
-Problem: coverage filters still reference deleted web paths, and `ironrdp-rdcleanpath` still describes itself in terms of the removed web client.
-Recommendation: clean the coverage regex/globs, rewrite the `ironrdp-rdcleanpath` description around current consumers only, and move missing architectural facts out of `AGENTS.md` into `ARCHITECTURE.md`.
-Effort: small.
+1. Platform-specific CI/build drift was cleaned up.
+Refs: `xtask/src/main.rs`, `xtask/src/cov.rs`, `xtask/src/check.rs`, `ARCHITECTURE.md`, `Cargo.toml`.
+Status: done.
+Notes: `cargo xtask ci` no longer assumes removed web-era paths or old platform behavior, stale coverage filters were removed, and the repo metadata better reflects the trimmed fork.
 
-3. Reclassify the excluded crates explicitly.
-Refs: `Cargo.toml`, `AGENTS.md`.
-Problem: the workspace still labels excluded crates as temporary compilation breakage even though they now look more like parked legacy surfaces.
-Recommendation: replace the blanket `# FIXME: fix compilation` note with an intentional classification such as `legacy/unmaintained`, or link each excluded crate to a tracked issue.
-Effort: small.
+2. Excluded crates were reclassified away from generic “fix compilation” debt.
+Refs: `Cargo.toml`, `AGENTS.md`, `ARCHITECTURE.md`.
+Status: done.
+Notes: the fork now treats these as intentionally parked/legacy surfaces instead of pretending they are active near-term work.
 
-4. Stop panicking across the FFI boundary.
-Refs: `ffi/src/log.rs`, `ffi/src/connector/mod.rs`.
-Problem: `Log::init_with_env()` still documents that it panics, and the FFI connector path still contains an `expect(...)` on DRDYNVC initialization.
-Recommendation: make logging initialization return a typed FFI error, store the result in a fallible one-time init path, and replace the `expect` with a checked error return.
-Effort: small.
+3. The Windows build/deployment path was upgraded.
+Refs: `build.ps1`, `.cargo/config.toml`, `Cargo.toml`, `xtask/src/ffi.rs`.
+Status: done.
+Notes: `build.ps1` now uses the CargoTools environment for optimized Windows builds, `sccache`/linker acceleration, and FFI helper setup.
 
-5. Stop unconditional TLS acceptance in the .NET direct-connection helper.
-Refs: `ffi/dotnet/Devolutions.IronRdp/src/Connection.cs`.
-Problem: the `SslStream` validation callback always returns `true`, so the managed helper bypasses certificate validation entirely.
-Recommendation: add an explicit certificate-validation policy hook, default it to normal platform validation, and clean up the nearby nullable and generic-exception paths.
-Effort: small.
+4. FFI boundary hardening landed.
+Refs: `ffi/src/log.rs`, `ffi/src/connector/mod.rs`, `ffi/dotnet/Devolutions.IronRdp/src/Connection.cs`.
+Status: mostly done.
+Notes: panic-prone paths were removed from the exposed FFI surface, and the managed connection helper no longer blindly accepts any TLS certificate by default.
 
-6. Clean the obvious .NET build/package warnings while the surface is still small.
-Refs: `ffi/dotnet/Devolutions.IronRdp/Generated/ConnectionActivationState.cs`, `ffi/dotnet/Devolutions.IronRdp/Generated/CredsspSequence.cs`, `ffi/dotnet/Devolutions.IronRdp/Generated/WinCliprdr.cs`, `ffi/dotnet/Devolutions.IronRdp/Devolutions.IronRdp.csproj`.
-Problem: the managed package still emits `GetType()` name-collision and nullability warnings, and the project file still carries a stale `ImplicitUsings` FIXME and obsolete trim fallout.
-Recommendation: fix the generation/post-generation path so optional Rust returns become nullable managed types, rename generated `GetType` methods consistently, disable `ImplicitUsings` or remove the FIXME, and remove stale platform-oriented conditions.
+5. The foundational `std`/`no_std` story was clarified instead of left misleading.
+Refs: `crates/ironrdp-propertyset/Cargo.toml`, `crates/ironrdp-svc/Cargo.toml`, `crates/ironrdp-svc/src/lib.rs`, `crates/ironrdp-dvc/Cargo.toml`, `crates/ironrdp-rdpsnd/Cargo.toml`.
+Status: done.
+Notes: manifest/runtime feature wiring now better matches actual code paths.
+
+6. The unsound native client window/display lifetime workaround was removed.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/main.rs`.
+Status: done.
+Notes: window, `softbuffer` context, and surface ownership now live in a dedicated state boundary without the fake `'static` lifetime hack.
+
+7. The client runtime was split into clearer responsibilities.
+Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/README.md`.
+Status: done.
+Notes: connection/bootstrap and live session processing are now separated.
+
+8. The server runtime was split and the event dispatcher was isolated.
+Refs: `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-server/README.md`.
+Status: done.
+Notes: listener/bootstrap logic is separated from accepted-session runtime, and the event-routing path now has narrower internal helpers.
+
+9. The fork is now in a clean signed state suitable for continued development.
+Refs: Git history on `windows-server-only`.
+Status: done.
+Notes: the local worktree was cleaned, signed commits were pushed, and the Codex handoff context was refreshed.
+
+## Priority 1: Next practical wins
+
+1. Clean the remaining .NET generated/package warnings.
+Refs: `ffi/dotnet/Devolutions.IronRdp/Generated/*.cs`, `ffi/dotnet/Devolutions.IronRdp/Devolutions.IronRdp.csproj`.
+Problem: generated C# still carries warning noise around nullability and generated naming, which makes the main Windows packaging surface harder to trust.
+Recommendation: fix the generation/post-generation pipeline so generated bindings compile warning-clean or at least warning-minimal.
 Effort: small to medium.
 
-7. Remove the unsound native-client lifetime workaround.
-Refs: `crates/ironrdp-client/src/app.rs`.
-Problem: the native client currently uses `transmute` to coerce `DisplayHandle<'_>` to `DisplayHandle<'static>`, and the file itself states that the API is unsound as written.
-Recommendation: refactor `App` ownership so the `softbuffer` context and surface are created and stored without needing a fake `'static` lifetime.
+2. Finish the Windows-native client bootstrap basics.
+Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/main.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/rdp.rs`.
+Problem: the client still has bootstrap gaps around initial sizing, Unicode input, reconnect/resize polish, and explicit exit/error behavior.
+Recommendation: finish the user-visible startup and reconnect path before deeper internal refactors.
 Effort: medium.
 
-8. Finish the Windows-native client bootstrap basics.
-Refs: `crates/ironrdp-client/src/main.rs`, `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/rdp.rs`.
-Problem: the initial window size is still hardcoded, Unicode input is still unimplemented, resize reconnects still skip the auto-reconnect cookie path, and failure paths still lack explicit process exit codes.
-Recommendation: move initial size/scale into app bootstrap, implement Unicode input through modern `winit` events, wire proper exit codes, and complete the auto-reconnect-cookie flow for resize-driven reconnects.
-Effort: small to medium.
+3. Add focused tests around the server runtime seam.
+Refs: `crates/ironrdp-testsuite-extra/tests/mod.rs`, `crates/ironrdp-server/src/session_driver.rs`.
+Problem: integration coverage exists, but it does not directly assert input delivery, backlog handling, clipboard/audio server events, or display-update failure modes.
+Recommendation: add focused tests for input handler delivery, event dispatch families, and non-resize display update paths.
+Effort: medium.
 
-9. Make display and bitmap limitations fail explicitly instead of degrading implicitly.
+4. Make display and bitmap limitations fail explicitly instead of degrading implicitly.
 Refs: `crates/ironrdp-displaycontrol/src/client.rs`, `crates/ironrdp-server/src/encoder/bitmap.rs`, `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/src/encoder/mod.rs`.
-Problem: display-control still does not enforce negotiated monitor-area limits, and the server still has known gaps around non-multiple-of-4 bitmap widths, client-smaller-than-server behavior, and pessimistic bitmap buffer growth.
-Recommendation: add capability/size validation before live-session entry, clamp or reject unsupported monitor layouts early, and add a cheap encoded-size heuristic to reduce repeated over-allocation.
-Effort: small to medium.
-
-10. Make the server connection model explicit.
-Refs: `crates/ironrdp-server/src/server.rs`.
-Problem: `RdpServer::run()` accepts a connection and then awaits it inline, so the listener is effectively single-connection even though that is not surfaced as a first-class contract.
-Recommendation: either document single-client behavior explicitly in type docs and README, or move to task-per-connection handling and replace the handler mutex with a channel-owned worker model.
+Problem: unsupported display layouts and bitmap edge cases are still handled too late or too implicitly.
+Recommendation: reject unsupported combinations earlier, clamp where safe, and document the enforced constraints in the server README/API docs.
 Effort: medium.
 
-## Priority 2: Medium-size boundary cleanup
-
-11. Unify FFI packaging logic between `xtask` and release workflows.
-Refs: `xtask/src/ffi.rs`, `.github/workflows/nuget-publish.yml`, `ffi/Cargo.toml`.
-Problem: `xtask` and the NuGet workflow currently implement overlapping DLL-copying and profile-selection logic, and the workflow still rewrites `ffi/Cargo.toml` at build time.
-Recommendation: teach `cargo xtask ffi build` about the production packaging profile, stop mutating `Cargo.toml` in CI, and have CI/release call the same entrypoint used locally.
+5. Make the server connection model a first-class contract.
+Refs: `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/README.md`.
+Problem: `RdpServer::run()` is still effectively single-client, but that behavior is not yet the explicit product contract for this fork.
+Recommendation: either document and embrace single-session behavior for David-Martel’s use case, or move to task-per-connection deliberately.
 Effort: medium.
 
-12. Replace the allocation-heavy managed framing path with a pooled or ring-buffer design.
+6. Unify the Windows deployment pipeline around one authoritative path.
+Refs: `build.ps1`, `xtask/src/ffi.rs`, `.github/workflows/nuget-publish.yml`, `ffi/dotnet/*`.
+Problem: build/deploy logic is improved but still split between local scripts and release automation.
+Recommendation: make `build.ps1` and `cargo xtask ffi build` the canonical local/CI entrypoints, then align publish workflows around them.
+Effort: medium.
+
+## Priority 2: Boundary cleanup with deployment payoff
+
+7. Replace allocation-heavy managed framing with pooled buffering.
 Refs: `ffi/dotnet/Devolutions.IronRdp/src/Framed.cs`.
-Problem: reads repeatedly call `ToArray()`, `Take()`, `Skip()`, and rebuild `List<byte>` buffers, which is avoidable churn on a now-central Windows code path.
-Recommendation: move to `ArrayBufferWriter<byte>` or a dedicated ring buffer, avoid full-buffer copies in `ReadPdu`/`ReadByHint`, and normalize EOF/error mapping at the same time.
+Problem: repeated `ToArray`/`Take`/`Skip` patterns create avoidable churn in the Windows-managed path.
+Recommendation: move to a pooled/ring-buffer design.
 Effort: medium.
 
-13. Simplify the FFI connector API instead of exposing consumed-state plumbing.
-Refs: `ffi/src/connector/mod.rs`.
-Problem: `ClientConnector` wraps `Option<...>` to model ownership transfer, still carries naming and missing-opaque-type FIXMEs, and exposes an awkward take-and-put-back shape to managed callers.
-Recommendation: rename the mutating helpers to `attach_*`, add opaque channel wrappers, and reduce the number of stateful consumption patterns exported through Diplomat.
+8. Simplify the FFI connector API.
+Refs: `ffi/src/connector/mod.rs`, `ffi/src/connector/config.rs`.
+Problem: the connector surface still exposes too much consumed-state machinery and internal ownership detail.
+Recommendation: introduce clearer attach/build semantics and reduce exported stateful take/replace patterns.
 Effort: medium.
 
-14. Move client-only rendering knobs out of `connector::Config`.
+9. Move presentation/rendering knobs out of `connector::Config`.
 Refs: `crates/ironrdp-connector/src/lib.rs`, `crates/ironrdp-client/src/config.rs`, `ffi/src/connector/config.rs`.
-Problem: fields like `enable_server_pointer` and `pointer_software_rendering` live in connector config even though the connector crate itself calls them client-only concerns.
-Recommendation: move presentation/rendering knobs into a higher-level client or session config so `ironrdp-connector` stays focused on handshake and negotiated protocol state.
+Problem: client-specific rendering and pointer settings still leak into lower-level connector configuration.
+Recommendation: move them into a higher-level client/session config boundary.
 Effort: medium.
 
-15. Reduce `ironrdp-session`’s coupling to `ironrdp-connector`.
+10. Reduce `ironrdp-session` coupling to `ironrdp-connector`.
 Refs: `crates/ironrdp-session/Cargo.toml`, `crates/ironrdp-session/src/lib.rs`.
-Problem: `ironrdp-session` still publicly depends on `ironrdp-connector`, and the crate root still questions whether some functionality belongs there at all.
-Recommendation: extract the minimum shared activation/session state needed by both crates and remove the public connector dependency from session.
+Problem: activation/session responsibilities are still not as cleanly separated as they should be.
+Recommendation: extract the minimum shared activation/session state and narrow the dependency boundary.
 Effort: medium.
 
-16. Decide which unpublished crates are intentionally private.
+11. Decide which unpublished crates are intentionally private in this fork.
 Refs: `crates/ironrdp-propertyset/Cargo.toml`, `crates/ironrdp-cfg/Cargo.toml`, `crates/ironrdp-mstsgu/Cargo.toml`, `crates/ironrdp-rdpfile/Cargo.toml`, `crates/ironrdp-egfx/Cargo.toml`.
-Problem: several crates still read as `publish = false # TODO: publish`, which looks like unresolved packaging debt rather than an explicit policy.
-Recommendation: either publish them or replace the TODOs with a clear statement that they are intentionally internal/private.
+Problem: several crates still read as unresolved “publish later” debt.
+Recommendation: replace the vague TODOs with an explicit private/internal policy where appropriate.
 Effort: small.
 
 ## Priority 3: Strategic refactors
 
-17. Turn broad architecture TODOs into tracked work for `ironrdp-pdu`.
+12. Turn broad `ironrdp-pdu` architecture debt into scoped tracked work.
 Refs: `ARCHITECTURE.md`, `crates/ironrdp-pdu/Cargo.toml`, `crates/ironrdp-pdu/README.md`.
-Problem: the architecture document and crate manifest still describe dependency debt in broad terms, and the README still contains an unfinished section.
-Recommendation: convert the vague TODOs into scoped work items or issue links, then continue removing `byteorder`, `num-derive`, and `num-traits` from the crate.
+Problem: the crate is still too broad and still carries dependency debt described only in broad terms.
+Recommendation: split the work into discrete dependency-removal and module-boundary tasks.
 Effort: medium to large.
 
-18. Split `ironrdp-graphics` into smaller crates and remove legacy helpers.
-Refs: `ARCHITECTURE.md`, `crates/ironrdp-graphics/Cargo.toml`, `crates/ironrdp-graphics/src/lib.rs`, `crates/ironrdp-graphics/src/rle.rs`, `crates/ironrdp-graphics/src/utils.rs`.
-Problem: graphics is still explicitly called out as oversized and still carries the same legacy dependency pattern as `ironrdp-pdu`.
-Recommendation: isolate codec- or format-specific code into smaller crates, push reusable cursor/buffer helpers toward `ironrdp-core` where appropriate, and remove remaining blanket lint allows once invariants are stated locally.
+13. Split `ironrdp-graphics` into smaller crates and remove legacy helpers.
+Refs: `ARCHITECTURE.md`, `crates/ironrdp-graphics/Cargo.toml`, `crates/ironrdp-graphics/src/lib.rs`.
+Problem: graphics remains oversized and still mixes several concerns.
+Recommendation: isolate codec- or format-specific code, then tighten local invariants and lint posture.
 Effort: large.
+
+## Deployment roadmap
+
+1. Stabilize the current local build path.
+Goal: one reproducible command for native Rust + FFI packaging on Windows.
+Primary refs: `build.ps1`, `xtask/src/ffi.rs`.
+
+2. Make the .NET package warning-clean and publish-ready.
+Goal: reliable reusable library output for David-Martel-owned tools across multiple machines.
+Primary refs: `ffi/dotnet/Devolutions.IronRdp/*`.
+
+3. Add installer-oriented packaging once the runtime surface settles.
+Goal: support self-contained EXE plus installer packaging from a stable build graph.
+Primary refs: `build.ps1`, future packaging project/scripts.
+
+4. Add CI validation for the David-Martel deployment path only.
+Goal: validate the Windows/server fork directly instead of carrying upstream surface area that is no longer relevant.
+Primary refs: `.github/workflows/*`, `build.ps1`.
 
 ## Suggested execution order
 
-1. Fix `xtask ci` platform behavior and remove stale coverage/docs drift.
-2. Fix FFI panic/TLS/package warning issues while the Windows/.NET surface is still narrow.
-3. Fix the native-client `softbuffer` lifetime issue and finish the bootstrap/input gaps.
-4. Make server/display limitations explicit and document the server connection model.
-5. Unify FFI packaging and simplify the FFI connector surface.
-6. Clean up `connector::Config` and reduce `ironrdp-session` coupling.
-7. Treat `ironrdp-pdu` and `ironrdp-graphics` as the next major refactor track, not as quick cleanup.
+1. Clean the generated .NET warnings and unify the FFI/package build path.
+2. Finish Windows-native client bootstrap polish.
+3. Add focused runtime tests for server input, display update, and server-event routing.
+4. Make display/bitmap limits and server connection behavior explicit.
+5. Simplify the FFI connector and managed framing path.
+6. Narrow `connector`/`session` responsibilities.
+7. Treat `ironrdp-pdu` and `ironrdp-graphics` as the next major refactor track after the Windows deployment path is stable.
