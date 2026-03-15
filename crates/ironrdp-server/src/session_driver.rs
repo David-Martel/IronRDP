@@ -811,8 +811,12 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
 #[cfg(test)]
 mod tests {
     use core::future::{Ready, ready};
+    use core::num::{NonZeroU16, NonZeroUsize};
+
+    use bytes::Bytes;
 
     use super::*;
+    use crate::{BitmapUpdate, PixelFormat};
 
     #[derive(Default)]
     struct VecWriter {
@@ -828,6 +832,19 @@ mod tests {
         fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
             self.writes.push(buf.to_vec());
             ready(Ok(()))
+        }
+    }
+
+    struct ErrorWriter;
+
+    impl FramedWrite for ErrorWriter {
+        type WriteAllFut<'write>
+            = Ready<std::io::Result<()>>
+        where
+            Self: 'write;
+
+        fn write_all<'a>(&'a mut self, _buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+            ready(Err(std::io::Error::other("synthetic write failure")))
         }
     }
 
@@ -877,5 +894,41 @@ mod tests {
             header.share_control_pdu,
             ShareControlPdu::ServerDeactivateAll(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn bitmap_display_update_write_failure_is_reported() {
+        let desktop_size = DesktopSize { width: 64, height: 64 };
+        let mut writer = ErrorWriter;
+        let mut scratch = Vec::new();
+        let encoder = UpdateEncoder::new(
+            desktop_size,
+            CmdFlags::empty(),
+            UpdateEncoderCodecs::new(),
+            crate::server::RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
+        )
+        .expect("encoder");
+        let bitmap = BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(1).expect("width"),
+            height: NonZeroU16::new(1).expect("height"),
+            format: PixelFormat::ARgb32,
+            data: Bytes::from_static(&[0, 0, 0, 255]),
+            stride: NonZeroUsize::new(4).expect("stride"),
+        };
+
+        let error = RdpServer::dispatch_display_update(
+            DisplayUpdate::Bitmap(bitmap),
+            &mut writer,
+            1001,
+            1003,
+            &mut scratch,
+            encoder,
+        )
+        .await
+        .expect_err("display update write should fail");
+
+        assert!(error.to_string().contains("failed to write display update"));
     }
 }

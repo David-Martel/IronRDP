@@ -129,6 +129,10 @@ Status: done.
 Refs: `rust-toolchain.toml`, `clippy.toml`, `Cargo.lock`, `build.ps1`, `rustfmt.toml`, crate manifests, targeted protocol/runtime fixes.
 Status: done.
 
+18. A no-repo Windows deployment path now exists as a portable bundle with install and smoke-test helpers.
+Refs: `build.ps1`, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `docs/windows-native-install.md`, `README.md`, `xtask/README.md`.
+Status: done for local package/install/smoke validation; remote `dtm-p1gen7` copy/install remains.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -137,16 +141,18 @@ This is the next concrete implementation queue, not a wish list.
 Refs: `crates/ironrdp-testsuite-extra`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Why now:
 - recent reliability changes need narrow tests, not just broad smoke coverage
-- the frame-buffer reuse and IME work now have unit coverage, but the server seam still needs integration coverage
+- the frame-buffer reuse and IME work now have unit coverage
+- server seam tests now cover resize reactivation and write-failure handling, but integration coverage is still thin
 Done when:
 - backlog disconnect, display failure, and single-session behavior are pinned down
 
 2. Add a repeatable deploy-and-smoke-test path for `dtm-p1gen7`.
-Refs: `build.ps1`, emitted artifact manifests, remote deploy scripts to be added.
+Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`.
 Why now:
 - this turns the branch into a real product path instead of a local-only build
 Done when:
 - package output can be copied, launched, and verified remotely with one documented flow
+- the current local portable-bundle install/smoke flow is mirrored on `dtm-p1gen7`
 
 3. Add lightweight client frame-path diagnostics before deeper render changes.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/session_driver.rs`.
@@ -317,12 +323,12 @@ Effort: large.
 Refs: SSH deploy path, `build.ps1`, emitted manifests.
 Effort: medium.
 
-2. Finish the .NET package and demo-distribution story.
-Refs: `ffi/dotnet/Devolutions.IronRdp/*.csproj`, `ffi/README.md`.
+2. Add a real installer layer after the portable bundle stays stable.
+Refs: `build.ps1`, `docs/windows-native-install.md`, future MSIX/MSI packaging project.
 Effort: medium.
 
-3. Add installer-oriented packaging only after the artifact graph stabilizes.
-Refs: `build.ps1`, future packaging scripts/project.
+3. Finish the .NET package and demo-distribution story.
+Refs: `ffi/dotnet/Devolutions.IronRdp/*.csproj`, `ffi/README.md`.
 Effort: medium.
 
 ## Priority 5: Boundary cleanup with clear payoff

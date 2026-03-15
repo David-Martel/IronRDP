@@ -43,6 +43,13 @@ pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode package -Release
 pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode publish -Release -TargetMachine dtm-p1gen7
 ```
 
+For a machine that does not have the repo checked out, package mode now emits a
+portable artifact root plus a deployment zip. The operator-facing install and
+smoke-test flow is documented in [docs/windows-native-install.md](./docs/windows-native-install.md)
+and shipped inside the bundle under `docs/` and `tools/`.
+That bundle is the current shipping format; MSI/MSIX packaging remains a later
+layer once the artifact graph is stable.
+
 The script uses CargoTools machine settings for build job count, `sccache`,
 `CARGO_TARGET_DIR`, linker acceleration, and artifact publishing. Package and
 publish modes also emit a machine-scoped `build-manifest.json` alongside the
@@ -67,6 +74,14 @@ On the Windows-native branch, the current client path remains CPU/software-first
 desktop, IME commit events are translated into Unicode fast-path input, and the
 packed presentation buffer is now reused across frames to reduce render-path
 heap churn before deeper GPU work is considered.
+
+The current deployment/test loop for Windows operators is:
+
+```pwsh
+pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode package -Release -SkipDotNet
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Install-IronRdpPackage.ps1
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-IronRdpSmokeTest.ps1 -InstallRoot $env:LOCALAPPDATA\Programs\IronRDP
+```
 
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 

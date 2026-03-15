@@ -704,7 +704,17 @@ function Invoke-RepoCargo {
     if ($script:UseCargoWrapper) {
         $command = $ArgumentList[0]
         $additionalArgs = if ($ArgumentList.Length -gt 1) { $ArgumentList[1..($ArgumentList.Length - 1)] } else { @() }
-        $exitCode = Invoke-CargoWrapper -Command $command -AdditionalArgs $additionalArgs -WorkingDirectory $RepoRoot
+        $wrapperResult = Invoke-CargoWrapper -Command $command -AdditionalArgs $additionalArgs -WorkingDirectory $RepoRoot
+        $exitCode = 0
+
+        if ($wrapperResult -is [int]) {
+            $exitCode = $wrapperResult
+        } elseif ($wrapperResult -is [array] -and $wrapperResult.Length -eq 1 -and $wrapperResult[0] -is [int]) {
+            $exitCode = $wrapperResult[0]
+        } elseif ($LASTEXITCODE -is [int]) {
+            $exitCode = $LASTEXITCODE
+        }
+
         if ($exitCode -ne 0) {
             throw "cargo $($ArgumentList -join ' ') failed with exit code $exitCode"
         }
@@ -919,6 +929,69 @@ function Publish-BuildOutputs {
     return $publishedArtifacts
 }
 
+function Publish-DeploymentSupportFiles {
+    $publishedArtifacts = New-Object System.Collections.Generic.List[object]
+    $supportFiles = @(
+        @{
+            SourcePath = Join-Path $RepoRoot 'scripts\windows\Install-IronRdpPackage.ps1'
+            RelativeDirectory = 'tools'
+            ArtifactKind = 'deployment-tool'
+        },
+        @{
+            SourcePath = Join-Path $RepoRoot 'scripts\windows\Invoke-IronRdpSmokeTest.ps1'
+            RelativeDirectory = 'tools'
+            ArtifactKind = 'deployment-tool'
+        },
+        @{
+            SourcePath = Join-Path $RepoRoot 'docs\windows-native-install.md'
+            RelativeDirectory = 'docs'
+            ArtifactKind = 'deployment-doc'
+        }
+    )
+
+    foreach ($supportFile in $supportFiles) {
+        if (-not (Test-Path -LiteralPath $supportFile.SourcePath -PathType Leaf)) {
+            continue
+        }
+
+        $publishedArtifacts.Add((
+            Publish-RepoArtifact `
+                -SourcePath $supportFile.SourcePath `
+                -RelativeDirectory $supportFile.RelativeDirectory `
+                -ArtifactKind $supportFile.ArtifactKind
+        ))
+    }
+
+    return $publishedArtifacts
+}
+
+function New-DeploymentBundleArtifact {
+    $bundleDirectory = Join-Path (Split-Path -Parent $script:ArtifactRoot) 'bundles'
+    New-Item -ItemType Directory -Force -Path $bundleDirectory | Out-Null
+
+    $buildClass = if ($NativeCpu) { 'host-optimized' } else { 'portable' }
+    $version = (Get-NestedValue $script:VersionInfo @('SemVer'))
+    $bundleName = "IronRDP-$($script:MachineIdentity)-$version-$buildClass.zip"
+
+    [pscustomobject]@{
+        kind = 'deployment-bundle'
+        source = $script:ArtifactRoot
+        destination = Join-Path $bundleDirectory $bundleName
+    }
+}
+
+function Publish-DeploymentBundle {
+    param(
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    if (Test-Path -LiteralPath $DestinationPath -PathType Leaf) {
+        Remove-Item -LiteralPath $DestinationPath -Force
+    }
+
+    Compress-Archive -Path (Join-Path $script:ArtifactRoot '*') -DestinationPath $DestinationPath -Force
+}
+
 function Write-BuildManifest {
     param([object[]]$Artifacts = @())
 
@@ -1128,8 +1201,13 @@ try {
             Ensure-DiplomatTool
             Invoke-RepoCargo -ArgumentList @('xtask', 'ffi', 'bindings', '-v', '--skip-dotnet-build')
             Invoke-DotNetBuild
-            $artifacts = Publish-BuildOutputs
+            $artifacts = New-Object System.Collections.Generic.List[object]
+            foreach ($artifact in (Publish-BuildOutputs)) { $artifacts.Add($artifact) }
+            foreach ($artifact in (Publish-DeploymentSupportFiles)) { $artifacts.Add($artifact) }
+            $bundleArtifact = New-DeploymentBundleArtifact
+            $artifacts.Add($bundleArtifact)
             Write-BuildManifest -Artifacts $artifacts
+            Publish-DeploymentBundle -DestinationPath $bundleArtifact.destination
         }
         'publish' {
             $Release = $true
@@ -1144,8 +1222,13 @@ try {
             Ensure-DiplomatTool
             Invoke-RepoCargo -ArgumentList @('xtask', 'ffi', 'bindings', '-v', '--skip-dotnet-build')
             Invoke-DotNetBuild
-            $artifacts = Publish-BuildOutputs
+            $artifacts = New-Object System.Collections.Generic.List[object]
+            foreach ($artifact in (Publish-BuildOutputs)) { $artifacts.Add($artifact) }
+            foreach ($artifact in (Publish-DeploymentSupportFiles)) { $artifacts.Add($artifact) }
+            $bundleArtifact = New-DeploymentBundleArtifact
+            $artifacts.Add($bundleArtifact)
             Write-BuildManifest -Artifacts $artifacts
+            Publish-DeploymentBundle -DestinationPath $bundleArtifact.destination
         }
     }
 } finally {
