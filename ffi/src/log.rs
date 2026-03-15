@@ -56,7 +56,10 @@ fn setup_logging(log_file_path: Option<&str>) -> anyhow::Result<()> {
             .with_ansi(false)
             .with_writer(file)
             .compact();
-        tracing_subscriber::registry().with(env_filter).with(fmt_layer).try_init()?;
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .try_init()?;
     } else {
         let fmt_layer = tracing_subscriber::fmt::layer()
             .compact()
@@ -64,7 +67,10 @@ fn setup_logging(log_file_path: Option<&str>) -> anyhow::Result<()> {
             .with_line_number(true)
             .with_thread_ids(true)
             .with_target(false);
-        tracing_subscriber::registry().with(env_filter).with(fmt_layer).try_init()?;
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .try_init()?;
     };
 
     Ok(())

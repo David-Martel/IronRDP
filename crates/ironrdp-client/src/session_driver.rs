@@ -15,7 +15,7 @@ use ironrdp::connector::connection_activation::{ConnectionActivationSequence, Co
 use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path, self};
+use ironrdp::session::{self, ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
 use ironrdp_core::WriteBuf;
 use ironrdp_tokio::{FramedWrite, TokioFramed, single_sequence_step_read, split_tokio_framed};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -92,8 +92,7 @@ impl SessionDriver {
             RdpInputEvent::FastPath(events) => {
                 trace!(?events);
                 Ok(SessionDriverFlow::Outputs(
-                    self.active_stage
-                        .process_fastpath_input(&mut self.image, &events)?,
+                    self.active_stage.process_fastpath_input(&mut self.image, &events)?,
                 ))
             }
             RdpInputEvent::Close => Ok(SessionDriverFlow::Outputs(self.active_stage.graceful_shutdown()?)),
@@ -174,10 +173,7 @@ impl SessionDriver {
         W: AsyncWrite + Unpin + Send + Sync,
     {
         for out in outputs {
-            if let Some(reason) = self
-                .handle_stage_output(reader, writer, event_loop_proxy, out)
-                .await?
-            {
+            if let Some(reason) = self.handle_stage_output(reader, writer, event_loop_proxy, out).await? {
                 return Ok(Some(reason));
             }
         }
@@ -265,10 +261,8 @@ impl SessionDriver {
         event_loop_proxy
             .send_event(RdpOutputEvent::Image {
                 buffer,
-                width: NonZeroU16::new(self.image.width())
-                    .ok_or_else(|| session::general_err!("width is zero"))?,
-                height: NonZeroU16::new(self.image.height())
-                    .ok_or_else(|| session::general_err!("height is zero"))?,
+                width: NonZeroU16::new(self.image.width()).ok_or_else(|| session::general_err!("width is zero"))?,
+                height: NonZeroU16::new(self.image.height()).ok_or_else(|| session::general_err!("height is zero"))?,
             })
             .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
 
