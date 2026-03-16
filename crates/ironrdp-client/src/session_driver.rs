@@ -39,6 +39,7 @@ pub(crate) enum RdpControlFlow {
 
 enum SessionDriverFlow {
     Outputs(Vec<ActiveStageOutput>),
+    EmitLatestImage,
     ReconnectWithNewSize { width: u16, height: u16 },
 }
 
@@ -46,6 +47,8 @@ struct SessionDriver {
     image: DecodedImage,
     active_stage: ActiveStage,
     reusable_frame_buffer: Vec<u8>,
+    frame_in_flight: bool,
+    latest_frame_dirty: bool,
     emitted_frame_count: u64,
     reconnect_resize_count: u64,
 }
@@ -64,6 +67,8 @@ impl SessionDriver {
             image,
             active_stage,
             reusable_frame_buffer: Vec::new(),
+            frame_in_flight: false,
+            latest_frame_dirty: false,
             emitted_frame_count: 0,
             reconnect_resize_count: 0,
         }
@@ -116,8 +121,19 @@ impl SessionDriver {
                     self.active_stage.process_fastpath_input(&mut self.image, &events)?,
                 ))
             }
+            RdpInputEvent::FramePresented => {
+                if finish_frame_present(&mut self.frame_in_flight, &mut self.latest_frame_dirty) {
+                    Ok(SessionDriverFlow::EmitLatestImage)
+                } else {
+                    Ok(SessionDriverFlow::Outputs(Vec::new()))
+                }
+            }
             RdpInputEvent::Close => Ok(SessionDriverFlow::Outputs(self.active_stage.graceful_shutdown()?)),
             RdpInputEvent::Clipboard(event) => {
+                trace!(
+                    message_kind = clipboard_message_kind(&event),
+                    "Handling clipboard event"
+                );
                 if let Some(cliprdr) = self.active_stage.get_svc_processor::<cliprdr::CliprdrClient>() {
                     if let Some(svc_messages) = match event {
                         ClipboardMessage::SendInitiateCopy(formats) => Some(
@@ -201,10 +217,26 @@ impl SessionDriver {
         R: AsyncRead + Unpin + Send + Sync,
         W: AsyncWrite + Unpin + Send + Sync,
     {
+        let mut graphics_update_pending = false;
+
         for out in outputs {
+            if matches!(out, ActiveStageOutput::GraphicsUpdate(_)) {
+                graphics_update_pending = true;
+                continue;
+            }
+
+            if graphics_update_pending {
+                self.queue_latest_image_update(event_loop_proxy)?;
+                graphics_update_pending = false;
+            }
+
             if let Some(reason) = self.handle_stage_output(reader, writer, event_loop_proxy, out).await? {
                 return Ok(Some(reason));
             }
+        }
+
+        if graphics_update_pending {
+            self.queue_latest_image_update(event_loop_proxy)?;
         }
 
         Ok(None)
@@ -230,7 +262,7 @@ impl SessionDriver {
                 Ok(None)
             }
             ActiveStageOutput::GraphicsUpdate(_region) => {
-                self.emit_image_update(event_loop_proxy)?;
+                self.queue_latest_image_update(event_loop_proxy)?;
                 Ok(None)
             }
             ActiveStageOutput::PointerDefault => {
@@ -312,6 +344,23 @@ impl SessionDriver {
         Ok(())
     }
 
+    fn queue_latest_image_update(&mut self, event_loop_proxy: &EventLoopProxy<RdpOutputEvent>) -> SessionResult<()> {
+        if !should_emit_latest_image(self.frame_in_flight, &mut self.latest_frame_dirty) {
+            trace!(
+                pending_frame = self.frame_in_flight,
+                emitted_frame_count = self.emitted_frame_count,
+                "Deferring image emit while the previous frame is still pending"
+            );
+            return Ok(());
+        }
+
+        self.emit_image_update(event_loop_proxy)?;
+        self.frame_in_flight = true;
+        self.latest_frame_dirty = false;
+
+        Ok(())
+    }
+
     async fn handle_deactivation_reactivation<R, W>(
         &mut self,
         reader: &mut TokioFramed<R>,
@@ -367,6 +416,37 @@ impl SessionDriver {
     }
 }
 
+fn should_emit_latest_image(frame_in_flight: bool, latest_frame_dirty: &mut bool) -> bool {
+    if frame_in_flight {
+        *latest_frame_dirty = true;
+        return false;
+    }
+
+    true
+}
+
+fn finish_frame_present(frame_in_flight: &mut bool, latest_frame_dirty: &mut bool) -> bool {
+    let should_emit_latest_image = *frame_in_flight && *latest_frame_dirty;
+
+    *frame_in_flight = false;
+    *latest_frame_dirty = false;
+
+    should_emit_latest_image
+}
+
+fn clipboard_message_kind(message: &ClipboardMessage) -> &'static str {
+    match message {
+        ClipboardMessage::SendInitiateCopy(_) => "SendInitiateCopy",
+        ClipboardMessage::SendFormatData(_) => "SendFormatData",
+        ClipboardMessage::SendInitiatePaste(_) => "SendInitiatePaste",
+        ClipboardMessage::SendLockClipboard { .. } => "SendLockClipboard",
+        ClipboardMessage::SendUnlockClipboard { .. } => "SendUnlockClipboard",
+        ClipboardMessage::SendFileContentsRequest(_) => "SendFileContentsRequest",
+        ClipboardMessage::SendFileContentsResponse(_) => "SendFileContentsResponse",
+        ClipboardMessage::Error(_) => "Error",
+    }
+}
+
 pub(crate) async fn run_active_session<S>(
     framed: TokioFramed<S>,
     connection_result: ConnectionResult,
@@ -401,6 +481,9 @@ where
                     break 'outer reason;
                 }
             }
+            SessionDriverFlow::EmitLatestImage => {
+                driver.queue_latest_image_update(event_loop_proxy)?;
+            }
             SessionDriverFlow::ReconnectWithNewSize { width, height } => {
                 return Ok(RdpControlFlow::ReconnectWithNewSize { width, height });
             }
@@ -424,7 +507,7 @@ fn copy_rgba_frame(image_data: &[u8], buffer: &mut Vec<u8>) -> SessionResult<()>
 
 #[cfg(test)]
 mod tests {
-    use super::copy_rgba_frame;
+    use super::{copy_rgba_frame, finish_frame_present, should_emit_latest_image};
 
     #[test]
     fn copy_rgba_frame_preserves_rgba_bytes() {
@@ -452,5 +535,23 @@ mod tests {
 
         assert_eq!(buffer.len(), image.len());
         assert_eq!(buffer.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn dirty_frame_is_re_emitted_only_after_present_ack() {
+        let mut frame_in_flight = false;
+        let mut latest_frame_dirty = false;
+
+        assert!(should_emit_latest_image(frame_in_flight, &mut latest_frame_dirty));
+        frame_in_flight = true;
+        latest_frame_dirty = false;
+
+        assert!(!should_emit_latest_image(frame_in_flight, &mut latest_frame_dirty));
+        assert!(latest_frame_dirty);
+        assert!(frame_in_flight);
+
+        assert!(finish_frame_present(&mut frame_in_flight, &mut latest_frame_dirty));
+        assert!(!frame_in_flight);
+        assert!(!latest_frame_dirty);
     }
 }

@@ -67,6 +67,7 @@ pub enum RdpInputEvent {
         physical_size: Option<(u32, u32)>,
     },
     FastPath(SmallVec<[FastPathInputEvent; 2]>),
+    FramePresented,
     Close,
     Clipboard(ClipboardMessage),
     RecycleFrameBuffer(Vec<u8>),
@@ -333,12 +334,15 @@ async fn connect(
         }
     }
 
+    info!("Enable RDPSND playback channel");
+    info!("Configured RDPDR backend backend=NoopRdpdrBackend");
     let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
         .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(0));
 
     if let Some(builder) = cliprdr_factory {
+        info!("Attach CLIPRDR channel");
         let backend = builder.build_cliprdr_backend();
 
         let cliprdr = cliprdr::Cliprdr::new(backend);
@@ -462,12 +466,15 @@ async fn connect_ws(
         }
     }
 
+    info!("Enable RDPSND playback channel");
+    info!("Configured RDPDR backend backend=NoopRdpdrBackend");
     let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
         .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(0));
 
     if let Some(builder) = cliprdr_factory {
+        info!("Attach CLIPRDR channel");
         let backend = builder.build_cliprdr_backend();
 
         let cliprdr = cliprdr::Cliprdr::new(backend);

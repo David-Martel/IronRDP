@@ -6,7 +6,7 @@ use ironrdp_client::config::{ClipboardType, Config};
 use ironrdp_client::rdp::{DvcPipeProxyFactory, RdpClient, RdpInputEvent, RdpOutputEvent};
 use mimalloc::MiMalloc;
 use tokio::runtime;
-use tracing::debug;
+use tracing::{debug, info};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoop;
 
@@ -44,6 +44,7 @@ fn main() -> anyhow::Result<()> {
         ClipboardType::Stub => {
             use ironrdp_cliprdr_native::StubClipboard;
 
+            info!("Configured stub clipboard backend");
             let cliprdr = StubClipboard::new();
             let factory = cliprdr.backend_factory();
             Some(factory)
@@ -53,13 +54,17 @@ fn main() -> anyhow::Result<()> {
             use ironrdp_client::clipboard::ClientClipboardMessageProxy;
             use ironrdp_cliprdr_native::WinClipboard;
 
+            info!("Configured Windows clipboard backend");
             let cliprdr = WinClipboard::new(ClientClipboardMessageProxy::new(input_event_sender.clone()))?;
 
             let factory = cliprdr.backend_factory();
             _win_clipboard = cliprdr;
             Some(factory)
         }
-        _ => None,
+        _ => {
+            info!("Clipboard integration disabled");
+            None
+        }
     };
 
     let dvc_pipe_proxy_factory = DvcPipeProxyFactory::new(input_event_sender);

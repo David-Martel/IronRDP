@@ -11,7 +11,7 @@
 
 #![allow(clippy::print_stderr, clippy::print_stdout)] // allowed in this module only
 
-use core::num::NonZeroU32;
+use core::num::{NonZeroU16, NonZeroU32};
 use core::time::Duration;
 use std::sync::Arc;
 use std::time::Instant;
@@ -52,6 +52,8 @@ pub struct App {
     initial_size: PhysicalSize<u32>,
     window_state: Option<WindowState>,
     buffer: Vec<u8>,
+    frame_pending_present: bool,
+    redraw_requested: bool,
     buffer_size: (u16, u16),
     surface_size: (u16, u16),
     input_database: ironrdp::input::Database,
@@ -75,6 +77,8 @@ impl App {
             initial_size,
             window_state: None,
             buffer: Vec::new(),
+            frame_pending_present: false,
+            redraw_requested: false,
             buffer_size: (0, 0),
             surface_size: (0, 0),
             input_database,
@@ -124,6 +128,8 @@ impl App {
     }
 
     fn draw(&mut self) {
+        self.redraw_requested = false;
+
         if self.buffer.is_empty() {
             return;
         }
@@ -142,7 +148,12 @@ impl App {
             }
         };
 
+        let frame_was_pending = self.frame_pending_present;
         self.presented_frame_count = self.presented_frame_count.saturating_add(1);
+        self.frame_pending_present = false;
+        if frame_was_pending {
+            let _ = self.input_event_sender.send(RdpInputEvent::FramePresented);
+        }
         if self.presented_frame_count == 1 {
             info!(
                 width = self.buffer_size.0,
@@ -160,6 +171,25 @@ impl App {
             total_micros = draw_started_at.elapsed().as_micros(),
             "Presented frame"
         );
+    }
+
+    fn queue_image_buffer(
+        &mut self,
+        buffer: Vec<u8>,
+        width: NonZeroU16,
+        height: NonZeroU16,
+    ) -> Option<(Vec<u8>, bool)> {
+        let recycled = if self.buffer.is_empty() {
+            self.buffer = buffer;
+            None
+        } else {
+            Some((core::mem::replace(&mut self.buffer, buffer), self.frame_pending_present))
+        };
+
+        self.buffer_size = (width.get(), height.get());
+        self.frame_pending_present = true;
+
+        recycled
     }
 }
 
@@ -424,30 +454,44 @@ impl ApplicationHandler<RdpOutputEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: RdpOutputEvent) {
-        let Some(window_state) = self.window_state.as_mut() else {
+        let Some(window) = self
+            .window_state
+            .as_ref()
+            .map(|window_state| Arc::clone(&window_state.window))
+        else {
             return;
         };
-        let window = Arc::clone(&window_state.window);
         match event {
             RdpOutputEvent::Image { buffer, width, height } => {
                 trace!(width = ?width, height = ?height, "Received image with size");
                 trace!(window_physical_size = ?window.inner_size(), "Drawing image to the window with size");
-                if !self.buffer.is_empty() {
-                    self.overwritten_frame_count = self.overwritten_frame_count.saturating_add(1);
-                    trace!(
-                        overwritten_frame_count = self.overwritten_frame_count,
-                        buffered_width = self.buffer_size.0,
-                        buffered_height = self.buffer_size.1,
-                        "Overwriting unpresented frame buffer"
-                    );
-                    let recycled_buffer = core::mem::take(&mut self.buffer);
+                let previous_buffer_size = self.buffer_size;
+                let frame_was_pending = self.frame_pending_present;
+                if let Some((recycled_buffer, overwritten_unpresented)) = self.queue_image_buffer(buffer, width, height)
+                {
+                    if overwritten_unpresented {
+                        self.overwritten_frame_count = self.overwritten_frame_count.saturating_add(1);
+                        trace!(
+                            overwritten_frame_count = self.overwritten_frame_count,
+                            buffered_width = previous_buffer_size.0,
+                            buffered_height = previous_buffer_size.1,
+                            "Overwriting unpresented frame buffer"
+                        );
+                    } else {
+                        trace!(
+                            buffered_width = previous_buffer_size.0,
+                            buffered_height = previous_buffer_size.1,
+                            "Replacing already presented frame buffer"
+                        );
+                    }
                     let _ = self
                         .input_event_sender
                         .send(RdpInputEvent::RecycleFrameBuffer(recycled_buffer));
                 }
-                self.buffer_size = (width.get(), height.get());
-                self.buffer = buffer;
                 if self.surface_size != self.buffer_size {
+                    let Some(window_state) = self.window_state.as_mut() else {
+                        return;
+                    };
                     if let Err(error) = window_state
                         .presenter
                         .resize(NonZeroU32::from(width), NonZeroU32::from(height))
@@ -466,7 +510,14 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                     );
                 }
 
-                window.request_redraw();
+                self.draw();
+                if self.frame_pending_present && !self.redraw_requested {
+                    if frame_was_pending {
+                        trace!("Image remained pending after an immediate draw attempt");
+                    }
+                    window.request_redraw();
+                    self.redraw_requested = true;
+                }
             }
             RdpOutputEvent::ConnectionFailure(error) => {
                 error!(?error);
@@ -549,9 +600,13 @@ fn unicode_text_operations(text: &str) -> smallvec::SmallVec<[ironrdp::input::Op
 
 #[cfg(test)]
 mod tests {
-    use ironrdp::input::Operation;
+    use core::num::NonZeroU16;
 
-    use super::unicode_text_operations;
+    use ironrdp::input::Operation;
+    use tokio::sync::mpsc;
+    use winit::dpi::PhysicalSize;
+
+    use super::{App, unicode_text_operations};
 
     #[test]
     fn unicode_text_operations_emit_press_and_release_pairs() {
@@ -569,5 +624,34 @@ mod tests {
         let operations = unicode_text_operations("\r\n\t");
 
         assert!(operations.is_empty());
+    }
+
+    #[test]
+    fn queue_image_buffer_only_counts_pending_frames_as_overwritten() {
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480)).expect("app");
+        let width = NonZeroU16::new(640).expect("non-zero width");
+        let height = NonZeroU16::new(480).expect("non-zero height");
+
+        let recycled = app.queue_image_buffer(vec![0; 16], width, height);
+        assert!(recycled.is_none());
+        assert!(app.frame_pending_present);
+
+        let recycled = app
+            .queue_image_buffer(vec![1; 16], width, height)
+            .expect("existing frame should be recycled");
+        assert!(recycled.1, "replacing a pending frame should be marked as overwritten");
+        assert!(app.frame_pending_present);
+
+        app.frame_pending_present = false;
+
+        let recycled = app
+            .queue_image_buffer(vec![2; 16], width, height)
+            .expect("existing frame should be recycled");
+        assert!(
+            !recycled.1,
+            "replacing an already presented frame should not be marked as overwritten"
+        );
+        assert!(app.frame_pending_present);
     }
 }

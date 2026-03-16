@@ -18,6 +18,8 @@ param(
     [int]$SampleIntervalMs = 500,
     [ValidateSet('off', 'prefer-reliable', 'reliable', 'prefer-lossy', 'lossy')]
     [string]$Multitransport = 'off',
+    [ValidateSet('default', 'windows', 'stub', 'none')]
+    [string]$ClipboardType = 'default',
     [string]$GuestWorkload = 'notepad',
     [int]$Width = 1280,
     [int]$Height = 720,
@@ -244,6 +246,41 @@ function Invoke-ClientMouseTrace {
     }
 }
 
+function Get-HostClipboardState {
+    try {
+        return [pscustomobject]@{
+            available = $true
+            text = (Get-Clipboard -Raw -ErrorAction Stop)
+        }
+    } catch {
+        return [pscustomobject]@{
+            available = $false
+            error = ($_ | Out-String).Trim()
+        }
+    }
+}
+
+function Set-HostClipboardText {
+    param([Parameter(Mandatory)][string]$Text)
+
+    Set-Clipboard -Value $Text -ErrorAction Stop
+
+    [pscustomobject]@{
+        text = $Text
+        length = $Text.Length
+    }
+}
+
+function Restore-HostClipboardState {
+    param([object]$State)
+
+    if (-not $State -or -not $State.available) {
+        return
+    }
+
+    Set-Clipboard -Value $State.text -ErrorAction SilentlyContinue
+}
+
 function Capture-WindowScreenshot {
     param(
         [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
@@ -365,6 +402,64 @@ function Invoke-GuestWorkload {
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
         }
     } -ArgumentList $Workload, $Credential.UserName, $plainPassword -ErrorAction Stop
+}
+
+function Get-GuestFeatureSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$VmName,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential
+    )
+
+    Invoke-Command -VMName $VmName -Credential $Credential -ScriptBlock {
+        $audioServices = @(
+            Get-Service -Name Audiosrv, AudioEndpointBuilder -ErrorAction SilentlyContinue |
+                Select-Object Name, Status, StartType
+        )
+
+        [pscustomobject]@{
+            clipboardCmdletsAvailable = [bool](Get-Command Set-Clipboard -ErrorAction SilentlyContinue) -and
+                [bool](Get-Command Get-Clipboard -ErrorAction SilentlyContinue)
+            audioServices = $audioServices
+            termService = Get-Service -Name TermService -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType
+        }
+    }
+}
+
+function Get-ClientCapabilityProfile {
+    param(
+        [Parameter(Mandatory)][string]$ClipboardType,
+        [Parameter(Mandatory)][object]$GuestFeatureSnapshot
+    )
+
+    [pscustomobject]@{
+        rendering = [pscustomobject]@{
+            status = 'supported'
+            mode = 'software-present'
+            backend = 'softbuffer'
+            validation = 'frame cadence, timing, and screenshot capture'
+        }
+        dynamicResize = [pscustomobject]@{
+            status = 'supported'
+            validation = 'resize scenario plus reconnect/deactivation tracing'
+        }
+        clipboard = [pscustomobject]@{
+            status = if ($ClipboardType -eq 'none') { 'disabled-by-harness' } else { 'enabled-assertable' }
+            mode = $ClipboardType
+            guestClipboardAvailable = [bool]$GuestFeatureSnapshot.clipboardCmdletsAvailable
+            validation = 'host clipboard mutation plus client CLIPRDR log activity'
+        }
+        audio = [pscustomobject]@{
+            status = 'enabled-assertable'
+            backend = 'rdpsnd-native/cpal'
+            guestAudioServices = $GuestFeatureSnapshot.audioServices
+            validation = 'channel wiring plus rdpsnd log activity'
+        }
+        deviceRedirection = [pscustomobject]@{
+            status = 'unsupported'
+            backend = 'NoopRdpdrBackend'
+            note = 'drive, printer, usb, and generic RDPDR coverage are not implemented in this fork yet'
+        }
+    }
 }
 
 function New-RdpBlockRule {
@@ -507,6 +602,18 @@ function Parse-IronRdpLog {
         shutdownDenied = @($entries | Where-Object { $_.message -eq 'ShutdownDenied received, session will be closed' }).Count
         surfaceFailures = @($entries | Where-Object { $_.message -eq 'Failed to present surface buffer' }).Count
         overwrittenFrames = @($entries | Where-Object { $_.message -like 'Overwriting unpresented frame buffer*' }).Count
+        clipboardForwarded = @($entries | Where-Object { $_.message -like 'Forwarding local clipboard event*' }).Count
+        clipboardHandled = @($entries | Where-Object { $_.message -like 'Handling clipboard event*' }).Count
+        cliprdrAttached = @($entries | Where-Object { $_.message -eq 'Attach CLIPRDR channel' }).Count
+        cliprdrInitialized = @($entries | Where-Object { $_.message -like 'CLIPRDR(clipboard) virtual channel has been initialized*' }).Count
+        cliprdrFormatListAck = @($entries | Where-Object { $_.message -like 'CLIPRDR(clipboard) Remote has received format list successfully*' }).Count
+        cliprdrFailures = @($entries | Where-Object { $_.message -like 'CLIPRDR(clipboard) failed:*' }).Count
+        clipboardBackendErrors = @($entries | Where-Object { $_.message -like 'Clipboard backend error:*' }).Count
+        clipboardUnavailable = @($entries | Where-Object { $_.message -eq 'Clipboard event received, but Cliprdr is not available' }).Count
+        audioChannelEnabled = @($entries | Where-Object { $_.message -eq 'Enable RDPSND playback channel' }).Count
+        audioFormatChanges = @($entries | Where-Object { $_.message -eq 'New audio format' }).Count
+        audioUnderruns = @($entries | Where-Object { $_.message -eq 'Playback rx underrun' }).Count
+        deviceRedirectionUnsupported = @($entries | Where-Object { $_.message -eq 'Configured RDPDR backend backend=NoopRdpdrBackend' }).Count
     }
 
     $status = if ($counts.presentedFrames -gt 0 -or $counts.firstPresentedFrame -gt 0) {
@@ -564,7 +671,10 @@ function Summarize-ProcessSamples {
 }
 
 function Get-ScenarioDefinitions {
-    param([string]$ScenarioSet)
+    param(
+        [string]$ScenarioSet,
+        [string]$ClipboardType
+    )
 
     $baseline = [pscustomobject]@{
         name = 'baseline'
@@ -573,6 +683,7 @@ function Get-ScenarioDefinitions {
         outageDurationSeconds = $null
         mouseMoveAtSeconds = 8
         guestWorkloadAtSeconds = 4
+        hostClipboardAtSeconds = if ($ClipboardType -eq 'none') { $null } else { 6 }
     }
 
     $resize = [pscustomobject]@{
@@ -585,6 +696,7 @@ function Get-ScenarioDefinitions {
         outageDurationSeconds = $null
         mouseMoveAtSeconds = 9
         guestWorkloadAtSeconds = 4
+        hostClipboardAtSeconds = if ($ClipboardType -eq 'none') { $null } else { 6 }
     }
 
     $outage = [pscustomobject]@{
@@ -594,6 +706,7 @@ function Get-ScenarioDefinitions {
         outageDurationSeconds = 4
         mouseMoveAtSeconds = 6
         guestWorkloadAtSeconds = 4
+        hostClipboardAtSeconds = if ($ClipboardType -eq 'none') { $null } else { 5 }
     }
 
     if ($ScenarioSet -eq 'quick') {
@@ -643,7 +756,7 @@ function Invoke-Scenario {
     $arguments.Add('--height')
     $arguments.Add($Height.ToString([System.Globalization.CultureInfo]::InvariantCulture))
     $arguments.Add('--clipboard-type')
-    $arguments.Add('none')
+    $arguments.Add($ClipboardType)
     $arguments.Add('--no-server-pointer')
     $arguments.Add('--log-file')
     $arguments.Add($logPath)
@@ -654,7 +767,7 @@ function Invoke-Scenario {
     }
 
     $process = Start-Process -FilePath $ClientExe -ArgumentList $arguments -WorkingDirectory (Split-Path -Parent $ClientExe) -PassThru -Environment @{
-        IRONRDP_LOG = 'info,ironrdp_client=trace,ironrdp_connector=debug,ironrdp_session=debug'
+        IRONRDP_LOG = 'info,ironrdp_client=trace,ironrdp_connector=debug,ironrdp_session=debug,ironrdp_cliprdr=trace,ironrdp_rdpsnd=debug,ironrdp_rdpsnd_native=debug'
     }
 
     $process = Wait-ForMainWindow -ProcessId $process.Id -TimeoutSeconds 15
@@ -666,6 +779,8 @@ function Invoke-Scenario {
     $samples = New-Object System.Collections.Generic.List[object]
     $events = New-Object System.Collections.Generic.List[object]
     $guestWorkloadResult = $null
+    $hostClipboardResult = $null
+    $hostClipboardOriginal = $null
     $mouseMoved = $false
     $outageRule = $null
     $outageStarted = $false
@@ -715,6 +830,23 @@ function Invoke-Scenario {
                 }
             }
 
+            if (-not $hostClipboardResult -and $Scenario.hostClipboardAtSeconds -ne $null -and $elapsed -ge $Scenario.hostClipboardAtSeconds) {
+                try {
+                    $hostClipboardOriginal = Get-HostClipboardState
+                    $marker = "IronRDP Hyper-V clipboard test {0:o}" -f (Get-Date)
+                    $hostClipboardResult = [pscustomobject]@{
+                        before = $hostClipboardOriginal
+                        after = Set-HostClipboardText -Text $marker
+                    }
+                    $events.Add([pscustomobject]@{ timestamp = $sampleAt.ToString('o'); kind = 'hostClipboardSet'; result = $hostClipboardResult.after })
+                } catch {
+                    $hostClipboardResult = [pscustomobject]@{
+                        error = ($_ | Out-String).Trim()
+                    }
+                    $events.Add([pscustomobject]@{ timestamp = $sampleAt.ToString('o'); kind = 'hostClipboardError'; result = $hostClipboardResult.error })
+                }
+            }
+
             if (-not $mouseMoved -and $Scenario.mouseMoveAtSeconds -ne $null -and $elapsed -ge $Scenario.mouseMoveAtSeconds) {
                 try {
                     $mouseTrace = Invoke-ClientMouseTrace -Process $current
@@ -758,6 +890,7 @@ function Invoke-Scenario {
         }
     } finally {
         Remove-RdpBlockRule -RuleName $outageRule
+        Restore-HostClipboardState -State $hostClipboardOriginal
 
         $current = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
         if ($current) {
@@ -789,6 +922,7 @@ function Invoke-Scenario {
         durationSeconds = $DurationSeconds
         sampleIntervalMs = $SampleIntervalMs
         guestWorkload = $guestWorkloadResult
+        hostClipboard = $hostClipboardResult
         screenshotPath = if (Test-Path -LiteralPath $screenshotPath -PathType Leaf) { $screenshotPath } else { $null }
         samplesPath = $samplePath
         logPath = $logPath
@@ -826,7 +960,9 @@ New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
 
 $guest = Resolve-ReachableGuestEndpoint -VmName $VmName
 $credential = New-GuestCredential -Username $Username -Password $Password
-$scenarios = Get-ScenarioDefinitions -ScenarioSet $ScenarioSet
+$guestFeatureSnapshot = Get-GuestFeatureSnapshot -VmName $VmName -Credential $credential
+$clientCapabilities = Get-ClientCapabilityProfile -ClipboardType $ClipboardType -GuestFeatureSnapshot $guestFeatureSnapshot
+$scenarios = Get-ScenarioDefinitions -ScenarioSet $ScenarioSet -ClipboardType $ClipboardType
 $results = New-Object System.Collections.Generic.List[object]
 
 foreach ($scenario in $scenarios) {
@@ -855,6 +991,8 @@ $summary = [pscustomobject]@{
     vmUptime = $guest.vm.Uptime
     selectedIpAddress = $guest.selected.ipAddress
     reachableAddresses = $guest.reachable
+    guestFeatures = $guestFeatureSnapshot
+    clientCapabilities = $clientCapabilities
     outputRoot = $outputPath
     scenarioSet = $ScenarioSet
     packageRoot = $root

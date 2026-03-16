@@ -242,6 +242,8 @@ The suite currently drives:
 
 - a bounded baseline session
 - resize and input automation against the live client window
+- host clipboard mutation and CLIPRDR log capture
+- explicit capability reporting for clipboard, audio wiring, and unsupported device redirection
 - optional temporary host-side outage simulation by blocking outbound `3389`
 - per-scenario screenshots, client logs, CPU samples, and JSON summaries
 
@@ -250,7 +252,11 @@ The current measured Hyper-V e2e baseline is:
 - connection establishment is about `~130 ms`
 - first image and first frame are about `~700 ms`
 - the active guest path is still dominated by `Rdp61` plus `16`-bpp RLE bitmap updates
-- the native client is overwriting queued unpresented frames under this workload, so render-path pacing is a known optimization target
+- the native client is still overwriting queued unpresented frames under this workload, so render-path pacing is a known optimization target
+- CLIPRDR initializes successfully on the Hyper-V path, but host clipboard mutation is not yet producing end-to-end forwarded clipboard events
+- guest audio services are running and the client RDPSND path is wired, but the suite still needs a guest-side sound workload before playback assertions are honest
+- device redirection remains explicitly unsupported on this branch because the client still uses `NoopRdpdrBackend`
+- the resize scenario now exposes a post-reactivation correctness fault, so resize/reactivation stability should be treated as the next reliability fix
 - guest workload launch currently falls back to a non-interactive process in session `0` because scheduled interactive task registration is rejected on this VM account model
 
 ## Uninstall
