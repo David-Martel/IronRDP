@@ -103,6 +103,84 @@ function New-GuestCredential {
     New-Object System.Management.Automation.PSCredential(".\$Username", (ConvertTo-SecureString $Password -AsPlainText -Force))
 }
 
+function New-WinRmGuestCredential {
+    param(
+        [Parameter(Mandatory)][string]$ComputerNameHint,
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$Password
+    )
+
+    New-Object System.Management.Automation.PSCredential("$ComputerNameHint\$Username", (ConvertTo-SecureString $Password -AsPlainText -Force))
+}
+
+function Ensure-TrustedHost {
+    param([Parameter(Mandatory)][string]$ComputerName)
+
+    $trustedHostsPath = 'WSMan:\localhost\Client\TrustedHosts'
+    $currentValue = (Get-Item -LiteralPath $trustedHostsPath -ErrorAction SilentlyContinue).Value
+    $entries = @()
+    if (-not [string]::IsNullOrWhiteSpace($currentValue)) {
+        $entries = $currentValue -split '\s*,\s*' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    }
+
+    if ($entries -contains $ComputerName -or $entries -contains '*') {
+        return
+    }
+
+    $updated = @($entries + $ComputerName) -join ','
+    Set-Item -LiteralPath $trustedHostsPath -Value $updated -Force
+}
+
+function Ensure-GuestWinRm {
+    param(
+        [Parameter(Mandatory)][string]$VmName,
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$PowerShellDirectCredential,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$WinRmCredential
+    )
+
+    Invoke-Command -VMName $VmName -Credential $PowerShellDirectCredential -ScriptBlock {
+        Enable-PSRemoting -Force
+        Set-Service -Name WinRM -StartupType Automatic
+        Start-Service -Name WinRM
+        Set-NetFirewallRule -DisplayGroup 'Windows Remote Management' -Enabled True | Out-Null
+    } -ErrorAction Stop
+
+    Ensure-TrustedHost -ComputerName $ComputerName
+    Test-WSMan -ComputerName $ComputerName -Authentication Negotiate -Credential $WinRmCredential -ErrorAction Stop | Out-Null
+}
+
+function Ensure-GuestCredentialStored {
+    param(
+        [Parameter(Mandatory)][string]$VmName,
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$Password
+    )
+
+    $userId = "$VmName\$Username"
+    $targets = @(
+        "IronRDP-HyperV-$VmName",
+        "WSMAN/$ComputerName",
+        "TERMSRV/$ComputerName"
+    ) | Select-Object -Unique
+
+    foreach ($target in $targets) {
+        & cmdkey.exe /generic:$target /user:$userId /pass:$Password | Out-Null
+    }
+}
+
+function Invoke-GuestCommand {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter()][object[]]$ArgumentList = @()
+    )
+
+    Invoke-Command -ComputerName $ComputerName -Credential $Credential -Authentication Negotiate -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -ErrorAction Stop
+}
+
 function Ensure-WindowInterop {
     if ('IronRdpWindowInterop' -as [type]) {
         return
@@ -246,6 +324,122 @@ function Invoke-ClientMouseTrace {
     }
 }
 
+function Ensure-SendKeysSupport {
+    Add-Type -AssemblyName System.Windows.Forms
+}
+
+function Focus-ClientWindow {
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Process
+    )
+
+    Ensure-WindowInterop
+    $process = Wait-ForMainWindow -ProcessId $Process.Id -TimeoutSeconds 5
+    if (-not $process -or $process.MainWindowHandle -eq 0) {
+        throw "client window handle not available for focus"
+    }
+
+    $rect = Get-WindowRectObject -Handle $process.MainWindowHandle
+    $null = [IronRdpWindowInterop]::SetForegroundWindow($process.MainWindowHandle)
+    $centerX = $rect.Left + [math]::Max([int]($rect.Width * 0.50), 20)
+    $centerY = $rect.Top + [math]::Max([int]($rect.Height * 0.50), 20)
+    [IronRdpWindowInterop]::SetCursorPos($centerX, $centerY) | Out-Null
+    Start-Sleep -Milliseconds 80
+    [IronRdpWindowInterop]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 50
+    [IronRdpWindowInterop]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 120
+
+    [pscustomobject]@{
+        centerX = $centerX
+        centerY = $centerY
+        width = $rect.Width
+        height = $rect.Height
+    }
+}
+
+function Invoke-ClientGuestWorkload {
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory)][string]$Workload
+    )
+
+    Ensure-SendKeysSupport
+    $focus = Focus-ClientWindow -Process $Process
+
+    $searchText = switch ($Workload) {
+        'calc' { 'calculator' }
+        default { $Workload }
+    }
+
+    [System.Windows.Forms.SendKeys]::SendWait('^{ESC}')
+    Start-Sleep -Milliseconds 400
+    [System.Windows.Forms.SendKeys]::SendWait($searchText)
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    Start-Sleep -Milliseconds 800
+
+    [pscustomobject]@{
+        workload = $Workload
+        searchText = $searchText
+        focus = $focus
+    }
+}
+
+function Get-GuestProcessSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential,
+        [Parameter(Mandatory)][string]$ProcessName
+    )
+
+    Invoke-GuestCommand -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+        param($ProcessName)
+
+        $process = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+            Sort-Object StartTime -Descending |
+            Select-Object -First 1
+
+        if (-not $process) {
+            return $null
+        }
+
+        [pscustomobject]@{
+            pid = $process.Id
+            processName = $process.ProcessName
+            sessionId = $process.SessionId
+            mainWindowHandle = $process.MainWindowHandle
+        }
+    } -ArgumentList $ProcessName
+}
+
+function Invoke-GuestAudioPulse {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential
+    )
+
+    Invoke-GuestCommand -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+        $audioCommand = @'
+Add-Type -AssemblyName System
+[System.Media.SystemSounds]::Asterisk.Play()
+Start-Sleep -Milliseconds 350
+[System.Media.SystemSounds]::Exclamation.Play()
+Start-Sleep -Milliseconds 350
+[System.Media.SystemSounds]::Hand.Play()
+'@
+
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($audioCommand))
+        $process = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoLogo', '-NoProfile', '-WindowStyle', 'Hidden', '-EncodedCommand', $encodedCommand) -PassThru
+        [pscustomobject]@{
+            attempted = $true
+            method = 'SystemSoundsAsync'
+            pid = $process.Id
+            timestamp = (Get-Date).ToString('o')
+        }
+    }
+}
+
 function Get-HostClipboardState {
     try {
         return [pscustomobject]@{
@@ -318,8 +512,10 @@ function Capture-WindowScreenshot {
 function Invoke-GuestWorkload {
     param(
         [Parameter(Mandatory)][string]$VmName,
+        [Parameter(Mandatory)][string]$ComputerName,
         [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential,
-        [Parameter(Mandatory)][string]$Workload
+        [Parameter(Mandatory)][string]$Workload,
+        [Parameter()][System.Diagnostics.Process]$ClientProcess
     )
 
     if ([string]::IsNullOrWhiteSpace($Workload) -or $Workload -eq 'none') {
@@ -327,9 +523,49 @@ function Invoke-GuestWorkload {
     }
 
     $plainPassword = $Credential.GetNetworkCredential().Password
+    $interactiveLaunchError = $null
 
-    Invoke-Command -VMName $VmName -Credential $Credential -ScriptBlock {
-        param($Workload, $UserName, $Password)
+    if ($ClientProcess) {
+        try {
+            $interactiveLaunch = Invoke-ClientGuestWorkload -Process $ClientProcess -Workload $Workload
+            $probeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $interactiveProcess = $null
+            $interactiveProcessName = switch ($Workload) {
+                'calc' { 'CalculatorApp' }
+                default { $Workload }
+            }
+
+            do {
+                Start-Sleep -Milliseconds 300
+                $interactiveProcess = Get-GuestProcessSnapshot -ComputerName $ComputerName -Credential $Credential -ProcessName $interactiveProcessName
+            } while ($probeStopwatch.Elapsed.TotalSeconds -lt 2.5 -and (-not $interactiveProcess -or $interactiveProcess.sessionId -le 0))
+
+            if ($interactiveProcess -and $interactiveProcess.sessionId -gt 0) {
+                return [pscustomobject]@{
+                    workload = $Workload
+                    launchMs = [math]::Round($probeStopwatch.Elapsed.TotalMilliseconds, 2)
+                    pid = $interactiveProcess.pid
+                    mainWindowHandle = $interactiveProcess.mainWindowHandle
+                    sessionId = $interactiveProcess.sessionId
+                    processName = $interactiveProcess.processName
+                    launchMode = 'client-interactive-search'
+                    scheduledTaskError = $null
+                    started = $true
+                    interactiveWindow = [bool]($interactiveProcess.mainWindowHandle -ne 0)
+                    interactiveSession = $true
+                    sessionZeroFallback = $false
+                    interactiveLaunch = $interactiveLaunch
+                }
+            }
+
+            $interactiveLaunchError = 'client interactive launch did not create a non-zero session process'
+        } catch {
+            $interactiveLaunchError = ($_ | Out-String).Trim()
+        }
+    }
+
+    Invoke-GuestCommand -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+        param($Workload, $UserName, $Password, $InteractiveLaunchError)
 
         $startMap = @{
             notepad = @{ filePath = 'notepad.exe'; processName = 'notepad'; arguments = $null }
@@ -383,8 +619,12 @@ function Invoke-GuestWorkload {
 
                 if ($process) {
                     $process.Refresh()
+
+                    if ($process.SessionId -eq 0 -or $launchMode -eq 'start-process-fallback') {
+                        break
+                    }
                 }
-            } while ($stopwatch.Elapsed.TotalSeconds -lt 12 -and (-not $process -or $process.MainWindowHandle -eq 0))
+            } while ($stopwatch.Elapsed.TotalSeconds -lt 4 -and (-not $process -or $process.MainWindowHandle -eq 0))
 
         [pscustomobject]@{
             workload = $Workload
@@ -395,6 +635,7 @@ function Invoke-GuestWorkload {
             processName = if ($process) { $process.ProcessName } else { $null }
             launchMode = $launchMode
             scheduledTaskError = $scheduledTaskError
+            interactiveLaunchError = $InteractiveLaunchError
             started = $null -ne $process
             interactiveWindow = $process -and $process.MainWindowHandle -ne 0
             interactiveSession = $process -and $process.SessionId -gt 0
@@ -403,16 +644,16 @@ function Invoke-GuestWorkload {
     } finally {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
     }
-} -ArgumentList $Workload, $Credential.UserName, $plainPassword -ErrorAction Stop
+} -ArgumentList $Workload, $Credential.UserName, $plainPassword, $interactiveLaunchError
 }
 
 function Get-GuestFeatureSnapshot {
     param(
-        [Parameter(Mandatory)][string]$VmName,
+        [Parameter(Mandatory)][string]$ComputerName,
         [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential
     )
 
-    Invoke-Command -VMName $VmName -Credential $Credential -ScriptBlock {
+    Invoke-GuestCommand -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
         $audioServices = @(
             Get-Service -Name Audiosrv, AudioEndpointBuilder -ErrorAction SilentlyContinue |
                 Select-Object Name, Status, StartType
@@ -814,7 +1055,8 @@ function Get-ScenarioHealth {
         [Parameter(Mandatory)][object]$LogSummary,
         [AllowEmptyCollection()][object[]]$Events = @(),
         [Parameter()][object]$HostClipboardResult,
-        [Parameter()][object]$GuestWorkloadResult
+        [Parameter()][object]$GuestWorkloadResult,
+        [Parameter()][object]$GuestAudioResult
     )
 
     $failures = New-Object System.Collections.Generic.List[string]
@@ -903,6 +1145,13 @@ function Get-ScenarioHealth {
             'interactive-session-no-window' { $warnings.Add('guest workload reached an interactive session without a visible window') }
         }
     }
+    if ($Scenario.guestAudioAtSeconds -ne $null -and $GuestAudioResult) {
+        if ($GuestAudioResult.PSObject.Properties.Name -contains 'error') {
+            $warnings.Add('guest audio pulse failed to execute')
+        } elseif ($GuestAudioResult.attempted -and $counts.audioFormatChanges -le 0) {
+            $warnings.Add('guest audio pulse ran but did not produce observed RDPSND playback activity')
+        }
+    }
 
     [pscustomobject]@{
         passed = ($failures.Count -eq 0)
@@ -926,6 +1175,7 @@ function Get-SuiteHealthRollup {
         clipboardObservedStage = @($Results | ForEach-Object { $_.health.clipboardStage } | Select-Object -Unique) -join ','
         audioObservedStage = @($Results | ForEach-Object { $_.health.audioStage } | Select-Object -Unique) -join ','
         workloadObservedStage = @($Results | ForEach-Object { $_.health.diagnosis.workloadStage } | Select-Object -Unique) -join ','
+        guestAudioAttempted = [bool]($Results | Where-Object { $_.guestAudio -and $_.guestAudio.attempted } | Select-Object -First 1)
         primaryDiagnosis = @($Results | ForEach-Object { $_.health.diagnosis.primary } | Group-Object | Sort-Object Count -Descending | Select-Object -First 1).Name
         diagnosisSignals = @(
             $Results |
@@ -981,6 +1231,7 @@ function Get-ScenarioDefinitions {
         outageDurationSeconds = $null
         mouseMoveAtSeconds = 8
         guestWorkloadAtSeconds = 4
+        guestAudioAtSeconds = 10
         hostClipboardAtSeconds = if ($ClipboardType -eq 'none') { $null } else { 6 }
     }
 
@@ -994,6 +1245,7 @@ function Get-ScenarioDefinitions {
         outageDurationSeconds = $null
         mouseMoveAtSeconds = 9
         guestWorkloadAtSeconds = 4
+        guestAudioAtSeconds = 11
         hostClipboardAtSeconds = if ($ClipboardType -eq 'none') { $null } else { 6 }
     }
 
@@ -1004,6 +1256,7 @@ function Get-ScenarioDefinitions {
         outageDurationSeconds = 4
         mouseMoveAtSeconds = 6
         guestWorkloadAtSeconds = 4
+        guestAudioAtSeconds = 7
         hostClipboardAtSeconds = if ($ClipboardType -eq 'none') { $null } else { 5 }
     }
 
@@ -1077,6 +1330,7 @@ function Invoke-Scenario {
     $samples = New-Object System.Collections.Generic.List[object]
     $events = New-Object System.Collections.Generic.List[object]
     $guestWorkloadResult = $null
+    $guestAudioResult = $null
     $hostClipboardResult = $null
     $hostClipboardOriginal = $null
     $mouseMoved = $false
@@ -1120,11 +1374,21 @@ function Invoke-Scenario {
 
             if (-not $guestWorkloadResult -and $Scenario.guestWorkloadAtSeconds -ne $null -and $elapsed -ge $Scenario.guestWorkloadAtSeconds) {
                 try {
-                    $guestWorkloadResult = Invoke-GuestWorkload -VmName $VmName -Credential $Credential -Workload $GuestWorkload
+                    $guestWorkloadResult = Invoke-GuestWorkload -VmName $VmName -ComputerName $Destination -Credential $Credential -Workload $GuestWorkload -ClientProcess $current
                     $events.Add([pscustomobject]@{ timestamp = $sampleAt.ToString('o'); kind = 'guestWorkload'; result = $guestWorkloadResult })
                 } catch {
                     $guestWorkloadResult = [pscustomobject]@{ workload = $GuestWorkload; started = $false; error = ($_ | Out-String).Trim() }
                     $events.Add([pscustomobject]@{ timestamp = $sampleAt.ToString('o'); kind = 'guestWorkloadError'; result = $guestWorkloadResult })
+                }
+            }
+
+            if (-not $guestAudioResult -and $Scenario.guestAudioAtSeconds -ne $null -and $elapsed -ge $Scenario.guestAudioAtSeconds) {
+                try {
+                    $guestAudioResult = Invoke-GuestAudioPulse -ComputerName $Destination -Credential $Credential
+                    $events.Add([pscustomobject]@{ timestamp = $sampleAt.ToString('o'); kind = 'guestAudioPulse'; result = $guestAudioResult })
+                } catch {
+                    $guestAudioResult = [pscustomobject]@{ attempted = $false; error = ($_ | Out-String).Trim() }
+                    $events.Add([pscustomobject]@{ timestamp = $sampleAt.ToString('o'); kind = 'guestAudioPulseError'; result = $guestAudioResult })
                 }
             }
 
@@ -1213,7 +1477,7 @@ function Invoke-Scenario {
 
     $logSummary = Parse-IronRdpLog -Path $logPath
     $cpuSummary = Summarize-ProcessSamples -Samples $samples
-    $health = Get-ScenarioHealth -Scenario $Scenario -LogSummary $logSummary -Events $events -HostClipboardResult $hostClipboardResult -GuestWorkloadResult $guestWorkloadResult
+    $health = Get-ScenarioHealth -Scenario $Scenario -LogSummary $logSummary -Events $events -HostClipboardResult $hostClipboardResult -GuestWorkloadResult $guestWorkloadResult -GuestAudioResult $guestAudioResult
 
     $result = [pscustomobject]@{
         scenario = $Scenario.name
@@ -1221,6 +1485,7 @@ function Invoke-Scenario {
         durationSeconds = $DurationSeconds
         sampleIntervalMs = $SampleIntervalMs
         guestWorkload = $guestWorkloadResult
+        guestAudio = $guestAudioResult
         hostClipboard = $hostClipboardResult
         screenshotPath = if (Test-Path -LiteralPath $screenshotPath -PathType Leaf) { $screenshotPath } else { $null }
         samplesPath = $samplePath
@@ -1259,8 +1524,11 @@ $outputPath = if ($OutputRoot) {
 New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
 
 $guest = Resolve-ReachableGuestEndpoint -VmName $VmName
-$credential = New-GuestCredential -Username $Username -Password $Password
-$guestFeatureSnapshot = Get-GuestFeatureSnapshot -VmName $VmName -Credential $credential
+$powerShellDirectCredential = New-GuestCredential -Username $Username -Password $Password
+$winRmCredential = New-WinRmGuestCredential -ComputerNameHint $VmName -Username $Username -Password $Password
+Ensure-GuestWinRm -VmName $VmName -ComputerName $guest.selected.ipAddress -PowerShellDirectCredential $powerShellDirectCredential -WinRmCredential $winRmCredential
+Ensure-GuestCredentialStored -VmName $VmName -ComputerName $guest.selected.ipAddress -Username $Username -Password $Password
+$guestFeatureSnapshot = Get-GuestFeatureSnapshot -ComputerName $guest.selected.ipAddress -Credential $winRmCredential
 $clientCapabilities = Get-ClientCapabilityProfile -ClipboardType $ClipboardType -GuestFeatureSnapshot $guestFeatureSnapshot
 $scenarios = Get-ScenarioDefinitions -ScenarioSet $ScenarioSet -ClipboardType $ClipboardType
 $results = New-Object System.Collections.Generic.List[object]
@@ -1272,7 +1540,7 @@ foreach ($scenario in $scenarios) {
             -ClientExe $clientExe `
             -Destination $guest.selected.ipAddress `
             -VmName $VmName `
-            -Credential $credential `
+            -Credential $winRmCredential `
             -Username $Username `
             -Password $Password `
             -OutputRoot $outputPath `

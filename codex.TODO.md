@@ -213,6 +213,21 @@ Status: done. Current suite output now includes:
 - diagnosis signals that call out the dominant reason a scenario is degraded
 - top-level rollups for `workloadObservedStage` and dominant diagnosis class
 
+31. The Hyper-V harness now enables and validates guest WinRM, stores reusable lab credentials in Windows Credential Manager, and drives a deliberate guest-side audio pulse through the WinRM path.
+Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, `README.md`, `docs/windows-native-install.md`, local Credential Manager entries for `IronRDP-HyperV-*`, `WSMAN/*`, and `TERMSRV/*`.
+Status: done. Current harness behavior now includes:
+- WinRM enablement and reachability validation for the selected guest IP before scenarios begin
+- reuse-friendly stored credentials for the Hyper-V lab targets
+- guest-side audio pulse attempts that can move `audioStage` from `channel-wired` to `playback-observed`
+
+32. Audio playback was silently broken: the `cpal` output stream was built but `stream.play()` was never called, leaving the stream in a paused state for every session. Fixed by adding the `play()` call and importing `StreamTrait`.
+Refs: `crates/ironrdp-rdpsnd-native/src/cpal.rs`.
+Status: done. Needs Hyper-V revalidation with a guest-side audio workload.
+
+33. Server pointer position updates now use `PhysicalPosition` instead of `LogicalPosition`, fixing cursor misplacement on HiDPI displays (125%, 150%, etc.) where the DPI scaling factor was being applied twice.
+Refs: `crates/ironrdp-client/src/app.rs`.
+Status: done.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -222,11 +237,11 @@ Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, `scripts/windows/Invoke-Hyper
 Why now:
 - the suite is already producing useful transport/render data
 - it now has explicit per-scenario health summaries plus staged clipboard/audio observations
-- it now reports session-`0` fallback explicitly, so the remaining gap is to improve the workload path itself
+- it now reports session-`0` fallback explicitly, so the remaining gap is to replace that fallback with a real interactive workload path
 Done when:
 - workload launch reaches the active interactive guest session or an equivalent UI-driving path
 - clipboard text transfer is asserted honestly end-to-end or explicitly documented as still local-path-only
-- guest-side audio activity is exercised deliberately instead of relying on opportunistic playback-path observations
+- guest-side audio activity is exercised deliberately as part of the suite and correlated with app-driven interactive workload behavior
 - unsupported device redirection stays explicit in the summary rather than implied
 
 2. Tighten the Hyper-V suite’s diagnosis thresholds and render/transport attribution.
@@ -342,13 +357,14 @@ Effort: medium.
 
 ## Priority 2: Windows performance, acceleration, and transport groundwork
 
-1. Instrument and measure the remaining backend-local surface conversion cost end to end.
-Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`.
+1. Forward dirty rectangles and reduce full-frame copy waste.
+Refs: `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/presentation.rs`.
 Problem:
-- the extra packed staging buffer is gone, and the current presenter loop has been simplified
-- `softbuffer` still requires a full RGBA-to-surface-word conversion during present
-- queue latency, surface acquisition, and backend conversion cost now need to be separated before deeper GPU work
-Effort: medium.
+- `ActiveStageOutput::GraphicsUpdate(InclusiveRectangle)` carries per-update dirty regions but they are discarded in `session_driver.rs` (the `_region` variable)
+- `copy_rgba_frame` unconditionally copies the entire framebuffer: 7.9 MB/frame at 1920x1080 = ~475 MB/s wasted memory bandwidth
+- `softbuffer` also converts every pixel even when only a small tile changed
+Agent analysis: this is the #1 optimization opportunity ahead of any GPU backend work.
+Effort: small to medium (in progress).
 
 2. Keep the presentation backend seam stable and use it as the entry point for Windows acceleration experiments.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`.
@@ -416,6 +432,12 @@ Refs: `crates/ironrdp-server/src/gfx.rs`, `crates/ironrdp-egfx`, native client g
 Guardrails:
 - prove value on Windows workloads
 - keep classic bitmap/RemoteFX compatibility paths intact
+Agent analysis findings:
+- EGFX client handler is currently a no-op stub: `handle_pdu` traces and returns, no GFX PDU affects the framebuffer
+- H.264 decode is entirely absent client-side (no openh264, ffmpeg, or Media Foundation)
+- server EGFX is substantially complete (AVC420/444, ZGFX, surface lifecycle, backpressure)
+- recommended first step: advertise `AVC420_ENABLED` capability and observe whether the Hyper-V server switches from bitmap to EGFX traffic (2-hour experiment, not a multi-week feature)
+- the `PresentationBackend` trait needs dirty-region and format-hint extensions before a GPU decode path is practical
 Effort: medium to large.
 
 2. Add real Windows device redirection beyond the current `NoopRdpdrBackend`.

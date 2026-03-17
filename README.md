@@ -131,6 +131,7 @@ That suite captures:
 - software present timing and overwritten-frame counts
 - compression mix and bitmap characteristics
 - bounded resize, mouse-input, and clipboard-mutation scenarios against the running guest
+- guest-side control over WinRM instead of only Hyper-V-local remoting
 - explicit capability reporting for clipboard, audio wiring, and currently unsupported device redirection
 - per-scenario health summaries with failures, warnings, staged clipboard/audio observations, and workload-stage diagnosis
 
@@ -142,8 +143,9 @@ Current measured Hyper-V e2e findings on this branch:
 - the resize/reactivation path now completes cleanly without the earlier FastPath decompressor failure
 - the native client no longer overwrites queued frames in the current resize workload after the pacing/coalescing pass
 - resize scenarios now show client-handled clipboard activity, but guest-side text verification is still not proven end to end
+- the guest-control path now enables and verifies WinRM, then reuses stored Credential Manager entries for `WSMAN/` and `TERMSRV/` access
 - suite summaries now call out workload-stage quality explicitly; the current guest workload still falls back to session `0`
-- the audio path can now reach `playback-observed` in live suite runs, but a deliberate guest-side sound workload is still needed for deterministic assertions
+- the suite now drives a deliberate guest-side audio pulse and can reach `playback-observed` in live runs, but a stronger interactive workload is still needed for deterministic app-driven audio assertions
 - backend-local `softbuffer` conversion and present time are still the main client-side render bottlenecks
 
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)

@@ -243,6 +243,7 @@ The suite currently drives:
 - a bounded baseline session
 - resize and input automation against the live client window
 - host clipboard mutation and CLIPRDR log capture
+- guest-side control over WinRM using the reachable guest IP
 - explicit capability reporting for clipboard, audio wiring, and unsupported device redirection
 - explicit per-scenario health summaries with failures, warnings, staged clipboard/audio observations, and workload-stage diagnosis
 - optional temporary host-side outage simulation by blocking outbound `3389`
@@ -256,8 +257,9 @@ The current measured Hyper-V e2e baseline is:
 - the resize/reactivation path now completes cleanly without the earlier FastPath decompressor failure
 - the native client no longer overwrites queued unpresented frames in the current resize workload after the pacing/coalescing pass
 - resize scenarios now show client-handled clipboard activity, but guest-side text verification is still not proven end to end
+- the guest-control path now enables and verifies WinRM, then stores reusable lab credentials in Windows Credential Manager under `IronRDP-HyperV-*`, `WSMAN/*`, and `TERMSRV/*`
 - suite summaries now report that the guest workload currently falls back to a non-interactive process in session `0` because scheduled interactive task registration is rejected on this VM account model
-- the audio path can now reach `playback-observed` in live suite runs, but the suite still needs a deliberate guest-side sound workload before playback assertions are deterministic
+- the suite now drives a deliberate guest-side audio pulse and can reach `playback-observed`, but it still needs a stronger interactive workload before app-driven audio assertions are deterministic
 - device redirection remains explicitly unsupported on this branch because the client still uses `NoopRdpdrBackend`
 - backend-local `softbuffer` conversion and present time are still the main client-side render bottlenecks
 
