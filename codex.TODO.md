@@ -205,6 +205,14 @@ Status: done. Current suite output now includes:
 - derived pacing metrics such as overwrite-per-presented-frame and first-image-to-first-frame latency
 - top-level suite rollups for baseline/resize pass state and worst-case latency/overwrite ratios
 
+30. The Hyper-V e2e suite now classifies scenario workload quality and primary diagnosis instead of leaving the operator to infer it from raw metrics alone.
+Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, `README.md`, `docs/windows-native-install.md`, Hyper-V suite logs under `%TEMP%\\ironrdp-hyperv-suite-*`.
+Status: done. Current suite output now includes:
+- per-scenario `health.diagnosis.primary` for `healthy`, `transport-limited`, `decode-limited`, or `present-limited`
+- per-scenario `health.diagnosis.workloadStage` so session-`0` fallback is explicit
+- diagnosis signals that call out the dominant reason a scenario is degraded
+- top-level rollups for `workloadObservedStage` and dominant diagnosis class
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -214,22 +222,22 @@ Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, `scripts/windows/Invoke-Hyper
 Why now:
 - the suite is already producing useful transport/render data
 - it now has explicit per-scenario health summaries plus staged clipboard/audio observations
-- the current workload launcher still lands in session `0`, so app-start timing is real but not yet interactive-desktop representative
+- it now reports session-`0` fallback explicitly, so the remaining gap is to improve the workload path itself
 Done when:
 - workload launch reaches the active interactive guest session or an equivalent UI-driving path
 - clipboard text transfer is asserted honestly end-to-end or explicitly documented as still local-path-only
-- guest-side audio activity is exercised and the suite can report observed RDPSND playback-path traffic
+- guest-side audio activity is exercised deliberately instead of relying on opportunistic playback-path observations
 - unsupported device redirection stays explicit in the summary rather than implied
 
-2. Promote the Hyper-V suite from metric collection to scenario diagnosis.
+2. Tighten the Hyper-V suite’s diagnosis thresholds and render/transport attribution.
 Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, Hyper-V suite logs under `%TEMP%\\ironrdp-hyperv-suite-*`.
 Why now:
-- the suite now publishes health flags, failures, warnings, and staged clipboard/audio observations
-- the next step is better diagnosis of render-path bottlenecks and workload quality, not just more raw counters
+- the suite now classifies dominant bottlenecks, but the thresholds are still heuristic
+- the current branch still needs better attribution for “healthy but still expensive” present-path runs
 Done when:
-- baseline/resize/outage scenarios classify whether they are transport-limited, decode-limited, or present-limited
-- workload quality distinguishes interactive desktop success from session-`0` fallback
-- suite rollups surface worst-case render and latency regressions directly
+- diagnosis distinguishes truly healthy idle workloads from present-cost-heavy steady-state workloads
+- scenario summaries can call out when render, decode, or transport costs dominate even without hard failures
+- suite rollups surface the worst diagnosis signals directly instead of only the primary class
 
 3. Add focused runtime tests for the newer client/server session seams.
 Refs: `crates/ironrdp-testsuite-extra`, `crates/ironrdp-server/src/session_driver.rs`, `crates/ironrdp-client/src/session_driver.rs`.

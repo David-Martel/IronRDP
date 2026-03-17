@@ -244,7 +244,7 @@ The suite currently drives:
 - resize and input automation against the live client window
 - host clipboard mutation and CLIPRDR log capture
 - explicit capability reporting for clipboard, audio wiring, and unsupported device redirection
-- explicit per-scenario health summaries with failures, warnings, and staged clipboard/audio observations
+- explicit per-scenario health summaries with failures, warnings, staged clipboard/audio observations, and workload-stage diagnosis
 - optional temporary host-side outage simulation by blocking outbound `3389`
 - per-scenario screenshots, client logs, CPU samples, and JSON summaries
 
@@ -256,10 +256,10 @@ The current measured Hyper-V e2e baseline is:
 - the resize/reactivation path now completes cleanly without the earlier FastPath decompressor failure
 - the native client no longer overwrites queued unpresented frames in the current resize workload after the pacing/coalescing pass
 - resize scenarios now show client-handled clipboard activity, but guest-side text verification is still not proven end to end
-- guest audio services are running and the client RDPSND path is wired, but the suite still needs a guest-side sound workload before playback assertions are honest
+- suite summaries now report that the guest workload currently falls back to a non-interactive process in session `0` because scheduled interactive task registration is rejected on this VM account model
+- the audio path can now reach `playback-observed` in live suite runs, but the suite still needs a deliberate guest-side sound workload before playback assertions are deterministic
 - device redirection remains explicitly unsupported on this branch because the client still uses `NoopRdpdrBackend`
 - backend-local `softbuffer` conversion and present time are still the main client-side render bottlenecks
-- guest workload launch currently falls back to a non-interactive process in session `0` because scheduled interactive task registration is rejected on this VM account model
 
 ## Uninstall
 

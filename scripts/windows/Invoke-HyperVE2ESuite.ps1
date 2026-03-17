@@ -386,22 +386,24 @@ function Invoke-GuestWorkload {
                 }
             } while ($stopwatch.Elapsed.TotalSeconds -lt 12 -and (-not $process -or $process.MainWindowHandle -eq 0))
 
-            [pscustomobject]@{
-                workload = $Workload
-                launchMs = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
-                pid = if ($process) { $process.Id } else { $null }
-                mainWindowHandle = if ($process) { $process.MainWindowHandle } else { $null }
-                sessionId = if ($process) { $process.SessionId } else { $null }
-                processName = if ($process) { $process.ProcessName } else { $null }
-                launchMode = $launchMode
-                scheduledTaskError = $scheduledTaskError
-                started = $null -ne $process
-                interactiveWindow = $process -and $process.MainWindowHandle -ne 0
-            }
-        } finally {
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        [pscustomobject]@{
+            workload = $Workload
+            launchMs = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+            pid = if ($process) { $process.Id } else { $null }
+            mainWindowHandle = if ($process) { $process.MainWindowHandle } else { $null }
+            sessionId = if ($process) { $process.SessionId } else { $null }
+            processName = if ($process) { $process.ProcessName } else { $null }
+            launchMode = $launchMode
+            scheduledTaskError = $scheduledTaskError
+            started = $null -ne $process
+            interactiveWindow = $process -and $process.MainWindowHandle -ne 0
+            interactiveSession = $process -and $process.SessionId -gt 0
+            sessionZeroFallback = $process -and $process.SessionId -eq 0
         }
-    } -ArgumentList $Workload, $Credential.UserName, $plainPassword -ErrorAction Stop
+    } finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    }
+} -ArgumentList $Workload, $Credential.UserName, $plainPassword -ErrorAction Stop
 }
 
 function Get-GuestFeatureSnapshot {
@@ -706,18 +708,120 @@ function Get-AudioObservationStage {
     return 'not-observed'
 }
 
+function Get-GuestWorkloadStage {
+    param([Parameter()][object]$GuestWorkloadResult)
+
+    if (-not $GuestWorkloadResult) { return 'not-requested' }
+    if ($GuestWorkloadResult.PSObject.Properties.Name -contains 'error') { return 'launch-error' }
+    if (-not $GuestWorkloadResult.started) { return 'not-started' }
+    if ($GuestWorkloadResult.interactiveWindow) { return 'interactive-window' }
+    if ($GuestWorkloadResult.interactiveSession) { return 'interactive-session-no-window' }
+    if ($GuestWorkloadResult.sessionZeroFallback) { return 'session-0-fallback' }
+    return 'background-process'
+}
+
+function Get-ScenarioDiagnosis {
+    param(
+        [Parameter(Mandatory)][object]$Scenario,
+        [Parameter(Mandatory)][object]$LogSummary,
+        [Parameter()][object]$GuestWorkloadResult
+    )
+
+    $counts = $LogSummary.counts
+    $derived = $LogSummary.derived
+    $latency = $LogSummary.latencyMs
+    $signals = New-Object System.Collections.Generic.List[string]
+    $primary = 'healthy'
+
+    $workloadStage = Get-GuestWorkloadStage -GuestWorkloadResult $GuestWorkloadResult
+    if ($workloadStage -eq 'session-0-fallback') {
+        $signals.Add('guest workload only reached session 0')
+    } elseif ($workloadStage -eq 'interactive-session-no-window') {
+        $signals.Add('guest workload reached an interactive session without a visible top-level window')
+    } elseif ($workloadStage -eq 'launch-error') {
+        $signals.Add('guest workload launch returned an error')
+    }
+
+    if ($counts.connectionEstablished -le 0 -or $LogSummary.status -eq 'connection-started') {
+        $primary = 'transport-limited'
+        $signals.Add('connection never reached established state')
+    } elseif ($counts.connectionErrors -gt 0 -or $latency.connectToEstablished -gt 1000) {
+        $primary = 'transport-limited'
+        if ($counts.connectionErrors -gt 0) {
+            $signals.Add("connection errors observed: $($counts.connectionErrors)")
+        }
+        if ($latency.connectToEstablished -gt 1000) {
+            $signals.Add("slow connect-to-established latency: $($latency.connectToEstablished) ms")
+        }
+    } elseif ($counts.activeSessionErrors -gt 0 -or $counts.missingDecompressorWarnings -gt 0 -or $counts.bulkDecompressionFailures -gt 0) {
+        $primary = 'decode-limited'
+        if ($counts.activeSessionErrors -gt 0) {
+            $signals.Add("active session errors observed: $($counts.activeSessionErrors)")
+        }
+        if ($counts.missingDecompressorWarnings -gt 0) {
+            $signals.Add('compressed fast-path data arrived without a decompressor')
+        }
+        if ($counts.bulkDecompressionFailures -gt 0) {
+            $signals.Add("bulk decompression failures observed: $($counts.bulkDecompressionFailures)")
+        }
+    } elseif ($counts.imageUpdates -gt 0 -and $counts.presentedFrames -le 0) {
+        $primary = 'present-limited'
+        $signals.Add('image updates were emitted but no frames were presented')
+    } elseif ($counts.surfaceFailures -gt 0 -or $counts.resizeSurfaceFailures -gt 0) {
+        $primary = 'present-limited'
+        if ($counts.surfaceFailures -gt 0) {
+            $signals.Add("surface present failures observed: $($counts.surfaceFailures)")
+        }
+        if ($counts.resizeSurfaceFailures -gt 0) {
+            $signals.Add("surface resize failures observed: $($counts.resizeSurfaceFailures)")
+        }
+    } elseif ($derived.overwritePerPresentedFrame -gt 0.25 -or $derived.firstImageToFrameMs -gt 120 -or ($LogSummary.presentMicros.average -gt 0 -and $LogSummary.convertMicros.average -gt 0 -and $LogSummary.presentMicros.average -ge ($LogSummary.convertMicros.average * 1.5))) {
+        $primary = 'present-limited'
+        if ($derived.overwritePerPresentedFrame -gt 0.25) {
+            $signals.Add("high overwrite-per-presented-frame ratio: $($derived.overwritePerPresentedFrame)")
+        }
+        if ($derived.firstImageToFrameMs -gt 120) {
+            $signals.Add("slow first-image-to-frame latency: $($derived.firstImageToFrameMs) ms")
+        }
+        if ($LogSummary.presentMicros.average -gt 0 -and $LogSummary.convertMicros.average -gt 0 -and $LogSummary.presentMicros.average -ge ($LogSummary.convertMicros.average * 1.5)) {
+            $signals.Add("present cost dominates conversion cost: avg present $($LogSummary.presentMicros.average) us vs convert $($LogSummary.convertMicros.average) us")
+        }
+    } elseif ($latency.connectToFirstImage -gt 1200 -and $counts.imageUpdates -le 2) {
+        $primary = 'transport-limited'
+        $signals.Add("slow connect-to-first-image latency: $($latency.connectToFirstImage) ms")
+    }
+
+    if ($signals.Count -eq 0) {
+        if ($Scenario.name -eq 'resize' -and $counts.resizeReconnectRequests -gt 0) {
+            $signals.Add("resize required reconnects: $($counts.resizeReconnectRequests)")
+        } elseif ($counts.audioChannelEnabled -gt 0 -and $counts.audioFormatChanges -le 0) {
+            $signals.Add('audio channel is wired but guest-side playback is not yet proven')
+        } else {
+            $signals.Add('no dominant bottleneck detected in current scenario')
+        }
+    }
+
+    [pscustomobject]@{
+        primary = $primary
+        workloadStage = $workloadStage
+        signals = @($signals)
+    }
+}
+
 function Get-ScenarioHealth {
     param(
         [Parameter(Mandatory)][object]$Scenario,
         [Parameter(Mandatory)][object]$LogSummary,
         [AllowEmptyCollection()][object[]]$Events = @(),
-        [Parameter()][object]$HostClipboardResult
+        [Parameter()][object]$HostClipboardResult,
+        [Parameter()][object]$GuestWorkloadResult
     )
 
     $failures = New-Object System.Collections.Generic.List[string]
     $warnings = New-Object System.Collections.Generic.List[string]
     $counts = $LogSummary.counts
     $derived = $LogSummary.derived
+    $diagnosis = Get-ScenarioDiagnosis -Scenario $Scenario -LogSummary $LogSummary -GuestWorkloadResult $GuestWorkloadResult
     $resizeEvents = @($Events | Where-Object kind -eq 'resize')
     $resizeErrors = @($Events | Where-Object kind -eq 'resizeError')
     $hasClipboardError = $false
@@ -791,6 +895,14 @@ function Get-ScenarioHealth {
     if ($derived.overwritePerPresentedFrame -gt 0.25) {
         $warnings.Add("high overwrite-per-presented-frame ratio: $($derived.overwritePerPresentedFrame)")
     }
+    if ($Scenario.guestWorkloadAtSeconds -ne $null -and $GuestWorkloadResult) {
+        switch ($diagnosis.workloadStage) {
+            'launch-error' { $warnings.Add('guest workload launch failed and interactive workload timing is unavailable') }
+            'not-started' { $warnings.Add('guest workload did not start') }
+            'session-0-fallback' { $warnings.Add('guest workload only reached session 0 fallback') }
+            'interactive-session-no-window' { $warnings.Add('guest workload reached an interactive session without a visible window') }
+        }
+    }
 
     [pscustomobject]@{
         passed = ($failures.Count -eq 0)
@@ -798,6 +910,7 @@ function Get-ScenarioHealth {
         warnings = @($warnings)
         clipboardStage = Get-ClipboardObservationStage -LogSummary $LogSummary -HostClipboardResult $HostClipboardResult
         audioStage = Get-AudioObservationStage -LogSummary $LogSummary
+        diagnosis = $diagnosis
     }
 }
 
@@ -812,6 +925,17 @@ function Get-SuiteHealthRollup {
         resizePassed = if ($resize) { [bool]$resize.health.passed } else { $false }
         clipboardObservedStage = @($Results | ForEach-Object { $_.health.clipboardStage } | Select-Object -Unique) -join ','
         audioObservedStage = @($Results | ForEach-Object { $_.health.audioStage } | Select-Object -Unique) -join ','
+        workloadObservedStage = @($Results | ForEach-Object { $_.health.diagnosis.workloadStage } | Select-Object -Unique) -join ','
+        primaryDiagnosis = @($Results | ForEach-Object { $_.health.diagnosis.primary } | Group-Object | Sort-Object Count -Descending | Select-Object -First 1).Name
+        diagnosisSignals = @(
+            $Results |
+                ForEach-Object {
+                    foreach ($signal in $_.health.diagnosis.signals) {
+                        '{0}: {1}' -f $_.scenario, $signal
+                    }
+                } |
+                Select-Object -Unique
+        )
         worstOverwritePerPresentedFrame = (
             $Results |
                 ForEach-Object { $_.log.derived.overwritePerPresentedFrame } |
@@ -1089,7 +1213,7 @@ function Invoke-Scenario {
 
     $logSummary = Parse-IronRdpLog -Path $logPath
     $cpuSummary = Summarize-ProcessSamples -Samples $samples
-    $health = Get-ScenarioHealth -Scenario $Scenario -LogSummary $logSummary -Events $events -HostClipboardResult $hostClipboardResult
+    $health = Get-ScenarioHealth -Scenario $Scenario -LogSummary $logSummary -Events $events -HostClipboardResult $hostClipboardResult -GuestWorkloadResult $guestWorkloadResult
 
     $result = [pscustomobject]@{
         scenario = $Scenario.name
