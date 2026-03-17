@@ -12,7 +12,9 @@
 //! sideband transport is implemented.
 
 use core::num::NonZeroU16;
+use core::time::Duration;
 use std::time::Instant;
+use tokio::time::{self as tokio_time, Instant as TokioInstant};
 
 use ironrdp::cliprdr;
 use ironrdp::cliprdr::backend::ClipboardMessage;
@@ -22,7 +24,7 @@ use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::rdp::multitransport::MultitransportResponsePdu;
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{self, ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
+use ironrdp::session::{self, ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult};
 use ironrdp_core::WriteBuf;
 use ironrdp_tokio::{FramedWrite as _, TokioFramed, single_sequence_step_read, split_tokio_framed};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -31,6 +33,11 @@ use tracing::{debug, error, info, trace, warn};
 use winit::event_loop::EventLoopProxy;
 
 use crate::rdp::{RdpInputEvent, RdpOutputEvent};
+
+/// Minimum interval between successive frame emissions when a new frame arrives
+/// while a prior frame is still in flight.  Set to 4 ms (~250 fps cap) so the
+/// server-update burst can be coalesced without starving the display pipeline.
+const FRAME_PACING_INTERVAL: Duration = Duration::from_millis(4);
 
 pub(crate) enum RdpControlFlow {
     ReconnectWithNewSize { width: u16, height: u16 },
@@ -51,6 +58,9 @@ struct SessionDriver {
     latest_frame_dirty: bool,
     emitted_frame_count: u64,
     reconnect_resize_count: u64,
+    /// When set, a pacing timer is pending.  The session driver will wait for this
+    /// instant before emitting the next dirty frame, coalescing server updates.
+    frame_pacing_deadline: Option<TokioInstant>,
 }
 
 impl SessionDriver {
@@ -71,6 +81,7 @@ impl SessionDriver {
             latest_frame_dirty: false,
             emitted_frame_count: 0,
             reconnect_resize_count: 0,
+            frame_pacing_deadline: None,
         }
     }
 
@@ -123,10 +134,13 @@ impl SessionDriver {
             }
             RdpInputEvent::FramePresented => {
                 if finish_frame_present(&mut self.frame_in_flight, &mut self.latest_frame_dirty) {
-                    Ok(SessionDriverFlow::EmitLatestImage)
-                } else {
-                    Ok(SessionDriverFlow::Outputs(Vec::new()))
+                    // Defer emission by a small pacing interval to coalesce bursts.
+                    // Only arm the timer if one is not already pending.
+                    if self.frame_pacing_deadline.is_none() {
+                        self.frame_pacing_deadline = Some(TokioInstant::now() + FRAME_PACING_INTERVAL);
+                    }
                 }
+                Ok(SessionDriverFlow::Outputs(Vec::new()))
             }
             RdpInputEvent::Close => Ok(SessionDriverFlow::Outputs(self.active_stage.graceful_shutdown()?)),
             RdpInputEvent::Clipboard(event) => {
@@ -397,16 +411,12 @@ impl SessionDriver {
             {
                 debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
                 self.image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
-                self.active_stage.set_fastpath_processor(
-                    fast_path::ProcessorBuilder {
-                        io_channel_id,
-                        user_channel_id,
-                        share_id,
-                        enable_server_pointer,
-                        pointer_software_rendering,
-                        bulk_decompressor: None,
-                    }
-                    .build(),
+                self.active_stage.reactivate_fastpath_processor(
+                    io_channel_id,
+                    user_channel_id,
+                    share_id,
+                    enable_server_pointer,
+                    pointer_software_rendering,
                 );
                 self.active_stage.set_share_id(share_id);
                 self.active_stage.set_enable_server_pointer(enable_server_pointer);
@@ -460,6 +470,15 @@ where
     let mut driver = SessionDriver::new(connection_result);
 
     let disconnect_reason = 'outer: loop {
+        // Build the pacing sleep future.  When no deadline is set the arm
+        // resolves to a perpetually-pending future so it never fires spuriously.
+        let pacing_sleep = async {
+            match driver.frame_pacing_deadline {
+                Some(deadline) => tokio_time::sleep_until(deadline).await,
+                None => core::future::pending::<()>().await,
+            }
+        };
+
         let flow = tokio::select! {
             frame = reader.read_pdu() => {
                 let (action, payload) = frame.map_err(|e| session::custom_err!("read frame", e))?;
@@ -469,6 +488,11 @@ where
             input_event = input_event_receiver.recv() => {
                 let input_event = input_event.ok_or_else(|| session::general_err!("GUI is stopped"))?;
                 driver.handle_input_event(input_event)?
+            }
+            _ = pacing_sleep => {
+                driver.frame_pacing_deadline = None;
+                trace!("Frame pacing timer fired, emitting coalesced frame");
+                SessionDriverFlow::EmitLatestImage
             }
         };
 

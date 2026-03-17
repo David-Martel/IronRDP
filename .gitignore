@@ -20,3 +20,4 @@
 *.ntvs*
 *.njsproj
 *.sw?
+/tmp/agent-ipc/
