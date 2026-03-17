@@ -443,16 +443,16 @@ function Get-ClientCapabilityProfile {
             validation = 'resize scenario plus reconnect/deactivation tracing'
         }
         clipboard = [pscustomobject]@{
-            status = if ($ClipboardType -eq 'none') { 'disabled-by-harness' } else { 'enabled-assertable' }
+            status = if ($ClipboardType -eq 'none') { 'disabled-by-harness' } else { 'channel-observed' }
             mode = $ClipboardType
             guestClipboardAvailable = [bool]$GuestFeatureSnapshot.clipboardCmdletsAvailable
-            validation = 'host clipboard mutation plus client CLIPRDR log activity'
+            validation = 'channel attach/init/ack plus host clipboard mutation and client CLIPRDR log activity'
         }
         audio = [pscustomobject]@{
-            status = 'enabled-assertable'
+            status = 'channel-observed'
             backend = 'rdpsnd-native/cpal'
             guestAudioServices = $GuestFeatureSnapshot.audioServices
-            validation = 'channel wiring plus rdpsnd log activity'
+            validation = 'channel wiring plus rdpsnd playback-path log activity'
         }
         deviceRedirection = [pscustomobject]@{
             status = 'unsupported'
@@ -515,6 +515,19 @@ function Get-NumericSummary {
         maximum = [math]::Round([double]$measure.Maximum, 2)
         p95 = Get-Percentile -Values $Values -Percentile 95
     }
+}
+
+function Get-RatioValue {
+    param(
+        [double]$Numerator,
+        [double]$Denominator
+    )
+
+    if ($Denominator -le 0) {
+        return $null
+    }
+
+    return [math]::Round($Numerator / $Denominator, 4)
 }
 
 function Parse-IronRdpLog {
@@ -601,7 +614,16 @@ function Parse-IronRdpLog {
         activeSessionErrors = @($entries | Where-Object { $_.message -like 'Active session error*' }).Count
         shutdownDenied = @($entries | Where-Object { $_.message -eq 'ShutdownDenied received, session will be closed' }).Count
         surfaceFailures = @($entries | Where-Object { $_.message -eq 'Failed to present surface buffer' }).Count
+        resizeSurfaceFailures = @($entries | Where-Object { $_.message -eq 'Failed to resize drawing surface' }).Count
+        surfaceResizeEvents = @($entries | Where-Object { $_.message -like 'Resized presentation surface*' }).Count
         overwrittenFrames = @($entries | Where-Object { $_.message -like 'Overwriting unpresented frame buffer*' }).Count
+        replacedPresentedFrames = @($entries | Where-Object { $_.message -like 'Replacing already presented frame buffer*' }).Count
+        framePacingFires = @($entries | Where-Object { $_.message -eq 'Frame pacing timer fired, emitting coalesced frame' }).Count
+        resizeReconnectRequests = @($entries | Where-Object { $_.message -like 'Resize requires reconnect*' }).Count
+        sameSizeReconnectGuard = @($entries | Where-Object { $_.message -like '*too many resize reconnects without a desktop size change*' }).Count
+        missingDecompressorWarnings = @($entries | Where-Object { $_.message -eq 'Received compressed FastPath data but no decompressor is configured' }).Count
+        bulkDecompressionFailures = @($entries | Where-Object { $_.message -like '*bulk decompression failed*' }).Count
+        reactivationCompletions = @($entries | Where-Object { $_.message -like 'Deactivation-Reactivation Sequence completed*' }).Count
         clipboardForwarded = @($entries | Where-Object { $_.message -like 'Forwarding local clipboard event*' }).Count
         clipboardHandled = @($entries | Where-Object { $_.message -like 'Handling clipboard event*' }).Count
         cliprdrAttached = @($entries | Where-Object { $_.message -eq 'Attach CLIPRDR channel' }).Count
@@ -648,8 +670,160 @@ function Parse-IronRdpLog {
             connectToFirstImage = if ($firstConnection -and $firstImage) { [math]::Round(($firstImage.timestamp - $firstConnection.timestamp).TotalMilliseconds, 2) } else { $null }
             connectToFirstFrame = if ($firstConnection -and $firstFrame) { [math]::Round(($firstFrame.timestamp - $firstConnection.timestamp).TotalMilliseconds, 2) } else { $null }
         }
+        derived = [pscustomobject]@{
+            overwritePerPresentedFrame = Get-RatioValue -Numerator $counts.overwrittenFrames -Denominator $counts.presentedFrames
+            overwritePerImageUpdate = Get-RatioValue -Numerator $counts.overwrittenFrames -Denominator $counts.imageUpdates
+            presentedPerImageUpdate = Get-RatioValue -Numerator $counts.presentedFrames -Denominator $counts.imageUpdates
+            firstImageToFrameMs = if ($firstImage -and $firstFrame) { [math]::Round(($firstFrame.timestamp - $firstImage.timestamp).TotalMilliseconds, 2) } else { $null }
+        }
         counts = [pscustomobject]$counts
         tail = Get-Content -LiteralPath $Path -Tail 120 | Out-String
+    }
+}
+
+function Get-ClipboardObservationStage {
+    param(
+        [Parameter(Mandatory)][object]$LogSummary,
+        [Parameter()][object]$HostClipboardResult
+    )
+
+    $counts = $LogSummary.counts
+    if ($counts.cliprdrAttached -le 0) { return 'disabled-or-unwired' }
+    if ($counts.clipboardHandled -gt 0) { return 'client-handled' }
+    if ($counts.clipboardForwarded -gt 0) { return 'local-forwarded' }
+    if ($counts.cliprdrFormatListAck -gt 0) { return 'remote-ack-observed' }
+    if ($counts.cliprdrInitialized -gt 0) { return 'initialized' }
+    if ($HostClipboardResult) { return 'host-mutation-triggered' }
+    return 'channel-attached'
+}
+
+function Get-AudioObservationStage {
+    param([Parameter(Mandatory)][object]$LogSummary)
+
+    $counts = $LogSummary.counts
+    if ($counts.audioFormatChanges -gt 0) { return 'playback-observed' }
+    if ($counts.audioChannelEnabled -gt 0) { return 'channel-wired' }
+    return 'not-observed'
+}
+
+function Get-ScenarioHealth {
+    param(
+        [Parameter(Mandatory)][object]$Scenario,
+        [Parameter(Mandatory)][object]$LogSummary,
+        [AllowEmptyCollection()][object[]]$Events = @(),
+        [Parameter()][object]$HostClipboardResult
+    )
+
+    $failures = New-Object System.Collections.Generic.List[string]
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $counts = $LogSummary.counts
+    $derived = $LogSummary.derived
+    $resizeEvents = @($Events | Where-Object kind -eq 'resize')
+    $resizeErrors = @($Events | Where-Object kind -eq 'resizeError')
+    $hasClipboardError = $false
+    $hasClipboardMutation = $false
+    if ($HostClipboardResult) {
+        $hasClipboardError = $HostClipboardResult.PSObject.Properties.Name -contains 'error'
+        $hasClipboardMutation = $HostClipboardResult.PSObject.Properties.Name -contains 'after'
+    }
+
+    if ($counts.connectionEstablished -le 0) {
+        $failures.Add('connection was never established')
+    }
+    if ($counts.firstPresentedFrame -le 0) {
+        $failures.Add('no frame was presented')
+    }
+    if ($counts.connectionErrors -gt 0) {
+        $failures.Add("connection errors observed: $($counts.connectionErrors)")
+    }
+    if ($counts.activeSessionErrors -gt 0) {
+        $failures.Add("active session errors observed: $($counts.activeSessionErrors)")
+    }
+    if ($counts.surfaceFailures -gt 0) {
+        $failures.Add("surface present failures observed: $($counts.surfaceFailures)")
+    }
+    if ($counts.resizeSurfaceFailures -gt 0) {
+        $failures.Add("surface resize failures observed: $($counts.resizeSurfaceFailures)")
+    }
+
+    if ($Scenario.name -eq 'resize') {
+        if ($resizeEvents.Count -ne $Scenario.resizeActions.Count) {
+            $failures.Add("expected $($Scenario.resizeActions.Count) resize actions but observed $($resizeEvents.Count)")
+        }
+        if ($resizeErrors.Count -gt 0) {
+            $failures.Add("resize automation errors observed: $($resizeErrors.Count)")
+        }
+        if ($counts.missingDecompressorWarnings -gt 0) {
+            $failures.Add("post-reactivation decompressor warnings observed: $($counts.missingDecompressorWarnings)")
+        }
+        if ($counts.bulkDecompressionFailures -gt 0) {
+            $failures.Add("bulk decompression failures observed: $($counts.bulkDecompressionFailures)")
+        }
+        if ($counts.sameSizeReconnectGuard -gt 0) {
+            $failures.Add("resize reconnect guard triggered: $($counts.sameSizeReconnectGuard)")
+        }
+        if ($counts.surfaceResizeEvents -le 0) {
+            $warnings.Add('no presentation-surface resize event was observed')
+        }
+        if ($counts.resizeReconnectRequests -gt 0) {
+            $warnings.Add("resize requested reconnects: $($counts.resizeReconnectRequests)")
+        }
+        if ($counts.reactivationCompletions -le 0) {
+            $warnings.Add('no deactivation-reactivation completion was observed')
+        }
+    }
+
+    if ($counts.shutdownDenied -gt 0) {
+        $warnings.Add("shutdown denied count: $($counts.shutdownDenied)")
+    }
+    if ($counts.cliprdrFailures -gt 0 -or $counts.clipboardBackendErrors -gt 0 -or $counts.clipboardUnavailable -gt 0) {
+        $warnings.Add('clipboard channel reported failures or unavailable events')
+    }
+    if ($hasClipboardMutation -and -not $hasClipboardError -and $counts.clipboardHandled -le 0) {
+        $warnings.Add('host clipboard mutation did not produce client-handled clipboard activity')
+    }
+    if ($counts.audioChannelEnabled -gt 0 -and $counts.audioFormatChanges -le 0) {
+        $warnings.Add('audio channel was wired but no playback format change was observed')
+    }
+    if ($counts.audioUnderruns -gt 0) {
+        $warnings.Add("audio underruns observed: $($counts.audioUnderruns)")
+    }
+    if ($derived.overwritePerPresentedFrame -gt 0.25) {
+        $warnings.Add("high overwrite-per-presented-frame ratio: $($derived.overwritePerPresentedFrame)")
+    }
+
+    [pscustomobject]@{
+        passed = ($failures.Count -eq 0)
+        failures = @($failures)
+        warnings = @($warnings)
+        clipboardStage = Get-ClipboardObservationStage -LogSummary $LogSummary -HostClipboardResult $HostClipboardResult
+        audioStage = Get-AudioObservationStage -LogSummary $LogSummary
+    }
+}
+
+function Get-SuiteHealthRollup {
+    param([Parameter(Mandatory)][object[]]$Results)
+
+    $baseline = $Results | Where-Object scenario -eq 'baseline' | Select-Object -First 1
+    $resize = $Results | Where-Object scenario -eq 'resize' | Select-Object -First 1
+
+    [pscustomobject]@{
+        baselinePassed = if ($baseline) { [bool]$baseline.health.passed } else { $false }
+        resizePassed = if ($resize) { [bool]$resize.health.passed } else { $false }
+        clipboardObservedStage = @($Results | ForEach-Object { $_.health.clipboardStage } | Select-Object -Unique) -join ','
+        audioObservedStage = @($Results | ForEach-Object { $_.health.audioStage } | Select-Object -Unique) -join ','
+        worstOverwritePerPresentedFrame = (
+            $Results |
+                ForEach-Object { $_.log.derived.overwritePerPresentedFrame } |
+                Where-Object { $null -ne $_ } |
+                Measure-Object -Maximum
+        ).Maximum
+        worstConnectToFirstFrameMs = (
+            $Results |
+                ForEach-Object { $_.log.latencyMs.connectToFirstFrame } |
+                Where-Object { $null -ne $_ } |
+                Measure-Object -Maximum
+        ).Maximum
     }
 }
 
@@ -915,6 +1089,7 @@ function Invoke-Scenario {
 
     $logSummary = Parse-IronRdpLog -Path $logPath
     $cpuSummary = Summarize-ProcessSamples -Samples $samples
+    $health = Get-ScenarioHealth -Scenario $Scenario -LogSummary $logSummary -Events $events -HostClipboardResult $hostClipboardResult
 
     $result = [pscustomobject]@{
         scenario = $Scenario.name
@@ -928,6 +1103,7 @@ function Invoke-Scenario {
         logPath = $logPath
         cpu = $cpuSummary
         log = $logSummary
+        health = $health
         events = $events
     }
 
@@ -997,6 +1173,7 @@ $summary = [pscustomobject]@{
     scenarioSet = $ScenarioSet
     packageRoot = $root
     packageFamilyName = if ($package) { $package.PackageFamilyName } else { $null }
+    health = Get-SuiteHealthRollup -Results $results
     results = $results
 }
 

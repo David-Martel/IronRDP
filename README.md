@@ -132,16 +132,18 @@ That suite captures:
 - compression mix and bitmap characteristics
 - bounded resize, mouse-input, and clipboard-mutation scenarios against the running guest
 - explicit capability reporting for clipboard, audio wiring, and currently unsupported device redirection
+- per-scenario health summaries with failures, warnings, and staged clipboard/audio observations
 
 Current measured Hyper-V e2e findings on this branch:
 
 - connection establishment is about `~130 ms`
 - first image and first frame are about `~700 ms`
 - the guest still prefers `Rdp61`/bitmap traffic over EGFX/H.264 on this path
-- the native client is still overwriting almost every queued frame under this workload, so present-path pacing remains a high-value target
-- CLIPRDR initializes successfully on the Hyper-V path, but host clipboard mutation is not yet producing end-to-end forwarded clipboard events
+- the resize/reactivation path now completes cleanly without the earlier FastPath decompressor failure
+- the native client no longer overwrites queued frames in the current resize workload after the pacing/coalescing pass
+- resize scenarios now show client-handled clipboard activity, but guest-side text verification is still not proven end to end
 - guest audio services are running and the client audio channel is wired, but playback-path assertions still need a guest-side sound workload
-- the resize scenario exposed a post-reactivation correctness issue, so resize stability is now a higher priority than synthetic outage work
+- backend-local `softbuffer` conversion and present time are still the main client-side render bottlenecks
 
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 
