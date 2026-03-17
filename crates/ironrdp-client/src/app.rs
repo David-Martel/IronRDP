@@ -20,16 +20,19 @@ use proc_exit::Code;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, PhysicalSize};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{self, Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::platform::scancode::PhysicalKeyExtScancode as _;
-use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes};
+use winit::window::{CursorIcon, CustomCursor, Fullscreen, Window, WindowAttributes};
 
 use crate::presentation::{PresentationBackend, SoftbufferBackend};
 use crate::rdp::{RdpInputEvent, RdpOutputEvent};
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// PS/2 scancode for the Enter key (both main and numpad share this base code).
+const SCANCODE_ENTER: u32 = 0x1C;
 
 struct WindowState {
     window: Arc<Window>,
@@ -50,6 +53,7 @@ impl WindowState {
 pub struct App {
     input_event_sender: mpsc::UnboundedSender<RdpInputEvent>,
     initial_size: PhysicalSize<u32>,
+    server_name: String,
     window_state: Option<WindowState>,
     buffer: Vec<u8>,
     frame_pending_present: bool,
@@ -64,17 +68,25 @@ pub struct App {
     surface_resize_count: u64,
     overwritten_frame_count: u64,
     exit_code: Code,
+    /// Whether the window is currently in borderless fullscreen mode.
+    is_fullscreen: bool,
+    /// Tracks the Ctrl modifier state, updated from `ModifiersChanged` events.
+    ctrl_pressed: bool,
+    /// Tracks the Alt modifier state, updated from `ModifiersChanged` events.
+    alt_pressed: bool,
 }
 
 impl App {
     pub fn new(
         input_event_sender: &mpsc::UnboundedSender<RdpInputEvent>,
         initial_size: PhysicalSize<u32>,
+        server_name: String,
     ) -> anyhow::Result<Self> {
         let input_database = ironrdp::input::Database::new();
         Ok(Self {
             input_event_sender: input_event_sender.clone(),
             initial_size,
+            server_name,
             window_state: None,
             buffer: Vec::new(),
             frame_pending_present: false,
@@ -89,6 +101,9 @@ impl App {
             surface_resize_count: 0,
             overwritten_frame_count: 0,
             exit_code: Code::SUCCESS,
+            is_fullscreen: false,
+            ctrl_pressed: false,
+            alt_pressed: false,
         })
     }
 
@@ -160,6 +175,9 @@ impl App {
                 height = self.buffer_size.1,
                 "First frame presented to the window"
             );
+            window_state
+                .window
+                .set_title(&format!("IronRDP \u{2014} {}", self.server_name));
         }
         trace!(
             frame_id = self.presented_frame_count,
@@ -208,7 +226,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window_attributes = WindowAttributes::default()
-            .with_title("IronRDP")
+            .with_title(format!("IronRDP \u{2014} Connecting to {}...", self.server_name))
             .with_inner_size(self.initial_size);
         match event_loop.create_window(window_attributes) {
             Ok(window) => {
@@ -255,6 +273,25 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                 // TODO(#110): File upload
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Intercept Ctrl+Alt+Enter before any other handling (including IME) to toggle
+                // borderless fullscreen locally without forwarding the key combo to the RDP session.
+                if event.state == event::ElementState::Pressed
+                    && self.ctrl_pressed
+                    && self.alt_pressed
+                    && event.physical_key.to_scancode() == Some(SCANCODE_ENTER)
+                {
+                    if self.is_fullscreen {
+                        window.set_fullscreen(None);
+                        self.is_fullscreen = false;
+                        debug!("Exited fullscreen mode");
+                    } else {
+                        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                        self.is_fullscreen = true;
+                        debug!("Entered fullscreen mode");
+                    }
+                    return;
+                }
+
                 if self.ime_preedit_active {
                     trace!("Ignoring raw keyboard input while IME preedit is active");
                     return;
@@ -299,6 +336,10 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                     trace!("Ignoring modifier changes while IME preedit is active");
                     return;
                 }
+
+                // Track Ctrl and Alt state for the Ctrl+Alt+Enter fullscreen toggle.
+                self.ctrl_pressed = modifiers.state().control_key();
+                self.alt_pressed = modifiers.state().alt_key();
 
                 const SHIFT_LEFT: ironrdp::input::Scancode = ironrdp::input::Scancode::from_u8(false, 0x2A);
                 const CONTROL_LEFT: ironrdp::input::Scancode = ironrdp::input::Scancode::from_u8(false, 0x1D);
@@ -520,11 +561,13 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                 }
             }
             RdpOutputEvent::ConnectionFailure(error) => {
+                window.set_title("IronRDP \u{2014} Connection Failed");
                 error!(?error);
                 eprintln!("Connection error: {}", error.report());
                 self.exit_with_code(event_loop, proc_exit::sysexits::PROTOCOL_ERR);
             }
             RdpOutputEvent::Terminated(result) => {
+                window.set_title("IronRDP \u{2014} Disconnected");
                 let exit_code = match result {
                     Ok(reason) => {
                         println!("Terminated gracefully: {reason}");
@@ -546,7 +589,21 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                 window.set_cursor_visible(true);
             }
             RdpOutputEvent::PointerPosition { x, y } => {
-                if let Err(error) = window.set_cursor_position(LogicalPosition::new(x, y)) {
+                // `x` and `y` are RDP guest desktop coordinates (buffer space). To correctly
+                // position the cursor on a HiDPI display we must map them back to physical
+                // window pixels — the exact inverse of the `CursorMoved` handler which maps
+                // physical pixels → buffer coordinates.
+                //
+                //   x_physical = x / buffer_width  * win_physical_width
+                //   y_physical = y / buffer_height * win_physical_height
+                //
+                // Using `PhysicalPosition` avoids a second DPI scale application that
+                // `LogicalPosition` would introduce, which misplaced the cursor at scales
+                // other than 100 %.
+                let win_size = window.inner_size();
+                let x_physical = f64::from(x) / f64::from(self.buffer_size.0) * f64::from(win_size.width);
+                let y_physical = f64::from(y) / f64::from(self.buffer_size.1) * f64::from(win_size.height);
+                if let Err(error) = window.set_cursor_position(PhysicalPosition::new(x_physical, y_physical)) {
                     error!(?error, "Failed to set cursor position");
                 }
             }
@@ -629,7 +686,7 @@ mod tests {
     #[test]
     fn queue_image_buffer_only_counts_pending_frames_as_overwritten() {
         let (sender, _receiver) = mpsc::unbounded_channel();
-        let mut app = App::new(&sender, PhysicalSize::new(640, 480)).expect("app");
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned()).expect("app");
         let width = NonZeroU16::new(640).expect("non-zero width");
         let height = NonZeroU16::new(480).expect("non-zero height");
 

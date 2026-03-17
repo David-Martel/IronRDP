@@ -22,6 +22,7 @@ use ironrdp::connector::ConnectionResult;
 use ironrdp::connector::connection_activation::{ConnectionActivationSequence, ConnectionActivationState};
 use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::rdp::multitransport::MultitransportResponsePdu;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{self, ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult};
@@ -61,6 +62,12 @@ struct SessionDriver {
     /// When set, a pacing timer is pending.  The session driver will wait for this
     /// instant before emitting the next dirty frame, coalescing server updates.
     frame_pacing_deadline: Option<TokioInstant>,
+    /// Accumulated dirty region across all graphics updates coalesced into the
+    /// next frame emission.  Stored as the axis-aligned bounding box of every
+    /// rectangle received since the last frame was emitted.  `None` means no
+    /// update has been recorded yet, or the previous frame was a full copy (e.g.
+    /// after a resize), so the next emission must also copy the full frame.
+    dirty_region: Option<InclusiveRectangle>,
 }
 
 impl SessionDriver {
@@ -82,6 +89,7 @@ impl SessionDriver {
             emitted_frame_count: 0,
             reconnect_resize_count: 0,
             frame_pacing_deadline: None,
+            dirty_region: None,
         }
     }
 
@@ -234,7 +242,10 @@ impl SessionDriver {
         let mut graphics_update_pending = false;
 
         for out in outputs {
-            if matches!(out, ActiveStageOutput::GraphicsUpdate(_)) {
+            if let ActiveStageOutput::GraphicsUpdate(region) = out {
+                // Coalesce consecutive updates into an axis-aligned bounding box
+                // stored on `self`.  The actual copy happens in `emit_image_update`.
+                union_dirty_region(&mut self.dirty_region, region);
                 graphics_update_pending = true;
                 continue;
             }
@@ -275,7 +286,8 @@ impl SessionDriver {
                     .map_err(|e| session::custom_err!("write response", e))?;
                 Ok(None)
             }
-            ActiveStageOutput::GraphicsUpdate(_region) => {
+            ActiveStageOutput::GraphicsUpdate(region) => {
+                union_dirty_region(&mut self.dirty_region, region);
                 self.queue_latest_image_update(event_loop_proxy)?;
                 Ok(None)
             }
@@ -330,9 +342,10 @@ impl SessionDriver {
 
     fn emit_image_update(&mut self, event_loop_proxy: &EventLoopProxy<RdpOutputEvent>) -> SessionResult<()> {
         let started_at = Instant::now();
+        let dirty = self.dirty_region.take();
         let mut buffer = core::mem::take(&mut self.reusable_frame_buffer);
         let copy_started_at = Instant::now();
-        copy_rgba_frame(self.image.data(), &mut buffer)?;
+        let partial = copy_rgba_frame(self.image.data(), &mut buffer, self.image.width(), dirty.as_ref())?;
         let copy_duration = copy_started_at.elapsed();
         let width = NonZeroU16::new(self.image.width()).ok_or_else(|| session::general_err!("width is zero"))?;
         let height = NonZeroU16::new(self.image.height()).ok_or_else(|| session::general_err!("height is zero"))?;
@@ -350,6 +363,7 @@ impl SessionDriver {
             width = width.get(),
             height = height.get(),
             pixels = usize::from(width.get()) * usize::from(height.get()),
+            partial_copy = partial,
             copy_micros = copy_duration.as_micros(),
             total_micros = started_at.elapsed().as_micros(),
             "Emitted image update"
@@ -411,6 +425,9 @@ impl SessionDriver {
             {
                 debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
                 self.image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                // Any accumulated dirty region from the prior image is now invalid;
+                // the next frame emission must copy the full (resized) frame.
+                self.dirty_region = None;
                 self.active_stage.reactivate_fastpath_processor(
                     io_channel_id,
                     user_channel_id,
@@ -422,6 +439,20 @@ impl SessionDriver {
                 self.active_stage.set_enable_server_pointer(enable_server_pointer);
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Expand `accumulated` to be the axis-aligned bounding box of itself and
+/// `new_rect`.  If `accumulated` is `None`, it is set to `new_rect`.
+fn union_dirty_region(accumulated: &mut Option<InclusiveRectangle>, new_rect: InclusiveRectangle) {
+    match accumulated {
+        None => *accumulated = Some(new_rect),
+        Some(existing) => {
+            existing.left = existing.left.min(new_rect.left);
+            existing.top = existing.top.min(new_rect.top);
+            existing.right = existing.right.max(new_rect.right);
+            existing.bottom = existing.bottom.max(new_rect.bottom);
         }
     }
 }
@@ -517,32 +548,78 @@ where
     Ok(RdpControlFlow::TerminatedGracefully(disconnect_reason))
 }
 
-fn copy_rgba_frame(image_data: &[u8], buffer: &mut Vec<u8>) -> SessionResult<()> {
-    let pixels = image_data.chunks_exact(4);
-    if !pixels.remainder().is_empty() {
+/// Copy the RGBA frame from `image_data` into `buffer`.
+///
+/// When `dirty` is `Some(rect)` and the buffer already holds a full frame of
+/// the correct size, only the rows `rect.top..=rect.bottom` are overwritten.
+/// All other rows retain their previous values from the recycled buffer, so
+/// the presentation backend always receives a complete, consistent frame.
+///
+/// When `dirty` is `None`, or when the buffer length does not match
+/// `image_data` (first frame, resize, etc.), a full copy is performed.
+///
+/// Returns `true` if a partial (dirty-region-only) copy was performed, or
+/// `false` if a full copy was performed.
+///
+/// # Errors
+///
+/// Returns an error if `image_data` length is not divisible by four.
+fn copy_rgba_frame(
+    image_data: &[u8],
+    buffer: &mut Vec<u8>,
+    width: u16,
+    dirty: Option<&InclusiveRectangle>,
+) -> SessionResult<bool> {
+    if !image_data.len().is_multiple_of(4) {
         return Err(session::general_err!("decoded image length is not divisible by four"));
     }
 
+    // Attempt a partial copy only when we have a valid dirty rect and the
+    // buffer is already fully populated (recycled from the previous frame).
+    if let Some(rect) = dirty
+        && buffer.len() == image_data.len()
+    {
+        // Number of bytes per row (4 bytes per RGBA pixel × width).
+        let stride = usize::from(width) * 4;
+
+        // Guard against a malformed rect that extends beyond the image.
+        let row_count = image_data.len() / stride.max(1);
+        let top = usize::from(rect.top);
+        let bottom = usize::from(rect.bottom).min(row_count.saturating_sub(1));
+
+        if top <= bottom && stride > 0 {
+            let src_start = top * stride;
+            let src_end = (bottom + 1) * stride;
+            buffer[src_start..src_end].copy_from_slice(&image_data[src_start..src_end]);
+            return Ok(true);
+        }
+    }
+
+    // Full copy: replaces buffer contents entirely.
     buffer.clear();
     buffer.extend_from_slice(image_data);
 
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_rgba_frame, finish_frame_present, should_emit_latest_image};
+    use ironrdp::pdu::geometry::InclusiveRectangle;
+
+    use super::{copy_rgba_frame, finish_frame_present, should_emit_latest_image, union_dirty_region};
 
     #[test]
     fn copy_rgba_frame_preserves_rgba_bytes() {
+        // 2-pixel image, 1 row wide=2
         let image = [
             0x11, 0x22, 0x33, 0xff, //
             0x44, 0x55, 0x66, 0x77,
         ];
         let mut buffer = Vec::new();
 
-        copy_rgba_frame(&image, &mut buffer).expect("copy frame");
+        let partial = copy_rgba_frame(&image, &mut buffer, 2, None).expect("copy frame");
 
+        assert!(!partial);
         assert_eq!(buffer, image);
     }
 
@@ -555,10 +632,66 @@ mod tests {
         let mut buffer = Vec::with_capacity(8);
         let initial_capacity = buffer.capacity();
 
-        copy_rgba_frame(&image, &mut buffer).expect("copy frame");
+        let partial = copy_rgba_frame(&image, &mut buffer, 2, None).expect("copy frame");
 
+        assert!(!partial);
         assert_eq!(buffer.len(), image.len());
         assert_eq!(buffer.capacity(), initial_capacity);
+    }
+
+    /// A 4×2 image (4 pixels wide, 2 rows).  We mark row 0 as dirty and
+    /// verify only that row is updated while row 1 retains its prior value.
+    #[test]
+    fn copy_rgba_frame_partial_updates_only_dirty_rows() {
+        // Row 0: four pixels (indices 0..=15), Row 1: four pixels (indices 16..=31)
+        let old_row0 = [0x00u8; 16];
+        let new_row0 = [0xAAu8; 16];
+        let old_row1 = [0xFFu8; 16];
+        let new_row1 = [0xFFu8; 16]; // same in source image
+
+        let mut image = [0u8; 32];
+        image[..16].copy_from_slice(&new_row0);
+        image[16..].copy_from_slice(&new_row1);
+
+        // Pre-populate the buffer with "stale" row 0 and sentinel row 1.
+        let mut buffer = Vec::with_capacity(32);
+        buffer.extend_from_slice(&old_row0);
+        buffer.extend_from_slice(&old_row1);
+
+        let dirty = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 3,
+            bottom: 0,
+        };
+
+        let partial = copy_rgba_frame(&image, &mut buffer, 4, Some(&dirty)).expect("partial copy");
+
+        assert!(partial, "expected a partial copy");
+        // Row 0 must be updated from the new image.
+        assert_eq!(&buffer[..16], &new_row0);
+        // Row 1 was not in the dirty rect so it keeps its old value.
+        assert_eq!(&buffer[16..], &old_row1);
+    }
+
+    /// When the buffer is empty (first frame), a dirty rect must fall back to
+    /// a full copy so the buffer is fully populated.
+    #[test]
+    fn copy_rgba_frame_partial_falls_back_when_buffer_empty() {
+        let image = [0xBBu8; 16];
+        let mut buffer = Vec::new(); // empty — no prior frame
+
+        let dirty = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 3,
+            bottom: 0,
+        };
+
+        let partial = copy_rgba_frame(&image, &mut buffer, 4, Some(&dirty)).expect("copy with empty buffer");
+
+        assert!(!partial, "must fall back to full copy when buffer is empty");
+        assert_eq!(buffer, image.as_ref());
     }
 
     #[test]
@@ -577,5 +710,46 @@ mod tests {
         assert!(finish_frame_present(&mut frame_in_flight, &mut latest_frame_dirty));
         assert!(!frame_in_flight);
         assert!(!latest_frame_dirty);
+    }
+
+    #[test]
+    fn union_dirty_region_starts_from_none() {
+        let mut acc: Option<InclusiveRectangle> = None;
+        let rect = InclusiveRectangle {
+            left: 10,
+            top: 20,
+            right: 30,
+            bottom: 40,
+        };
+        union_dirty_region(&mut acc, rect.clone());
+        assert_eq!(acc, Some(rect));
+    }
+
+    #[test]
+    fn union_dirty_region_expands_bounding_box() {
+        let mut acc = Some(InclusiveRectangle {
+            left: 10,
+            top: 20,
+            right: 30,
+            bottom: 40,
+        });
+        union_dirty_region(
+            &mut acc,
+            InclusiveRectangle {
+                left: 5,
+                top: 25,
+                right: 50,
+                bottom: 35,
+            },
+        );
+        assert_eq!(
+            acc,
+            Some(InclusiveRectangle {
+                left: 5,
+                top: 20,
+                right: 50,
+                bottom: 40,
+            })
+        );
     }
 }

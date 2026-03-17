@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context as _, bail};
-use cpal::traits::{DeviceTrait as _, HostTrait as _};
+use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use ironrdp_rdpsnd::client::RdpsndClientHandler;
 use ironrdp_rdpsnd::pdu::{AudioFormat, PitchPdu, VolumePdu, WaveFormat};
@@ -220,6 +220,9 @@ impl DecodeStream {
                 None,
             )
             .context("failed to setup output stream")?;
+
+        stream.play().context("start audio output stream")?;
+        debug!("Audio output stream started");
 
         Ok(Self {
             _dec_thread: dec_thread,

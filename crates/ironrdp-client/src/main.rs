@@ -26,7 +26,8 @@ fn main() -> anyhow::Result<()> {
         u32::from(config.connector.desktop_size.width),
         u32::from(config.connector.desktop_size.height),
     );
-    let mut app = App::new(&input_event_sender, initial_window_size).context("unable to initialize App")?;
+    let mut app = App::new(&input_event_sender, initial_window_size, config.destination.name().to_owned())
+        .context("unable to initialize App")?;
 
     config.connector.desktop_scale_factor = 0;
 
