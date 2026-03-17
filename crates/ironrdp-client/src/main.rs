@@ -18,6 +18,12 @@ fn main() -> anyhow::Result<()> {
 
     setup_logging(config.log_file.as_deref()).context("unable to initialize logging")?;
 
+    info!(
+        version = ironrdp_client::version::VERSION,
+        git_hash = ironrdp_client::version::GIT_HASH,
+        "IronRDP client starting"
+    );
+
     debug!("Initialize App");
     let event_loop = EventLoop::<RdpOutputEvent>::with_user_event().build()?;
     let event_loop_proxy = event_loop.create_proxy();

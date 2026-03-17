@@ -71,6 +71,13 @@ pub struct Config {
     /// to obtain DVC plugin COM objects. Example: `C:\Windows\System32\webauthn.dll`.
     #[cfg(windows)]
     pub dvc_plugins: Vec<PathBuf>,
+
+    /// Register the EGFX graphics pipeline DVC channel and log received PDUs.
+    ///
+    /// When enabled, the client advertises AVC420 capability and logs every GFX PDU
+    /// received from the server. This is useful for observing whether the server switches
+    /// from bitmap updates to EGFX traffic. Requires the `egfx` feature flag.
+    pub egfx: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -258,7 +265,7 @@ impl FromStr for DvcProxyInfo {
 /// Devolutions IronRDP client
 #[derive(Parser, Debug)]
 #[clap(author = "Devolutions", about = "Devolutions-IronRDP client")]
-#[clap(version, long_about = None)]
+#[clap(version = crate::version::VERSION, long_about = None)]
 struct Args {
     /// A file with IronRDP client logs
     #[clap(short, long, value_parser)]
@@ -416,6 +423,13 @@ struct Args {
     #[cfg(windows)]
     #[clap(long)]
     dvc_plugin: Vec<PathBuf>,
+
+    /// Enable experimental EGFX graphics pipeline (logs GFX PDUs, does not decode H.264)
+    ///
+    /// Registers the RDPEGFX DVC channel and advertises AVC420 capability so the server
+    /// may switch from bitmap updates to EGFX traffic. Requires the `egfx` feature.
+    #[clap(long, default_value_t = false)]
+    egfx: bool,
 }
 
 impl Config {
@@ -566,10 +580,10 @@ impl Config {
             desktop_size,
             desktop_scale_factor: 0, // Default to 0 per FreeRDP
             bitmap: Some(bitmap),
-            client_build: semver::Version::parse(env!("CARGO_PKG_VERSION"))
-                .map_or(0, |version| version.major * 100 + version.minor * 10 + version.patch)
+            client_build: semver::Version::parse(crate::version::VERSION)
+                .map_or(0, |v| v.major * 100 + v.minor * 10 + v.patch)
                 .pipe(u32::try_from)
-                .context("cargo package version")?,
+                .context("build version")?,
             client_name: whoami::hostname().unwrap_or_else(|_| "ironrdp".to_owned()),
             // NOTE: hardcode this value like in freerdp
             // https://github.com/FreeRDP/FreeRDP/blob/4e24b966c86fdf494a782f0dfcfc43a057a2ea60/libfreerdp/core/settings.c#LL49C34-L49C70
@@ -612,6 +626,7 @@ impl Config {
             dvc_pipe_proxies: args.dvc_proxy,
             #[cfg(windows)]
             dvc_plugins: args.dvc_plugin,
+            egfx: args.egfx,
         })
     }
 }

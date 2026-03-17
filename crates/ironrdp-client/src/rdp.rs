@@ -39,6 +39,33 @@ use winit::event_loop::EventLoopProxy;
 use crate::config::{Config, RDCleanPathConfig};
 use crate::session_driver::{RdpControlFlow, run_active_session};
 
+/// Logging-only EGFX graphics pipeline handler.
+///
+/// Advertises AVC420 capability so that the server may choose to switch from bitmap
+/// updates to EGFX traffic.  Every received GFX PDU is logged at `debug` level.
+/// This handler intentionally does not decode H.264 frames.
+///
+/// # Errors
+///
+/// This handler does not return errors from `handle_pdu`.
+#[cfg(feature = "egfx")]
+struct LoggingEgfxHandler;
+
+#[cfg(feature = "egfx")]
+impl ironrdp_egfx::client::GraphicsPipelineHandler for LoggingEgfxHandler {
+    fn capabilities(&self) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
+        // Advertise V8_1 with AVC420_ENABLED to encourage the server to switch
+        // from bitmap updates to EGFX traffic (MS-RDPEGFX 2.2.3.2).
+        vec![ironrdp_egfx::pdu::CapabilitySet::V8_1 {
+            flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED,
+        }]
+    }
+
+    fn handle_pdu(&mut self, pdu: ironrdp_egfx::pdu::GfxPdu) {
+        debug!(?pdu, "Received EGFX GFX PDU");
+    }
+}
+
 #[derive(Debug)]
 pub enum RdpOutputEvent {
     Image {
@@ -304,6 +331,15 @@ async fn connect(
         drdynvc = drdynvc.with_dynamic_channel(dvc_pipe_proxy_factory.create(channel_name, pipe_name));
     }
 
+    // Register EGFX graphics pipeline DVC channel (requires `egfx` feature)
+    #[cfg(feature = "egfx")]
+    if config.egfx {
+        info!("Registering EGFX graphics pipeline DVC channel");
+        drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
+            Box::new(LoggingEgfxHandler),
+        ));
+    }
+
     // Load DVC COM plugins (Windows only)
     #[cfg(windows)]
     {
@@ -434,6 +470,15 @@ async fn connect_ws(
         trace!(%channel_name, %pipe_name, "Creating DVC proxy");
 
         drdynvc = drdynvc.with_dynamic_channel(dvc_pipe_proxy_factory.create(channel_name, pipe_name));
+    }
+
+    // Register EGFX graphics pipeline DVC channel (requires `egfx` feature)
+    #[cfg(feature = "egfx")]
+    if config.egfx {
+        info!("Registering EGFX graphics pipeline DVC channel");
+        drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
+            Box::new(LoggingEgfxHandler),
+        ));
     }
 
     // Load DVC COM plugins (Windows only)

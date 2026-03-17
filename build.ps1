@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('check', 'client', 'ffi', 'test', 'coverage', 'fmt', 'lints', 'package', 'publish', 'doctor', 'hyperv-live', 'hyperv-suite', 'all')]
+    [ValidateSet('check', 'client', 'deploy', 'deploy-suite', 'ffi', 'test', 'coverage', 'fmt', 'lints', 'package', 'publish', 'doctor', 'hyperv-live', 'hyperv-suite', 'all')]
     [string]$Mode = 'all',
 
     [switch]$Release,
@@ -33,7 +33,7 @@ param(
     [string]$HyperVScenarioSet = 'quick',
     [int]$SuiteDurationSeconds = 30,
     [int]$SuiteSampleIntervalMs = 500,
-    [string]$HyperVGuestWorkload = 'notepad'
+    [string]$HyperVGuestWorkload = 'file-write'
 )
 
 Set-StrictMode -Version Latest
@@ -704,12 +704,51 @@ function Initialize-PreferredToolchainContext {
     }
 }
 
+function Get-CrateVersionFromManifest {
+    param([Parameter(Mandatory)][string]$ManifestPath)
+
+    if (-not (Test-Path -LiteralPath $ManifestPath)) {
+        return $null
+    }
+
+    foreach ($line in (Get-Content -LiteralPath $ManifestPath)) {
+        if ($line -match '^\s*version\s*=\s*"([^"]+)"\s*$') {
+            return $Matches[1]
+        }
+    }
+
+    return $null
+}
+
+function Get-IronRdpClientBuildVersion {
+    $clientManifest = Join-Path $RepoRoot 'crates\ironrdp-client\Cargo.toml'
+    $clientVersion = Get-CrateVersionFromManifest -ManifestPath $clientManifest
+    if ([string]::IsNullOrWhiteSpace($clientVersion)) {
+        return (Get-NestedValue $script:VersionInfo @('SemVer'))
+    }
+
+    $hash = Get-NestedValue $script:VersionInfo @('GitHashShort')
+    $isDirty = [bool](Get-NestedValue $script:VersionInfo @('IsDirty'))
+    $commitsSinceTag = Get-NestedValue $script:VersionInfo @('CommitsSinceTag')
+    $commitsCount = if ($commitsSinceTag -is [ValueType]) { [int]$commitsSinceTag } elseif ($commitsSinceTag) { [int]$commitsSinceTag } else { 0 }
+
+    if ([string]::IsNullOrWhiteSpace($hash)) {
+        return $clientVersion
+    }
+
+    if ($commitsCount -le 0 -and -not $isDirty) {
+        return $clientVersion
+    }
+
+    return '{0}-dev.{1}+{2}' -f $clientVersion, $commitsCount, $hash
+}
+
 function Set-DeploymentMetadataEnvironment {
     Set-DefaultEnvVar -Name 'IRONRDP_DEPLOYMENT_NAME' -Value $script:DeploymentName
     Set-DefaultEnvVar -Name 'IRONRDP_MACHINE_IDENTITY' -Value $script:MachineIdentity
     Set-DefaultEnvVar -Name 'IRONRDP_TARGET_MACHINE' -Value $TargetMachine
     Set-DefaultEnvVar -Name 'IRONRDP_ARTIFACT_ROOT' -Value $script:ArtifactRoot
-    Set-DefaultEnvVar -Name 'IRONRDP_BUILD_VERSION' -Value (Get-NestedValue $script:VersionInfo @('SemVer'))
+    Set-DefaultEnvVar -Name 'IRONRDP_BUILD_VERSION' -Value (Get-IronRdpClientBuildVersion)
     Set-DefaultEnvVar -Name 'IRONRDP_BUILD_CLASS' -Value (Get-NestedValue $script:HardwareProfile @('buildClass'))
     Set-DefaultEnvVar -Name 'IRONRDP_PRIMARY_NETWORK_GBPS' -Value "$([string](Get-NestedValue $script:HardwareProfile @('fastestNetworkGbps')))"
 }
@@ -947,6 +986,50 @@ function Publish-BuildOutputs {
     return $publishedArtifacts
 }
 
+function Deploy-ClientBinary {
+    # Resolve the built client binary using the same pattern as Publish-BuildOutputs.
+    # Always operates against the production profile (deploy modes always set $Release = $true).
+    $clientProfile = $ClientBuildProfile
+    $clientDir = Resolve-CargoTargetDirectory -ProjectDir $RepoRoot -Configuration 'Release'
+    if ($clientProfile -ne 'debug' -and -not $clientDir.EndsWith($clientProfile, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $clientDir = Join-Path (Split-Path -Parent $clientDir) $clientProfile
+    }
+    $clientExe = Join-Path $clientDir 'ironrdp-client.exe'
+
+    if (-not (Test-Path -LiteralPath $clientExe -PathType Leaf)) {
+        throw "client binary not found after build: $clientExe"
+    }
+
+    $deployDir = Join-Path $script:ArtifactRoot 'client'
+    if (-not (Test-Path -LiteralPath $deployDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $deployDir -Force | Out-Null
+    }
+
+    $destExe = Join-Path $deployDir 'ironrdp-client.exe'
+    Copy-Item -LiteralPath $clientExe -Destination $destExe -Force
+
+    $fileSize = (Get-Item $destExe).Length
+    Write-Host ""
+    Write-Host "  Deployed: $destExe" -ForegroundColor Green
+    Write-Host "  Size:     $([math]::Round($fileSize / 1MB, 2)) MB"
+    Write-Host "  Version:  $(if ($script:VersionInfo) { $script:VersionInfo.SemVer } else { 'unknown' })"
+    Write-Host "  Artifact: $($script:ArtifactRoot)"
+    Write-Host ""
+
+    # Stamp the manifest with deploy metadata if one already exists.
+    $manifestPath = Join-Path $script:ArtifactRoot 'build-manifest.json'
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        try {
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            $manifest | Add-Member -NotePropertyName 'lastDeployTimestamp' -NotePropertyValue (Get-Date -Format 'o') -Force
+            $manifest | Add-Member -NotePropertyName 'lastDeployVersion' -NotePropertyValue $(if ($script:VersionInfo) { $script:VersionInfo.SemVer } else { 'unknown' }) -Force
+            $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+        } catch {
+            Write-Warning "Could not update build manifest: $_"
+        }
+    }
+}
+
 function Publish-DeploymentSupportFiles {
     $publishedArtifacts = New-Object System.Collections.Generic.List[object]
     $supportFiles = @(
@@ -1124,6 +1207,229 @@ function Publish-InstallerArtifacts {
     )
 }
 
+function Write-DoctorReport {
+    # Read the pinned toolchain channel from rust-toolchain.toml.
+    $pinnedVersion = $null
+    $toolchainToml = Join-Path $RepoRoot 'rust-toolchain.toml'
+    if (Test-Path -LiteralPath $toolchainToml) {
+        $tomlContent = Get-Content -LiteralPath $toolchainToml -Raw -ErrorAction SilentlyContinue
+        if ($tomlContent) {
+            $tomlMatch = [regex]::Match($tomlContent, 'channel\s*=\s*"([^"]+)"')
+            if ($tomlMatch.Success) { $pinnedVersion = $tomlMatch.Groups[1].Value }
+        }
+    }
+
+    # Probe the stable alias version (may differ from the pinned toolchain).
+    $stableVersion = $null
+    try {
+        $stableOutput = (& rustup run stable rustc --version 2>$null) -join ' '
+        $stableMatch = [regex]::Match($stableOutput, 'rustc\s+([\d.]+)')
+        if ($stableMatch.Success) { $stableVersion = $stableMatch.Groups[1].Value }
+    } catch {}
+
+    # Probe the active (pinned) rustc version.
+    $activeRustcVersion = $null
+    try {
+        $rustcOutput = (& rustc --version 2>$null) -join ' '
+        $rustcMatch = [regex]::Match($rustcOutput, 'rustc\s+([\d.]+)')
+        if ($rustcMatch.Success) { $activeRustcVersion = $rustcMatch.Groups[1].Value }
+    } catch {}
+
+    # Probe sccache daemon health.
+    $sccacheHealthy = $false
+    if (Get-NestedValue $script:ToolchainInfo @('commands', 'sccache')) {
+        try {
+            $null = & sccache --show-stats 2>$null
+            $sccacheHealthy = ($LASTEXITCODE -eq 0)
+        } catch {}
+    }
+
+    # Resolve MSVC version string.
+    $msvcVersion = Get-NestedValue $script:ToolchainInfo @('visualStudio', 'msvcVersion')
+    $msvcPresent = -not [string]::IsNullOrWhiteSpace($msvcVersion)
+
+    # Resolve CargoTools module presence.
+    $cargoToolsLoaded = $script:ImportedModules.Contains('CargoTools')
+
+    # Resolve .NET SDK version.
+    $dotnetVersion = $null
+    $dotnetPath = Get-NestedValue $script:ToolchainInfo @('commands', 'dotnet')
+    if ($dotnetPath) {
+        try {
+            $dotnetOutput = (& $dotnetPath --version 2>$null) -join ' '
+            $dotnetMatch = [regex]::Match($dotnetOutput, '([\d.]+)')
+            if ($dotnetMatch.Success) { $dotnetVersion = $dotnetMatch.Groups[1].Value }
+        } catch {}
+    }
+
+    # Resolve optional tool presence from already-probed ToolchainInfo.
+    $llvmRoot    = Get-NestedValue $script:ToolchainInfo @('llvm', 'root')
+    $llvmVersion = Get-NestedValue $script:ToolchainInfo @('llvm', 'version')
+    $nasmPath    = Get-NestedValue $script:ToolchainInfo @('commands', 'nasm')
+    $ninjaPath   = Get-NestedValue $script:ToolchainInfo @('commands', 'ninja')
+    $oneApiRoot  = Get-NestedValue $script:ToolchainInfo @('oneApi', 'root')
+    $cudaVersion = Get-NestedValue $script:ToolchainInfo @('cuda', 'version')
+
+    # Check if NASM version can be read (invoke by full path to avoid PATH resolution issues).
+    $nasmVersion = $null
+    if ($nasmPath) {
+        try {
+            $nasmOut = (& $nasmPath --version 2>$null) -join ' '
+            $nasmMatch = [regex]::Match($nasmOut, '(\d+\.\d+[\d.]*)')
+            if ($nasmMatch.Success) { $nasmVersion = $nasmMatch.Groups[1].Value }
+        } catch {}
+    }
+
+    # Check if Ninja version can be read (invoke by full path to avoid PATH resolution issues).
+    $ninjaVersion = $null
+    if ($ninjaPath) {
+        try {
+            $ninjaOut = (& $ninjaPath --version 2>$null) -join ' '
+            $ninjaMatch = [regex]::Match($ninjaOut, '(\d+\.\d+[\d.]*)')
+            if ($ninjaMatch.Success) { $ninjaVersion = $ninjaMatch.Groups[1].Value }
+        } catch {}
+    }
+
+    # Check for global.json next to the .NET project.
+    $dotnetProjectDir = Split-Path -Parent $DotNetProject
+    $globalJsonPath = Join-Path $dotnetProjectDir 'global.json'
+    $globalJsonPresent = Test-Path -LiteralPath $globalJsonPath
+
+    # ---- helpers ----
+    function Format-DoctorRow {
+        param(
+            [string]$Tag,
+            [string]$Label,
+            [string]$Detail,
+            [System.ConsoleColor]$TagColor
+        )
+        $tagPadded   = $Tag.PadRight(11)
+        $labelPadded = $Label.PadRight(24)
+        Write-Host "  " -NoNewline
+        Write-Host $tagPadded -ForegroundColor $TagColor -NoNewline
+        Write-Host "$labelPadded $Detail"
+    }
+
+    # ---- header ----
+    Write-Host ''
+    Write-Host '=== Doctor Report ===' -ForegroundColor White
+    Write-Host ''
+
+    # ---- REQUIRED section ----
+    Write-Host 'REQUIRED:' -ForegroundColor White
+
+    # Rust toolchain (active rustc vs pinned)
+    if ($activeRustcVersion) {
+        $rustDetail = "$activeRustcVersion (pinned)"
+        if ($pinnedVersion -and $activeRustcVersion -ne $pinnedVersion) {
+            $rustDetail = "$activeRustcVersion (MISMATCH: toolchain.toml pins $pinnedVersion)"
+        }
+        Format-DoctorRow -Tag '[PASS]' -Label 'Rust toolchain' -Detail $rustDetail -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[FAIL]' -Label 'Rust toolchain' -Detail 'rustc not found in PATH' -TagColor Red
+    }
+
+    # MSVC
+    if ($msvcPresent) {
+        Format-DoctorRow -Tag '[PASS]' -Label 'MSVC' -Detail $msvcVersion -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[FAIL]' -Label 'MSVC' -Detail 'Visual Studio with VC++ tools not found' -TagColor Red
+    }
+
+    # CargoTools module
+    if ($cargoToolsLoaded) {
+        $cargoToolsVersion = if ($script:ImportedModules['CargoTools'] -and $script:ImportedModules['CargoTools']['version']) {
+            $script:ImportedModules['CargoTools']['version']
+        } else {
+            'loaded'
+        }
+        Format-DoctorRow -Tag '[PASS]' -Label 'CargoTools module' -Detail $cargoToolsVersion -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[FAIL]' -Label 'CargoTools module' -Detail 'module not loaded' -TagColor Red
+    }
+
+    # Stable alias drift check
+    if ($stableVersion -and $pinnedVersion -and $stableVersion -ne $pinnedVersion) {
+        Format-DoctorRow -Tag '[WARN]' -Label 'Stable alias' -Detail "$stableVersion (drift from pinned $pinnedVersion)" -TagColor Yellow
+    } elseif ($stableVersion -and $pinnedVersion) {
+        Format-DoctorRow -Tag '[PASS]' -Label 'Stable alias' -Detail "$stableVersion (matches pinned)" -TagColor Green
+    } elseif ($stableVersion) {
+        Format-DoctorRow -Tag '[PASS]' -Label 'Stable alias' -Detail $stableVersion -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[WARN]' -Label 'Stable alias' -Detail 'could not probe (rustup run stable rustc --version failed)' -TagColor Yellow
+    }
+
+    # sccache health
+    $sccachePath = Get-NestedValue $script:ToolchainInfo @('commands', 'sccache')
+    if ($sccachePath) {
+        if ($sccacheHealthy) {
+            Format-DoctorRow -Tag '[PASS]' -Label 'sccache' -Detail 'healthy' -TagColor Green
+        } else {
+            Format-DoctorRow -Tag '[WARN]' -Label 'sccache' -Detail 'daemon not running or unhealthy' -TagColor Yellow
+        }
+    } else {
+        Format-DoctorRow -Tag '[WARN]' -Label 'sccache' -Detail 'not found in PATH (builds will not be cached)' -TagColor Yellow
+    }
+
+    # ---- OPTIONAL section ----
+    Write-Host ''
+    Write-Host 'OPTIONAL:' -ForegroundColor White
+
+    # LLVM/lld
+    if ($llvmRoot) {
+        $llvmDetail = if ($llvmVersion) { "$llvmRoot (clang $llvmVersion)" } else { $llvmRoot }
+        Format-DoctorRow -Tag '[PRESENT]' -Label 'LLVM/lld' -Detail $llvmDetail -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[ABSENT]' -Label 'LLVM/lld' -Detail '(lld linker unavailable — builds will use MSVC link.exe)' -TagColor DarkGray
+    }
+
+    # .NET SDK
+    if ($dotnetVersion) {
+        Format-DoctorRow -Tag '[PRESENT]' -Label '.NET SDK' -Detail $dotnetVersion -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[ABSENT]' -Label '.NET SDK' -Detail '(FFI .NET bindings will be skipped)' -TagColor DarkGray
+    }
+
+    # NASM
+    if ($nasmPath) {
+        $nasmDetail = if ($nasmVersion) { $nasmVersion } else { $nasmPath }
+        Format-DoctorRow -Tag '[PRESENT]' -Label 'NASM' -Detail $nasmDetail -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[ABSENT]' -Label 'NASM' -Detail '(assembler not found)' -TagColor DarkGray
+    }
+
+    # Ninja
+    if ($ninjaPath) {
+        $ninjaDetail = if ($ninjaVersion) { $ninjaVersion } else { $ninjaPath }
+        Format-DoctorRow -Tag '[PRESENT]' -Label 'Ninja' -Detail $ninjaDetail -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[ABSENT]' -Label 'Ninja' -Detail '(cmake will fall back to MSBuild)' -TagColor DarkGray
+    }
+
+    # oneAPI
+    if ($oneApiRoot) {
+        Format-DoctorRow -Tag '[PRESENT]' -Label 'oneAPI' -Detail $oneApiRoot -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[ABSENT]' -Label 'oneAPI' -Detail '(Intel oneAPI not installed)' -TagColor DarkGray
+    }
+
+    # CUDA
+    if ($cudaVersion) {
+        Format-DoctorRow -Tag '[PRESENT]' -Label 'CUDA' -Detail $cudaVersion -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[ABSENT]' -Label 'CUDA' -Detail '(NVIDIA CUDA toolkit not installed)' -TagColor DarkGray
+    }
+
+    # global.json
+    if ($globalJsonPresent) {
+        Format-DoctorRow -Tag '[PRESENT]' -Label 'global.json' -Detail $globalJsonPath -TagColor Green
+    } else {
+        Format-DoctorRow -Tag '[ABSENT]' -Label 'global.json' -Detail "(no .NET SDK pin -- consider adding $globalJsonPath)" -TagColor DarkGray
+    }
+
+    Write-Host ''
+}
+
 function Write-BuildManifest {
     param([object[]]$Artifacts = @())
 
@@ -1246,7 +1552,7 @@ try {
         Add-RustFlag -Flags @('-C', 'target-cpu=native')
     }
 
-    $portableWindowsRuntimeModes = @('package', 'publish')
+    $portableWindowsRuntimeModes = @('package', 'publish', 'deploy', 'deploy-suite')
     if ($portableWindowsRuntimeModes -contains $Mode) {
         Add-RustFlag -Flags @('-C', 'target-feature=+crt-static')
         $env:IRONRDP_WINDOWS_RUNTIME = 'static-msvc-crt'
@@ -1286,6 +1592,44 @@ try {
             $clientArgs = @('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile)
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs $clientArgs -SupportsTimings)
         }
+        'deploy' {
+            # Always build release; static CRT is added to RUSTFLAGS above via $portableWindowsRuntimeModes.
+            $Release = $true
+            $clientArgs = @('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $ClientBuildProfile)
+            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs $clientArgs -SupportsTimings)
+            Deploy-ClientBinary
+            Write-Host "  Ready for: build.ps1 -Mode hyperv-suite" -ForegroundColor Cyan
+            Write-Host ""
+        }
+        'deploy-suite' {
+            # Phase 1: build and deploy the client binary to the artifact root.
+            $Release = $true
+            $clientArgs = @('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $ClientBuildProfile)
+            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs $clientArgs -SupportsTimings)
+            Deploy-ClientBinary
+
+            # Phase 2: run the Hyper-V e2e suite against the freshly deployed binary.
+            $suiteScript = Join-Path $RepoRoot 'scripts\windows\Invoke-HyperVE2ESuite.ps1'
+            if (-not (Test-Path -LiteralPath $suiteScript -PathType Leaf)) {
+                throw "Hyper-V e2e suite script not found: $suiteScript"
+            }
+
+            $manifestPath = Join-Path $script:ArtifactRoot 'build-manifest.json'
+            if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+                Write-Warning "No build manifest found at '$manifestPath'; suite will run against the deployed binary without full package metadata"
+            }
+
+            & $suiteScript `
+                -PackageRoot $script:ArtifactRoot `
+                -VmName $HyperVVmName `
+                -Username $HyperVUsername `
+                -Password $HyperVPassword `
+                -ScenarioSet $HyperVScenarioSet `
+                -DurationSeconds $SuiteDurationSeconds `
+                -SampleIntervalMs $SuiteSampleIntervalMs `
+                -Multitransport $LiveTestMultitransport `
+                -GuestWorkload $HyperVGuestWorkload
+        }
         'ffi' {
             $ffiProfile = if ($Release) { $FfiBuildProfile } else { '' }
             $ffiArgs = @('build', '--package', 'ffi') + (Get-ProfileArgs $ffiProfile)
@@ -1313,6 +1657,7 @@ try {
             Invoke-RepoCargo -ArgumentList @('xtask', 'check', 'lints', '-v')
         }
         'doctor' {
+            Write-DoctorReport
             Write-BuildManifest
         }
         'hyperv-live' {

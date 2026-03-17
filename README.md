@@ -128,12 +128,12 @@ That suite captures:
 
 - connection-established, first-image, and first-frame timing
 - frame cadence and image cadence summaries
-- software present timing and overwritten-frame counts
+- software present timing, surface-acquire timing, and redraw-pressure counters
 - compression mix and bitmap characteristics
 - bounded resize, mouse-input, and clipboard-mutation scenarios against the running guest
 - guest-side control over WinRM instead of only Hyper-V-local remoting
 - explicit capability reporting for clipboard, audio wiring, and currently unsupported device redirection
-- per-scenario health summaries with failures, warnings, staged clipboard/audio observations, and workload-stage diagnosis
+- per-scenario health summaries with failures, warnings, staged clipboard/audio observations, workload-stage diagnosis, and workload launch mode reporting
 
 Current measured Hyper-V e2e findings on this branch:
 
@@ -144,9 +144,10 @@ Current measured Hyper-V e2e findings on this branch:
 - the native client no longer overwrites queued frames in the current resize workload after the pacing/coalescing pass
 - resize scenarios now show client-handled clipboard activity, but guest-side text verification is still not proven end to end
 - the guest-control path now enables and verifies WinRM, then reuses stored Credential Manager entries for `WSMAN/` and `TERMSRV/` access
-- suite summaries now call out workload-stage quality explicitly; the current guest workload still falls back to session `0`
+- the default guest workload is now a direct WinRM-backed file write, so baseline and resize scenarios no longer depend on Notepad or a fragile session-`0` fallback just to prove guest-side activity
+- suite summaries now call out workload-stage quality and launch mode explicitly; the current validated baseline is `remote-file-write`, while a fully interactive in-session workload is still a follow-up item
 - the suite now drives a deliberate guest-side audio pulse and can reach `playback-observed` in live runs, but a stronger interactive workload is still needed for deterministic app-driven audio assertions
-- backend-local `softbuffer` conversion and present time are still the main client-side render bottlenecks
+- backend-local `softbuffer` conversion and present time are still the main client-side render bottlenecks, and the suite now separates surface acquisition cost from conversion/present cost when diagnosing that path
 
 ### [`screenshot`](https://github.com/Devolutions/IronRDP/blob/master/crates/ironrdp/examples/screenshot.rs)
 

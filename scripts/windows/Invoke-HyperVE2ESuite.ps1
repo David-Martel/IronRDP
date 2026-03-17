@@ -20,7 +20,7 @@ param(
     [string]$Multitransport = 'off',
     [ValidateSet('default', 'windows', 'stub', 'none')]
     [string]$ClipboardType = 'default',
-    [string]$GuestWorkload = 'notepad',
+    [string]$GuestWorkload = 'file-write',
     [int]$Width = 1280,
     [int]$Height = 720,
     [string]$OutputRoot
@@ -213,6 +213,7 @@ public static class IronRdpWindowInterop {
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
 }
 "@
 }
@@ -244,7 +245,7 @@ function Wait-ForMainWindow {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        $proc = Get-LiveProcessById -ProcessId $ProcessId
         if (-not $proc) {
             return $null
         }
@@ -258,6 +259,18 @@ function Wait-ForMainWindow {
     } while ((Get-Date) -lt $deadline)
 
     return $proc
+}
+
+function Get-LiveProcessById {
+    param([Parameter(Mandatory)][int]$ProcessId)
+
+    try {
+        $process = [System.Diagnostics.Process]::GetProcessById($ProcessId)
+        $process.Refresh()
+        return $process
+    } catch {
+        return $null
+    }
 }
 
 function Resize-ClientWindow {
@@ -369,15 +382,20 @@ function Invoke-ClientGuestWorkload {
 
     $searchText = switch ($Workload) {
         'calc' { 'calculator' }
+        'mspaint' { 'paint' }
+        'powershell' { 'powershell' }
+        'notepad' { 'notepad' }
         default { $Workload }
     }
 
+    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    Start-Sleep -Milliseconds 150
     [System.Windows.Forms.SendKeys]::SendWait('^{ESC}')
-    Start-Sleep -Milliseconds 400
+    Start-Sleep -Milliseconds 450
     [System.Windows.Forms.SendKeys]::SendWait($searchText)
-    Start-Sleep -Milliseconds 300
+    Start-Sleep -Milliseconds 650
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-    Start-Sleep -Milliseconds 800
+    Start-Sleep -Milliseconds 1200
 
     [pscustomobject]@{
         workload = $Workload
@@ -522,6 +540,48 @@ function Invoke-GuestWorkload {
         return $null
     }
 
+    if ($Workload -eq 'file-write') {
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $result = Invoke-GuestCommand -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+            $directory = Join-Path $env:TEMP 'IronRdp-E2E'
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+
+            $timestamp = Get-Date
+            $path = Join-Path $directory ("workload-{0:yyyyMMdd-HHmmssfff}.txt" -f $timestamp)
+            $content = @(
+                "IronRDP Hyper-V guest workload"
+                "timestamp=$($timestamp.ToString('o'))"
+                "computer=$env:COMPUTERNAME"
+                "user=$env:USERNAME"
+            ) -join [Environment]::NewLine
+
+            Set-Content -LiteralPath $path -Value $content -Encoding UTF8
+            $item = Get-Item -LiteralPath $path
+
+            [pscustomobject]@{
+                workload = 'file-write'
+                path = $path
+                bytes = $item.Length
+                processName = $null
+                launchMode = 'winrm-file-write'
+                started = $true
+                interactiveWindow = $false
+                interactiveSession = $false
+                sessionZeroFallback = $false
+                remoteFileWrite = $true
+                lastWriteTimeUtc = $item.LastWriteTimeUtc.ToString('o')
+            }
+        }
+
+        if ($result) {
+            if (-not ($result.PSObject.Properties.Name -contains 'launchMs')) {
+                $result | Add-Member -NotePropertyName 'launchMs' -NotePropertyValue ([math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2))
+            }
+        }
+
+        return $result
+    }
+
     $plainPassword = $Credential.GetNetworkCredential().Password
     $interactiveLaunchError = $null
 
@@ -538,7 +598,7 @@ function Invoke-GuestWorkload {
             do {
                 Start-Sleep -Milliseconds 300
                 $interactiveProcess = Get-GuestProcessSnapshot -ComputerName $ComputerName -Credential $Credential -ProcessName $interactiveProcessName
-            } while ($probeStopwatch.Elapsed.TotalSeconds -lt 2.5 -and (-not $interactiveProcess -or $interactiveProcess.sessionId -le 0))
+            } while ($probeStopwatch.Elapsed.TotalSeconds -lt 8 -and (-not $interactiveProcess -or $interactiveProcess.sessionId -le 0))
 
             if ($interactiveProcess -and $interactiveProcess.sessionId -gt 0) {
                 return [pscustomobject]@{
@@ -579,26 +639,114 @@ function Invoke-GuestWorkload {
             throw "unsupported guest workload: $Workload"
         }
 
+        function Get-InteractiveExplorerSession {
+            param([Parameter(Mandatory)][string]$PreferredUser)
+
+            $preferredLeaf = (($PreferredUser -replace '^[.\\]+', '') -split '\\')[-1]
+            $candidates = @(
+                Get-Process -Name explorer -IncludeUserName -ErrorAction SilentlyContinue |
+                    Where-Object { $_.SessionId -gt 0 -and -not [string]::IsNullOrWhiteSpace($_.UserName) } |
+                    Sort-Object StartTime -Descending
+            )
+
+            if (-not $candidates -or $candidates.Count -eq 0) {
+                return $null
+            }
+
+            $preferred = $candidates |
+                Where-Object { (($_.UserName -split '\\')[-1]) -ieq $preferredLeaf } |
+                Select-Object -First 1
+
+            $selected = if ($preferred) { $preferred } else { $candidates | Select-Object -First 1 }
+            if (-not $selected) {
+                return $null
+            }
+
+            [pscustomobject]@{
+                userName = $selected.UserName
+                sessionId = $selected.SessionId
+            }
+        }
+
+        function New-ScheduledTaskCommandLine {
+            param([Parameter(Mandatory)][object]$WorkloadSpec)
+
+            if ([string]::IsNullOrWhiteSpace($WorkloadSpec.arguments)) {
+                return $WorkloadSpec.filePath
+            }
+
+            return '"{0}" {1}' -f $WorkloadSpec.filePath, $WorkloadSpec.arguments
+        }
+
+        function Start-InteractiveScheduledTask {
+            param(
+                [Parameter(Mandatory)][string]$TaskName,
+                [Parameter(Mandatory)][object]$WorkloadSpec,
+                [Parameter(Mandatory)][string]$UserName,
+                [Parameter(Mandatory)][string]$Password
+            )
+
+            $startTime = (Get-Date).AddMinutes(1).ToString('HH:mm')
+            $taskCommand = New-ScheduledTaskCommandLine -WorkloadSpec $WorkloadSpec
+
+            & schtasks.exe /Create /TN $TaskName /SC ONCE /ST $startTime /RL HIGHEST /RU $UserName /RP $Password /IT /TR $taskCommand /F | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "schtasks /Create failed with exit code $LASTEXITCODE"
+            }
+
+            & schtasks.exe /Run /TN $TaskName | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "schtasks /Run failed with exit code $LASTEXITCODE"
+            }
+        }
+
         $taskName = "IronRdp-E2E-$([Guid]::NewGuid().ToString('N'))"
+        $interactiveTaskName = "IronRdp-E2E-Interactive-$([Guid]::NewGuid().ToString('N'))"
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $process = $null
         $launchMode = 'scheduled-task'
         $scheduledTaskError = $null
+        $interactiveTaskError = $null
+        $interactiveSession = Get-InteractiveExplorerSession -PreferredUser $UserName
 
         try {
-            try {
-                $action = if ([string]::IsNullOrWhiteSpace($workloadSpec.arguments)) {
-                    New-ScheduledTaskAction -Execute $workloadSpec.filePath
-                } else {
-                    New-ScheduledTaskAction -Execute $workloadSpec.filePath -Argument $workloadSpec.arguments
-                }
+            if ($interactiveSession) {
+                try {
+                    Start-InteractiveScheduledTask -TaskName $interactiveTaskName -WorkloadSpec $workloadSpec -UserName $interactiveSession.userName -Password $Password
+                    $launchMode = 'scheduled-task-interactive-token'
 
+                    do {
+                        Start-Sleep -Milliseconds 200
+                        $process = Get-Process -Name $workloadSpec.processName -ErrorAction SilentlyContinue |
+                            Where-Object { $_.SessionId -eq $interactiveSession.sessionId } |
+                            Sort-Object StartTime -Descending |
+                            Select-Object -First 1
+
+                        if ($process) {
+                            $process.Refresh()
+                        }
+                    } while ($stopwatch.Elapsed.TotalSeconds -lt 6 -and (-not $process -or $process.SessionId -ne $interactiveSession.sessionId))
+
+                    if (-not $process -or $process.SessionId -ne $interactiveSession.sessionId) {
+                        $interactiveTaskError = 'interactive token task did not create a process in the active RDP session'
+                        $process = $null
+                    }
+                } catch {
+                    $interactiveTaskError = ($_ | Out-String).Trim()
+                    $process = $null
+                } finally {
+                    Unregister-ScheduledTask -TaskName $interactiveTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+                }
+            }
+
+            if (-not $process) {
+                $launchMode = 'scheduled-task'
+            }
+
+            if (-not $process) {
+            try {
                 $normalizedUserName = $UserName -replace '^[.\\]+', ''
-                $principal = New-ScheduledTaskPrincipal -UserId $normalizedUserName -LogonType InteractiveOrPassword -RunLevel Highest
-                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-                $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings
-                Register-ScheduledTask -TaskName $taskName -InputObject $task -Password $Password -Force -ErrorAction Stop | Out-Null
-                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                Start-InteractiveScheduledTask -TaskName $taskName -WorkloadSpec $workloadSpec -UserName $normalizedUserName -Password $Password
             } catch {
                 $launchMode = 'start-process-fallback'
                 $scheduledTaskError = ($_ | Out-String).Trim()
@@ -608,10 +756,11 @@ function Invoke-GuestWorkload {
                     Start-Process -FilePath $workloadSpec.filePath -ArgumentList $workloadSpec.arguments -PassThru
                 }
             }
+            }
 
             do {
                 Start-Sleep -Milliseconds 200
-                if (-not $process -or $launchMode -eq 'scheduled-task') {
+                if (-not $process -or $launchMode -in @('scheduled-task', 'scheduled-task-interactive-token')) {
                     $process = Get-Process -Name $workloadSpec.processName -ErrorAction SilentlyContinue |
                         Sort-Object StartTime -Descending |
                         Select-Object -First 1
@@ -635,7 +784,10 @@ function Invoke-GuestWorkload {
             processName = if ($process) { $process.ProcessName } else { $null }
             launchMode = $launchMode
             scheduledTaskError = $scheduledTaskError
+            interactiveTaskError = $interactiveTaskError
             interactiveLaunchError = $InteractiveLaunchError
+            interactiveSessionUser = if ($interactiveSession) { $interactiveSession.userName } else { $null }
+            interactiveSessionIdHint = if ($interactiveSession) { $interactiveSession.sessionId } else { $null }
             started = $null -ne $process
             interactiveWindow = $process -and $process.MainWindowHandle -ne 0
             interactiveSession = $process -and $process.SessionId -gt 0
@@ -823,6 +975,7 @@ function Parse-IronRdpLog {
     }
 
     $copyValues = [regex]::Matches($logText, 'copy_micros=(\d+)') | ForEach-Object { [double]$_.Groups[1].Value }
+    $acquireValues = [regex]::Matches($logText, 'acquire_micros=(\d+)') | ForEach-Object { [double]$_.Groups[1].Value }
     $convertValues = [regex]::Matches($logText, 'convert_micros=(\d+)') | ForEach-Object { [double]$_.Groups[1].Value }
     $presentValues = [regex]::Matches($logText, 'present_micros=(\d+)') | ForEach-Object { [double]$_.Groups[1].Value }
     $backendValues = [regex]::Matches($logText, 'backend_total_micros=(\d+)') | ForEach-Object { [double]$_.Groups[1].Value }
@@ -860,6 +1013,7 @@ function Parse-IronRdpLog {
         resizeSurfaceFailures = @($entries | Where-Object { $_.message -eq 'Failed to resize drawing surface' }).Count
         surfaceResizeEvents = @($entries | Where-Object { $_.message -like 'Resized presentation surface*' }).Count
         overwrittenFrames = @($entries | Where-Object { $_.message -like 'Overwriting unpresented frame buffer*' }).Count
+        pendingAfterImmediateDraws = @($entries | Where-Object { $_.message -eq 'Image remained pending after an immediate draw attempt' }).Count
         replacedPresentedFrames = @($entries | Where-Object { $_.message -like 'Replacing already presented frame buffer*' }).Count
         framePacingFires = @($entries | Where-Object { $_.message -eq 'Frame pacing timer fired, emitting coalesced frame' }).Count
         resizeReconnectRequests = @($entries | Where-Object { $_.message -like 'Resize requires reconnect*' }).Count
@@ -893,19 +1047,29 @@ function Parse-IronRdpLog {
         'launch-only'
     }
 
+    $presentIntervalSummary = Get-NumericSummary -Values $presentIntervals
+    $imageUpdateIntervalSummary = Get-NumericSummary -Values $imageIntervals
+    $copySummary = Get-NumericSummary -Values $copyValues
+    $acquireSummary = Get-NumericSummary -Values $acquireValues
+    $convertSummary = Get-NumericSummary -Values $convertValues
+    $presentSummary = Get-NumericSummary -Values $presentValues
+    $backendSummary = Get-NumericSummary -Values $backendValues
+    $compressionRatioSummary = Get-NumericSummary -Values $compressionRatios
+
     [pscustomobject]@{
         status = $status
         lineCount = $entries.Count
         frameCount = $presented.Count
         imageUpdateCount = $emitted.Count
         fps = $fps
-        presentIntervalMs = Get-NumericSummary -Values $presentIntervals
-        imageUpdateIntervalMs = Get-NumericSummary -Values $imageIntervals
-        copyMicros = Get-NumericSummary -Values $copyValues
-        convertMicros = Get-NumericSummary -Values $convertValues
-        presentMicros = Get-NumericSummary -Values $presentValues
-        backendTotalMicros = Get-NumericSummary -Values $backendValues
-        compressionRatio = Get-NumericSummary -Values $compressionRatios
+        presentIntervalMs = $presentIntervalSummary
+        imageUpdateIntervalMs = $imageUpdateIntervalSummary
+        copyMicros = $copySummary
+        acquireMicros = $acquireSummary
+        convertMicros = $convertSummary
+        presentMicros = $presentSummary
+        backendTotalMicros = $backendSummary
+        compressionRatio = $compressionRatioSummary
         bitmapBpp = [pscustomobject]$bppSummary
         compressionTypes = [pscustomobject]$compressionTypeSummary
         latencyMs = [pscustomobject]@{
@@ -916,8 +1080,12 @@ function Parse-IronRdpLog {
         derived = [pscustomobject]@{
             overwritePerPresentedFrame = Get-RatioValue -Numerator $counts.overwrittenFrames -Denominator $counts.presentedFrames
             overwritePerImageUpdate = Get-RatioValue -Numerator $counts.overwrittenFrames -Denominator $counts.imageUpdates
+            pendingAfterImmediateDrawPerPresentedFrame = Get-RatioValue -Numerator $counts.pendingAfterImmediateDraws -Denominator $counts.presentedFrames
             presentedPerImageUpdate = Get-RatioValue -Numerator $counts.presentedFrames -Denominator $counts.imageUpdates
             firstImageToFrameMs = if ($firstImage -and $firstFrame) { [math]::Round(($firstFrame.timestamp - $firstImage.timestamp).TotalMilliseconds, 2) } else { $null }
+            backendP95Over16ms = [bool]($backendSummary -and $backendSummary.p95 -gt 16000)
+            presentIntervalP95Over16ms = [bool]($presentIntervalSummary -and $presentIntervalSummary.p95 -gt 16)
+            reactivationFailureObserved = [bool]($counts.missingDecompressorWarnings -gt 0 -or $counts.bulkDecompressionFailures -gt 0)
         }
         counts = [pscustomobject]$counts
         tail = Get-Content -LiteralPath $Path -Tail 120 | Out-String
@@ -955,6 +1123,9 @@ function Get-GuestWorkloadStage {
     if (-not $GuestWorkloadResult) { return 'not-requested' }
     if ($GuestWorkloadResult.PSObject.Properties.Name -contains 'error') { return 'launch-error' }
     if (-not $GuestWorkloadResult.started) { return 'not-started' }
+    if ($GuestWorkloadResult.PSObject.Properties.Name -contains 'remoteFileWrite' -and $GuestWorkloadResult.remoteFileWrite) {
+        return 'remote-file-write'
+    }
     if ($GuestWorkloadResult.interactiveWindow) { return 'interactive-window' }
     if ($GuestWorkloadResult.interactiveSession) { return 'interactive-session-no-window' }
     if ($GuestWorkloadResult.sessionZeroFallback) { return 'session-0-fallback' }
@@ -973,10 +1144,19 @@ function Get-ScenarioDiagnosis {
     $latency = $LogSummary.latencyMs
     $signals = New-Object System.Collections.Generic.List[string]
     $primary = 'healthy'
+    $presentCadenceLagging = [bool](
+        $LogSummary.presentIntervalMs -and
+        $LogSummary.imageUpdateIntervalMs -and
+        $LogSummary.presentIntervalMs.p95 -gt 0 -and
+        $LogSummary.imageUpdateIntervalMs.p95 -gt 0 -and
+        $LogSummary.presentIntervalMs.p95 -gt ($LogSummary.imageUpdateIntervalMs.p95 * 1.25)
+    )
 
     $workloadStage = Get-GuestWorkloadStage -GuestWorkloadResult $GuestWorkloadResult
     if ($workloadStage -eq 'session-0-fallback') {
         $signals.Add('guest workload only reached session 0')
+    } elseif ($workloadStage -eq 'remote-file-write') {
+        $signals.Add('guest workload executed via direct file write')
     } elseif ($workloadStage -eq 'interactive-session-no-window') {
         $signals.Add('guest workload reached an interactive session without a visible top-level window')
     } elseif ($workloadStage -eq 'launch-error') {
@@ -1016,13 +1196,29 @@ function Get-ScenarioDiagnosis {
         if ($counts.resizeSurfaceFailures -gt 0) {
             $signals.Add("surface resize failures observed: $($counts.resizeSurfaceFailures)")
         }
-    } elseif ($derived.overwritePerPresentedFrame -gt 0.25 -or $derived.firstImageToFrameMs -gt 120 -or ($LogSummary.presentMicros.average -gt 0 -and $LogSummary.convertMicros.average -gt 0 -and $LogSummary.presentMicros.average -ge ($LogSummary.convertMicros.average * 1.5))) {
+    } elseif (
+        $derived.firstImageToFrameMs -gt 120 -or
+        $derived.pendingAfterImmediateDrawPerPresentedFrame -gt 0.10 -or
+        $derived.overwritePerPresentedFrame -gt 0.75 -or
+        $derived.backendP95Over16ms -or
+        $presentCadenceLagging -or
+        ($LogSummary.presentMicros.average -gt 0 -and $LogSummary.convertMicros.average -gt 0 -and $LogSummary.presentMicros.average -ge ($LogSummary.convertMicros.average * 1.5))
+    ) {
         $primary = 'present-limited'
+        if ($derived.pendingAfterImmediateDrawPerPresentedFrame -gt 0.10) {
+            $signals.Add("pending-after-immediate-draw pressure: $($derived.pendingAfterImmediateDrawPerPresentedFrame)")
+        }
         if ($derived.overwritePerPresentedFrame -gt 0.25) {
-            $signals.Add("high overwrite-per-presented-frame ratio: $($derived.overwritePerPresentedFrame)")
+            $signals.Add("overwrite-per-presented-frame ratio: $($derived.overwritePerPresentedFrame)")
         }
         if ($derived.firstImageToFrameMs -gt 120) {
             $signals.Add("slow first-image-to-frame latency: $($derived.firstImageToFrameMs) ms")
+        }
+        if ($derived.backendP95Over16ms) {
+            $signals.Add('backend p95 exceeded the 16 ms frame budget')
+        }
+        if ($presentCadenceLagging) {
+            $signals.Add("present cadence lags image cadence: present p95 $($LogSummary.presentIntervalMs.p95) ms vs image p95 $($LogSummary.imageUpdateIntervalMs.p95) ms")
         }
         if ($LogSummary.presentMicros.average -gt 0 -and $LogSummary.convertMicros.average -gt 0 -and $LogSummary.presentMicros.average -ge ($LogSummary.convertMicros.average * 1.5)) {
             $signals.Add("present cost dominates conversion cost: avg present $($LogSummary.presentMicros.average) us vs convert $($LogSummary.convertMicros.average) us")
@@ -1138,6 +1334,17 @@ function Get-ScenarioHealth {
         $warnings.Add("high overwrite-per-presented-frame ratio: $($derived.overwritePerPresentedFrame)")
     }
     if ($Scenario.guestWorkloadAtSeconds -ne $null -and $GuestWorkloadResult) {
+        $hasInteractiveTaskError = $GuestWorkloadResult.PSObject.Properties.Name -contains 'interactiveTaskError' -and
+            -not [string]::IsNullOrWhiteSpace($GuestWorkloadResult.interactiveTaskError)
+        $hasInteractiveLaunchError = $GuestWorkloadResult.PSObject.Properties.Name -contains 'interactiveLaunchError' -and
+            -not [string]::IsNullOrWhiteSpace($GuestWorkloadResult.interactiveLaunchError)
+
+        if ($hasInteractiveTaskError) {
+            $warnings.Add('interactive-token workload launch required fallback')
+        }
+        if ($hasInteractiveLaunchError) {
+            $warnings.Add('client-driven workload launch required fallback')
+        }
         switch ($diagnosis.workloadStage) {
             'launch-error' { $warnings.Add('guest workload launch failed and interactive workload timing is unavailable') }
             'not-started' { $warnings.Add('guest workload did not start') }
@@ -1151,6 +1358,8 @@ function Get-ScenarioHealth {
         } elseif ($GuestAudioResult.attempted -and $counts.audioFormatChanges -le 0) {
             $warnings.Add('guest audio pulse ran but did not produce observed RDPSND playback activity')
         }
+    } elseif ($Scenario.guestAudioAtSeconds -ne $null) {
+        $warnings.Add('guest audio pulse was not attempted')
     }
 
     [pscustomobject]@{
@@ -1172,10 +1381,17 @@ function Get-SuiteHealthRollup {
     [pscustomobject]@{
         baselinePassed = if ($baseline) { [bool]$baseline.health.passed } else { $false }
         resizePassed = if ($resize) { [bool]$resize.health.passed } else { $false }
+        interactiveWorkloadPassed = -not [bool](
+            $Results |
+                Where-Object { $_.guestWorkload } |
+                Where-Object { $_.health.diagnosis.workloadStage -notin @('interactive-window', 'interactive-session-no-window', 'remote-file-write', 'not-requested') } |
+                Select-Object -First 1
+        )
         clipboardObservedStage = @($Results | ForEach-Object { $_.health.clipboardStage } | Select-Object -Unique) -join ','
         audioObservedStage = @($Results | ForEach-Object { $_.health.audioStage } | Select-Object -Unique) -join ','
         workloadObservedStage = @($Results | ForEach-Object { $_.health.diagnosis.workloadStage } | Select-Object -Unique) -join ','
-        guestAudioAttempted = [bool]($Results | Where-Object { $_.guestAudio -and $_.guestAudio.attempted } | Select-Object -First 1)
+        workloadLaunchModes = @($Results | ForEach-Object { if ($_.guestWorkload -and $_.guestWorkload.PSObject.Properties.Name -contains 'launchMode') { $_.guestWorkload.launchMode } } | Where-Object { $_ } | Select-Object -Unique) -join ','
+        guestAudioAttempted = [bool]($Results | Where-Object { $_.PSObject.Properties.Name -contains 'guestAudio' -and $_.guestAudio -and $_.guestAudio.PSObject.Properties.Name -contains 'attempted' -and $_.guestAudio.attempted } | Select-Object -First 1)
         primaryDiagnosis = @($Results | ForEach-Object { $_.health.diagnosis.primary } | Group-Object | Sort-Object Count -Descending | Select-Object -First 1).Name
         diagnosisSignals = @(
             $Results |
@@ -1343,7 +1559,7 @@ function Invoke-Scenario {
 
     try {
         while ((Get-Date) -lt $startedAt.AddSeconds($DurationSeconds)) {
-            $current = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+            $current = Get-LiveProcessById -ProcessId $process.Id
             if (-not $current) {
                 break
             }
@@ -1454,7 +1670,7 @@ function Invoke-Scenario {
         Remove-RdpBlockRule -RuleName $outageRule
         Restore-HostClipboardState -State $hostClipboardOriginal
 
-        $current = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+        $current = Get-LiveProcessById -ProcessId $process.Id
         if ($current) {
             try {
                 Capture-WindowScreenshot -Process $current -Path $screenshotPath | Out-Null
@@ -1468,7 +1684,7 @@ function Invoke-Scenario {
             }
 
             Start-Sleep -Seconds 3
-            $current = Get-Process -Id $current.Id -ErrorAction SilentlyContinue
+            $current = Get-LiveProcessById -ProcessId $current.Id
             if ($current) {
                 Stop-Process -Id $current.Id -Force
             }

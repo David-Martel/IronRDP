@@ -245,7 +245,7 @@ The suite currently drives:
 - host clipboard mutation and CLIPRDR log capture
 - guest-side control over WinRM using the reachable guest IP
 - explicit capability reporting for clipboard, audio wiring, and unsupported device redirection
-- explicit per-scenario health summaries with failures, warnings, staged clipboard/audio observations, and workload-stage diagnosis
+- explicit per-scenario health summaries with failures, warnings, staged clipboard/audio observations, workload-stage diagnosis, and workload launch mode reporting
 - optional temporary host-side outage simulation by blocking outbound `3389`
 - per-scenario screenshots, client logs, CPU samples, and JSON summaries
 
@@ -258,10 +258,20 @@ The current measured Hyper-V e2e baseline is:
 - the native client no longer overwrites queued unpresented frames in the current resize workload after the pacing/coalescing pass
 - resize scenarios now show client-handled clipboard activity, but guest-side text verification is still not proven end to end
 - the guest-control path now enables and verifies WinRM, then stores reusable lab credentials in Windows Credential Manager under `IronRDP-HyperV-*`, `WSMAN/*`, and `TERMSRV/*`
-- suite summaries now report that the guest workload currently falls back to a non-interactive process in session `0` because scheduled interactive task registration is rejected on this VM account model
+- the default guest workload is now a direct WinRM-backed file write, so the suite no longer needs Notepad or session-`0` fallback just to prove guest-side activity
+- suite summaries now report workload stage and launch mode explicitly; the currently validated baseline is `remote-file-write`, while a fully interactive in-session workload is still a follow-up item
 - the suite now drives a deliberate guest-side audio pulse and can reach `playback-observed`, but it still needs a stronger interactive workload before app-driven audio assertions are deterministic
 - device redirection remains explicitly unsupported on this branch because the client still uses `NoopRdpdrBackend`
-- backend-local `softbuffer` conversion and present time are still the main client-side render bottlenecks
+- backend-local `softbuffer` conversion and present time are still the main client-side render bottlenecks, and the suite now breaks that path down far enough to separate surface acquisition cost from conversion/present cost
+
+To deploy the portable bundle to another Windows machine over SSH without a local repo checkout, use:
+
+```pwsh
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\Deploy-IronRdpRemote.ps1 `
+  -BundlePath T:\RustCache\artifacts\IronRDP\windows-server-only\bundles\IronRDP-DTM-WORK-0.0.0-dev-portable.zip `
+  -RemoteHost dtm-p1gen7 `
+  -Force
+```
 
 ## Uninstall
 

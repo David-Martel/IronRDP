@@ -176,7 +176,8 @@ Status: done for the first regression-ready pass. Current observed baseline and 
 - the guest still prefers `Rdp61`/bitmap traffic, especially `16`-bpp RLE streams
 - the native client is overwriting almost every queued frame under this workload, so present-path pacing/coalescing is now the highest-value render optimization
 - resize scenarios do not currently trigger reconnects, but they do amplify backend-total present spikes
-- scheduled interactive workload launch is rejected on this VM account model, so the suite currently falls back to non-interactive process-start timing in session `0`
+- the default guest workload is now a direct WinRM-backed file write, so the suite no longer relies on Notepad or session-`0` fallback as the primary guest-activity signal
+- a fully interactive in-session workload is still missing; the remaining blocker is that an `Interactive` scheduled task can report success without creating a visible process in the active RDP session
 - CLIPRDR initializes successfully on the Hyper-V path, and resize scenarios now observe remote format-list acknowledgement
 - host-side clipboard mutation is now part of the suite, but end-to-end text clipboard transfer is not proven yet because the current run did not produce local forwarded/handled clipboard events
 - guest audio services are running and the client audio channel is wired, but the suite still needs a guest-side sound workload before playback-path assertions are honest
@@ -228,6 +229,27 @@ Status: done. Needs Hyper-V revalidation with a guest-side audio workload.
 Refs: `crates/ironrdp-client/src/app.rs`.
 Status: done.
 
+34. The native client now emits finer-grained present-path diagnostics: `acquire_micros` for surface buffer acquisition and an explicit `pending_after_immediate_draw_count` signal for frames that still require a redraw after an immediate draw attempt.
+Refs: `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/app.rs`, Hyper-V suite log parsing in `scripts/windows/Invoke-HyperVE2ESuite.ps1`.
+Status: done. The new client traces now expose:
+- surface-buffer acquisition cost separately from conversion/present time
+- a direct “immediate draw still pending” pressure signal instead of inferring it only from overwritten-frame counts
+- enough data for the suite to distinguish workload cadence from true present-path lag
+
+35. The Hyper-V suite now reports `interactiveWorkloadPassed`, `workloadLaunchModes`, pending-after-draw pressure, and tighter present-path attribution. It no longer treats “present interval p95 > 16 ms” as present-limited on its own when image cadence is already slower than 60 FPS.
+Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, local Hyper-V suite logs under `%TEMP%\\ironrdp-hyperv-suite-*`.
+Status: done. The suite now:
+- reports when guest workloads required fallback even if the scenario otherwise passed
+- records launch mode explicitly instead of collapsing all workload failures into a generic warning
+- uses cadence comparison and immediate-draw pressure instead of a blunt 16 ms threshold alone
+
+36. The Hyper-V lab now has a stable default guest workload path: direct WinRM-backed file creation inside the guest user profile replaces the older Notepad/session-`0` fallback contract for baseline suite runs.
+Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, WinRM probes against `172.23.187.173`, local Hyper-V suite logs under `%TEMP%\\ironrdp-hyperv-suite-*`.
+Status: done and revalidated. Current implications:
+- baseline and resize scenarios can prove guest-side activity without relying on GUI application launch
+- suite summaries now expose `remote-file-write` as a first-class workload stage and `winrm-file-write` as the launch mode
+- interactive workload launch remains a follow-up item, not a blocker for the default regression path
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -237,9 +259,9 @@ Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, `scripts/windows/Invoke-Hyper
 Why now:
 - the suite is already producing useful transport/render data
 - it now has explicit per-scenario health summaries plus staged clipboard/audio observations
-- it now reports session-`0` fallback explicitly, so the remaining gap is to replace that fallback with a real interactive workload path
+- the default regression path is now stable via direct WinRM-backed file writes, so the remaining interaction gap is specifically “how do we launch a real interactive in-session workload when we want one?”
 Done when:
-- workload launch reaches the active interactive guest session or an equivalent UI-driving path
+- the default file-write workload remains green and a second optional workload reaches the active interactive guest session or an equivalent UI-driving path
 - clipboard text transfer is asserted honestly end-to-end or explicitly documented as still local-path-only
 - guest-side audio activity is exercised deliberately as part of the suite and correlated with app-driven interactive workload behavior
 - unsupported device redirection stays explicit in the summary rather than implied
@@ -247,8 +269,8 @@ Done when:
 2. Tighten the Hyper-V suite’s diagnosis thresholds and render/transport attribution.
 Refs: `scripts/windows/Invoke-HyperVE2ESuite.ps1`, Hyper-V suite logs under `%TEMP%\\ironrdp-hyperv-suite-*`.
 Why now:
-- the suite now classifies dominant bottlenecks, but the thresholds are still heuristic
-- the current branch still needs better attribution for “healthy but still expensive” present-path runs
+- the suite now classifies dominant bottlenecks using cadence comparison plus immediate-draw pressure, but the remaining thresholds still need one more pass against the refreshed client metrics
+- the current branch still needs better attribution for “healthy but still expensive” present-path runs and RDPSND underrun-heavy scenarios
 Done when:
 - diagnosis distinguishes truly healthy idle workloads from present-cost-heavy steady-state workloads
 - scenario summaries can call out when render, decode, or transport costs dominate even without hard failures
@@ -265,20 +287,31 @@ Done when:
 - the decompressor regression has both a unit guardrail (done) and an integration-level test
 
 4. Mirror the now-validated Hyper-V deployment and live-connect flow onto `dtm-p1gen7`.
-Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `scripts/windows/Invoke-HyperVLiveConnectTest.ps1`.
+Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `scripts/windows/Invoke-HyperVLiveConnectTest.ps1`, `scripts/windows/Deploy-IronRdpRemote.ps1`.
 Why now:
 - the portable bundle and bounded live client session are now proven locally, so the next deployment unknown is the real second machine
 Done when:
 - package output can be copied, launched, and verified remotely with one documented flow
 - the Hyper-V-validated install/smoke/live-connect flow is mirrored on `dtm-p1gen7`
 
+7. Clean up the native audio path after the first honest Hyper-V playback-observed runs.
+Refs: `crates/ironrdp-rdpsnd-native/src/cpal.rs`, Hyper-V suite logs under `%TEMP%\\ironrdp-hyperv-suite-*`.
+Why now:
+- the suite now proves that the RDPSND path can reach `playback-observed`
+- the latest live logs also surfaced Opus decode and closed-channel shutdown noise that should be treated as a real client-quality issue, not ignored test chatter
+Done when:
+- Opus decode failures are understood and either fixed or downgraded to clearly classified unsupported cases
+- closed-channel teardown noise is removed from expected shutdown paths
+- audio underrun metrics are still captured, but no longer hide shutdown/decoder correctness issues
+
 5. Use the Hyper-V live/e2e logs to drive the next standards-first render and transport optimizations.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-server/src/gfx.rs`, local Hyper-V live-connect and suite logs.
 Why now:
 - the Hyper-V traces now show where the client and server are actually spending time
+- the new client metrics now split surface acquire time from conversion/present time and expose redraw pressure directly
 - the observed workload is still software bitmap heavy, so deeper work should stay grounded in measured data
 Done when:
-- there is a clear follow-up plan for the `16`-bpp bitmap path, `softbuffer` backend conversion, and EGFX/H.264 readiness
+- there is a clear follow-up plan for the `16`-bpp bitmap path, surface acquisition vs conversion cost, and EGFX/H.264 readiness
 - reconnect causes and graceful vs hard termination stay explicit in logs/tests
 - the reason multitransport remains TCP-only in this environment is explicitly understood, not just observed
 

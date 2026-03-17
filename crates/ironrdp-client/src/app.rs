@@ -67,6 +67,7 @@ pub struct App {
     presented_frame_count: u64,
     surface_resize_count: u64,
     overwritten_frame_count: u64,
+    pending_after_immediate_draw_count: u64,
     exit_code: Code,
     /// Whether the window is currently in borderless fullscreen mode.
     is_fullscreen: bool,
@@ -100,6 +101,7 @@ impl App {
             presented_frame_count: 0,
             surface_resize_count: 0,
             overwritten_frame_count: 0,
+            pending_after_immediate_draw_count: 0,
             exit_code: Code::SUCCESS,
             is_fullscreen: false,
             ctrl_pressed: false,
@@ -183,6 +185,7 @@ impl App {
             frame_id = self.presented_frame_count,
             width = self.buffer_size.0,
             height = self.buffer_size.1,
+            acquire_micros = stats.acquire_micros,
             convert_micros = stats.convert_micros,
             present_micros = stats.present_micros,
             backend_total_micros = stats.total_micros,
@@ -553,9 +556,13 @@ impl ApplicationHandler<RdpOutputEvent> for App {
 
                 self.draw();
                 if self.frame_pending_present && !self.redraw_requested {
-                    if frame_was_pending {
-                        trace!("Image remained pending after an immediate draw attempt");
-                    }
+                    self.pending_after_immediate_draw_count =
+                        self.pending_after_immediate_draw_count.saturating_add(1);
+                    trace!(
+                        pending_after_immediate_draw_count = self.pending_after_immediate_draw_count,
+                        frame_was_already_pending = frame_was_pending,
+                        "Image remained pending after an immediate draw attempt"
+                    );
                     window.request_redraw();
                     self.redraw_requested = true;
                 }
