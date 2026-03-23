@@ -54,10 +54,12 @@ You are expected to read and follow these sources of truth when relevant:
 - **Changelog / release config:** `cliff.toml`, `release-plz.toml`
 - **Crate-level specifics:** `crates/*/README.md` and `crates/*/CHANGELOG.md`
 - **FFI details:** `ffi/README.md`
+- **Fork task tracker:** `codex.TODO.md` (windows-server-only branch priorities and completed items)
+- **Fork build/deploy:** `build.ps1`, `scripts/windows/`
 
 ### Microsoft Open Specifications (Agent Skill)
 
-For protocol-level work, the [windows-protocols](hhttps://skills.sh/awakecoding/openspecs/windows-protocols) agent skill provides a local markdown corpus of Microsoft Open Specifications (`MS-RDP*` and related docs).
+For protocol-level work, the [windows-protocols](https://skills.sh/awakecoding/openspecs/windows-protocols) agent skill provides a local markdown corpus of Microsoft Open Specifications (`MS-RDP*` and related docs).
 When referencing these specs, check if the skill is installed and suggest installing it if not:
 
 ```
@@ -92,6 +94,11 @@ These crates exist on disk but are not documented in `ARCHITECTURE.md`. Be aware
 - `ironrdp-rdpdr-native` — native RDPDR backend
 - `ironrdp-rdpsnd-native` — native RDPSND backend
 - `ironrdp-bench` — benchmarking harness
+- `ironrdp-cfg` — feature/configuration utilities
+- `ironrdp-cliprdr-native` — native clipboard backend
+- `ironrdp-echo` — echo channel (DVC test surface)
+- `ironrdp-rdpeusb` — USB redirection channel
+- `ironrdp-rdpfile` — `.rdp` file parser
 
 ### Workspace Exclusions
 
@@ -123,7 +130,7 @@ Do not modify them unless specifically working on fixing their compilation.
 ## Coding Standards (The "Gold Standard")
 
 - **Language:** Rust (Edition 2024; toolchain pinned via `rust-toolchain.toml`)
-- **Toolchain baseline:** Rust `1.89.0`
+- **Toolchain baseline:** Rust `1.94.0`
 - **Formatter:** `rustfmt` (workspace config in `rustfmt.toml`)
 - **Lints:** Strict workspace lint policy (`[workspace.lints.rust]` and `[workspace.lints.clippy]` in root `Cargo.toml`)
 - **Error handling:** Prefer explicit, composable error messages following `STYLE.md`
@@ -173,6 +180,36 @@ The highest-value imported rules for this fork are:
 - **Spec-traceable docs:** when adding protocol entities, include concise doc comments with spec references where appropriate.
 - **Performance awareness:** avoid avoidable allocations/copies in hot paths and keep compile-time costs reasonable in foundational crates.
 - **Boundary discipline:** respect crate API boundaries and keep internal-only logic in internal-tier crates.
+
+## Fork-Specific Workflow (`windows-server-only`)
+
+This fork (`David-Martel/windows-server-only`) is a Windows-native RDP client/server runtime. The upstream IronRDP is source material; `codex.TODO.md` is the authoritative task tracker.
+
+### Fork Build Commands
+
+- **Optimized Windows build:** `.\build.ps1` (uses CargoTools, sccache, static MSVC CRT)
+- **Portable package:** `.\build.ps1 -Mode package`
+- **Deploy to Hyper-V guest:** `.\build.ps1 -Mode deploy`
+- **Full deploy + test suite:** `.\build.ps1 -Mode deploy-suite`
+- **Toolchain/env diagnostics:** `.\build.ps1 -Mode doctor`
+- **Remote deploy:** `.\scripts\windows\Deploy-IronRdpRemote.ps1`
+
+### Hyper-V Validation
+
+- **E2E suite:** `.\scripts\windows\Invoke-HyperVE2ESuite.ps1`
+- **Live connect test:** `.\scripts\windows\Invoke-HyperVLiveConnectTest.ps1`
+- **Smoke test:** `.\scripts\windows\Invoke-IronRdpSmokeTest.ps1`
+- **Install helper:** `.\scripts\windows\Install-IronRdpPackage.ps1`
+
+Primary validation target: Hyper-V Windows Server 2025 guest on Intel x64. Secondary: `dtm-p1gen7` remote host.
+
+### Fork-Specific Files
+
+- **Task tracker:** `codex.TODO.md` — ordered implementation queue for this fork
+- **Build entrypoint:** `build.ps1` — CargoTools-managed Windows build with packaging/deploy modes
+- **Version tracking:** `crates/ironrdp-client/build.rs` + `crates/ironrdp-client/src/version.rs`
+- **Deploy/test scripts:** `scripts/windows/`
+- **Session context:** `.claude/context/` — per-session context snapshots
 
 ## CI/CD & Deployment
 

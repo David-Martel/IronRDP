@@ -250,6 +250,18 @@ Status: done and revalidated. Current implications:
 - suite summaries now expose `remote-file-write` as a first-class workload stage and `winrm-file-write` as the launch mode
 - interactive workload launch remains a follow-up item, not a blocker for the default regression path
 
+37. Audio buffer underruns reduced: the cpal backend now requests a ~40ms hardware buffer, uses a 100ms recv timeout (was 4 seconds), fills silence on underrun instead of leaving stale data, and tracks underrun count via an atomic counter for diagnostics.
+Refs: `crates/ironrdp-rdpsnd-native/src/cpal.rs`.
+Status: done. Needs Hyper-V revalidation to measure underrun reduction.
+
+38. Keyboard layout auto-detection: the client now reads the active Windows keyboard layout via `GetKeyboardLayout` on startup and passes it to the server during connection. A `--keyboard-layout` CLI flag allows manual override.
+Refs: `crates/ironrdp-client/src/config.rs`, `crates/ironrdp-client/Cargo.toml`.
+Status: done.
+
+39. Connection errors and session failures now keep the window open with the error message in the title bar instead of silently vanishing. The window stays open until the user closes it manually, giving time to read the error. Graceful disconnects still auto-close.
+Refs: `crates/ironrdp-client/src/app.rs`.
+Status: done. 8 new tests for title-formatting helpers.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
