@@ -78,9 +78,12 @@ Host connector/agent
 
 - [ ] Keep gateway work off the primary critical path until direct Windows
       client/server quality goals are met.
-- [ ] Design a new `ironrdp-gateway` crate with clean separation between:
+- [x] Design a new `ironrdp-gateway` crate with clean separation between:
       control plane, auth/policy, and data plane relay.
-- [ ] Reuse `ironrdp-rdcleanpath` as the first gateway protocol.
+      Done: `crates/ironrdp-gateway/` scaffolded with `GatewayAuthenticator`,
+      `GatewayPolicy`, `GatewayRelay`, `GatewaySession`, `GatewayConfig`.
+- [x] Reuse `ironrdp-rdcleanpath` as the first gateway protocol.
+      Done: `ironrdp-rdcleanpath` is a dependency and re-exported from `lib.rs`.
 - [ ] Implement gateway-side TLS termination on `443`.
 - [ ] Implement RADIUS client auth against `192.168.1.1`.
 - [ ] Define local authorization policy:

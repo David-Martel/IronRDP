@@ -99,6 +99,7 @@ These crates exist on disk but are not documented in `ARCHITECTURE.md`. Be aware
 - `ironrdp-echo` — echo channel (DVC test surface)
 - `ironrdp-rdpeusb` — USB redirection channel
 - `ironrdp-rdpfile` — `.rdp` file parser
+- `ironrdp-gateway` — RDCleanPath-compatible RDP gateway (scaffold; see `gateway.TODO.md`)
 
 ### Workspace Exclusions
 

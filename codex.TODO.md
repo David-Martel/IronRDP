@@ -262,6 +262,30 @@ Status: done.
 Refs: `crates/ironrdp-client/src/app.rs`.
 Status: done. 8 new tests for title-formatting helpers.
 
+40. Single-session server behavior is now an explicit programmatic contract. The server tracks active sessions via `Arc<AtomicBool>` with RAII `SessionGuard`, rejects concurrent connections with a clear log message, and documents the invariant in both the struct doc comment and README.
+Refs: `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/README.md`.
+Status: done.
+
+41. Display and bitmap constraints now fail early and clearly. `UpdateEncoder::new()` validates desktop dimensions (non-zero, <=8192), and `BitmapUpdater::handle()` validates stride vs row-width consistency and data-length vs stride x height before any encoding begins.
+Refs: `crates/ironrdp-server/src/encoder/mod.rs`.
+Status: done.
+
+42. Audio path shutdown noise eliminated. Opus decode errors are now `warn!`-level with a separate `decode_error_count` atomic counter, closed-channel teardown exits silently instead of logging errors, and the cpal recv timeout was reduced from 4s to 100ms with silence fill on underrun.
+Refs: `crates/ironrdp-rdpsnd-native/src/cpal.rs`.
+Status: done. Hyper-V revalidated: 0 ERROR-level messages across baseline and resize scenarios.
+
+43. Client reconnect and shutdown logging now explicitly distinguishes user-initiated disconnect, server-initiated graceful disconnect, connection failure, and resize-triggered reconnect at `info!`/`error!` level. GUI channel drop is handled as a hard disconnect with a debug log instead of a protocol error.
+Refs: `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-client/src/app.rs`.
+Status: done. Hyper-V live connect logs show clean 4-step shutdown trail.
+
+44. Focused session seam integration tests added: `test_graceful_disconnect`, `test_server_display_write_failure`, and `test_double_reactivation` cover server-initiated shutdown, display backend failure, and consecutive resize/reactivation with decompressor state preservation. All 6 integration tests pass.
+Refs: `crates/ironrdp-testsuite-extra/tests/mod.rs`.
+Status: done.
+
+45. Initial `ironrdp-gateway` crate scaffolded with trait-based three-plane architecture: `GatewayAuthenticator` (auth), `GatewayPolicy` + `AuthzDecision` (policy), `GatewayRelay` with bidirectional byte copy and `RelayStats` (data plane), `GatewaySession` (session metadata), and `GatewayConfig` (static configuration). Reuses `ironrdp-rdcleanpath` as the first gateway protocol.
+Refs: `crates/ironrdp-gateway/`.
+Status: done (scaffold only — no listener, RADIUS, or TLS implementation yet).
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -297,6 +321,7 @@ Why now:
 Done when:
 - backlog disconnect, display failure, resize/reactivation, and single-session behavior are pinned down
 - the decompressor regression has both a unit guardrail (done) and an integration-level test
+Progress: graceful disconnect, display write failure, and double reactivation tests added (item 44). Remaining: single-session rejection test, decompressor regression integration test.
 
 4. Mirror the now-validated Hyper-V deployment and live-connect flow onto `dtm-p1gen7`.
 Refs: `build.ps1`, emitted artifact manifests, `scripts/windows/Install-IronRdpPackage.ps1`, `scripts/windows/Invoke-IronRdpSmokeTest.ps1`, `scripts/windows/Invoke-HyperVLiveConnectTest.ps1`, `scripts/windows/Deploy-IronRdpRemote.ps1`.
@@ -315,6 +340,7 @@ Done when:
 - Opus decode failures are understood and either fixed or downgraded to clearly classified unsupported cases
 - closed-channel teardown noise is removed from expected shutdown paths
 - audio underrun metrics are still captured, but no longer hide shutdown/decoder correctness issues
+Progress: Opus errors downgraded to warn with decode_error_count (item 42), shutdown noise eliminated, silence fill on underrun. Remaining: investigate root cause of Opus decode failures (codec mismatch? truncated packets?) and validate underrun reduction with real audio workload.
 
 5. Use the Hyper-V live/e2e logs to drive the next standards-first render and transport optimizations.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-server/src/gfx.rs`, local Hyper-V live-connect and suite logs.
@@ -380,23 +406,20 @@ Effort: small.
 
 ## Priority 1: Runtime correctness before acceleration
 
-1. Make single-session server behavior an explicit fork contract.
-Refs: `crates/ironrdp-server/src/server.rs`, `crates/ironrdp-server/README.md`.
-Effort: small to medium.
+1. ~~Make single-session server behavior an explicit fork contract.~~ Done (item 40).
 
 2. Finish focused runtime tests around the session seams.
 Refs: `crates/ironrdp-testsuite-extra/tests/*`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-server/src/session_driver.rs`.
 Effort: medium.
+Progress: 3 new tests added (item 44). Remaining: single-session rejection, decompressor regression integration.
 
-3. Make display and bitmap constraints fail early and clearly.
-Refs: `crates/ironrdp-server/src/encoder/bitmap.rs`, `crates/ironrdp-server/src/encoder/mod.rs`, `crates/ironrdp-server/src/session_driver.rs`.
-Effort: medium.
+3. ~~Make display and bitmap constraints fail early and clearly.~~ Done (item 41).
 
 4. Extend Unicode/IME coverage from unit tests into end-to-end Windows validation.
 Refs: `crates/ironrdp-client/src/app.rs`, `crates/ironrdp-testsuite-extra`, deployment/demo notes.
 Effort: medium.
 
-5. Finish reconnect/shutdown clarity.
+5. ~~Finish reconnect/shutdown clarity.~~ Done (item 43).
 Refs: `crates/ironrdp-client/src/main.rs`, `crates/ironrdp-client/src/rdp.rs`, `crates/ironrdp-client/src/session_driver.rs`.
 Effort: medium.
 
