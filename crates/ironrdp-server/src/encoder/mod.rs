@@ -1,7 +1,7 @@
 use core::fmt;
 use core::num::NonZeroU16;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use ironrdp_acceptor::DesktopSize;
 use ironrdp_graphics::diff::{Rect, find_different_rects_sub};
 use ironrdp_pdu::encode_vec;
@@ -116,6 +116,27 @@ impl UpdateEncoder {
         codecs: UpdateEncoderCodecs,
         max_request_size: u32,
     ) -> Result<Self> {
+        // RDP protocol allows at most 8192×8192; zero dimensions are also invalid
+        // because downstream code (e.g., split_diff) divides by width/height.
+        ensure!(
+            desktop_size.width > 0,
+            "desktop width must be non-zero"
+        );
+        ensure!(
+            desktop_size.height > 0,
+            "desktop height must be non-zero"
+        );
+        ensure!(
+            desktop_size.width <= 8192,
+            "desktop width {} exceeds protocol maximum of 8192",
+            desktop_size.width
+        );
+        ensure!(
+            desktop_size.height <= 8192,
+            "desktop height {} exceeds protocol maximum of 8192",
+            desktop_size.height
+        );
+
         let bitmap_updater = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
             match codecs {
                 #[cfg(feature = "qoiz")]
@@ -435,6 +456,31 @@ enum BitmapUpdater {
 
 impl BitmapUpdater {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
+        // Validate that stride is wide enough to hold a full row of pixels.
+        // Handlers index each row as `row[..bytes_per_pixel * width]`; a stride
+        // narrower than that would cause an out-of-bounds slice panic.
+        let min_stride = usize::from(bitmap.format.bytes_per_pixel()) * usize::from(bitmap.width.get());
+        ensure!(
+            bitmap.stride.get() >= min_stride,
+            "bitmap stride {} is narrower than required row width {} ({}bpp × {} px)",
+            bitmap.stride.get(),
+            min_stride,
+            bitmap.format.bytes_per_pixel() * 8,
+            bitmap.width,
+        );
+
+        // Validate that the data buffer is large enough for stride × height rows.
+        let expected_data_len = bitmap.stride.get() * usize::from(bitmap.height.get());
+        if bitmap.data.len() < expected_data_len {
+            bail!(
+                "bitmap data length {} is too small for {} stride × {} height rows (expected at least {})",
+                bitmap.data.len(),
+                bitmap.stride,
+                bitmap.height,
+                expected_data_len,
+            );
+        }
+
         match self {
             Self::None(up) => up.handle(bitmap),
             Self::Bitmap(up) => up.handle(bitmap),

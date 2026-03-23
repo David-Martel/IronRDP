@@ -3,6 +3,7 @@
 //! The accepted-client session state machine lives in [`crate::session_driver`].
 
 use core::net::SocketAddr;
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -24,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::RdpServerDisplay;
@@ -165,8 +166,13 @@ impl DisplayControlHandler for DisplayControlBackend {
 ///  - receive display updates from a [`RdpServerDisplay`] and forward them to the client
 ///  - receive input events from a client and forward them to an [`RdpServerInputHandler`]
 ///
-/// This Windows-native fork currently accepts and services one client session
-/// at a time. New accepts are serialized behind the active session loop.
+/// # Single-session contract
+///
+/// This server enforces a **single-session-at-a-time** invariant as an explicit fork contract.
+/// When a client session is active (`active_session` is `true`), any new inbound TCP connection
+/// is immediately dropped and a `WARN`-level log line is emitted. This is intentional behaviour,
+/// not a limitation to be worked around: multi-session support must be designed and validated
+/// explicitly before this invariant can be relaxed.
 ///
 /// # Example
 ///
@@ -239,6 +245,11 @@ pub struct RdpServer {
     pub(crate) ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     pub(crate) creds: Option<Credentials>,
     pub(crate) local_addr: Option<SocketAddr>,
+    /// `true` while a client session is being serviced.
+    ///
+    /// INVARIANT: at most one session is active at any point in time.
+    /// Set to `true` by `run_connection` on entry; cleared on exit via `SessionGuard`.
+    pub(crate) active_session: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -260,6 +271,19 @@ pub trait ServerEventSender {
 impl ServerEvent {
     pub fn create_channel() -> (mpsc::UnboundedSender<Self>, mpsc::UnboundedReceiver<Self>) {
         mpsc::unbounded_channel()
+    }
+}
+
+/// RAII guard that clears `active_session` when the session scope exits.
+///
+/// Constructed at the start of `run_connection`; dropped (and therefore the
+/// flag is reset to `false`) whether the session finishes normally or with an
+/// error.
+struct SessionGuard(Arc<AtomicBool>);
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -299,6 +323,7 @@ impl RdpServer {
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
             local_addr: None,
+            active_session: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -373,6 +398,11 @@ impl RdpServer {
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
+        // Mark session active; the guard clears the flag on drop regardless of
+        // how this function exits (normal return or propagated error).
+        let _guard = SessionGuard(Arc::clone(&self.active_session));
+        self.active_session.store(true, Ordering::Release);
+
         let framed = TokioFramed::new(stream);
 
         let size = self.display.lock().await.size().await;
@@ -464,12 +494,20 @@ impl RdpServer {
                     }
                 },
                 Ok((stream, peer)) = listener.accept() => {
-                    debug!(?peer, "Received connection");
                     drop(ev_receiver);
-                    if let Err(error) = self.run_connection(stream).await {
-                        error!(?error, "Connection error");
+                    if self.active_session.load(Ordering::Acquire) {
+                        // Single-session contract: reject new connections while a
+                        // session is already active.  Drop `stream` to close the
+                        // TCP connection immediately from the server side.
+                        info!(%peer, "Rejected inbound connection: a session is already active (single-session contract)");
+                        drop(stream);
+                    } else {
+                        debug!(?peer, "Received connection");
+                        if let Err(error) = self.run_connection(stream).await {
+                            error!(?error, "Connection error");
+                        }
+                        self.static_channels = StaticChannelSet::new();
                     }
-                    self.static_channels = StaticChannelSet::new();
                 }
                 else => break,
             }

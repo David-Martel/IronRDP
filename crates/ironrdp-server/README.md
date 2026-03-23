@@ -37,9 +37,12 @@ That split keeps the long-lived listener/bootstrap path separate from the per-cl
 The session driver is also the place where backlog handling, display-update dispatch,
 and resize-triggered reactivation are coordinated, so reliability and protocol tests
 for those paths should land close to that boundary rather than in the listener/bootstrap code.
-The current Windows-native fork intentionally serves one client session at a time; the listener
-serializes new accepts behind the active session loop until multi-session behavior is designed
-and tested explicitly.
+The current Windows-native fork enforces a **single-session-at-a-time** contract as an explicit
+invariant. When `run_connection` is entered, `RdpServer::active_session` (`Arc<AtomicBool>`) is set
+to `true` and cleared on exit via a `SessionGuard` RAII wrapper. Any new inbound TCP connection
+that arrives while a session is active is immediately dropped and logged at `INFO` level. This is
+intentional behaviour: multi-session support must be designed and validated explicitly before this
+invariant can be relaxed.
 
 This crate is part of the [IronRDP] project.
 
