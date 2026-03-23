@@ -2639,6 +2639,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ironrdp-rdcleanpath",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-graphics"
 version = "0.7.0"
 dependencies = [
