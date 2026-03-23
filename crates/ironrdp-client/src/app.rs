@@ -69,6 +69,11 @@ pub struct App {
     overwritten_frame_count: u64,
     pending_after_immediate_draw_count: u64,
     exit_code: Code,
+    /// Exit code to use when the user manually closes the window.
+    ///
+    /// Set to an error code when the session fails so that a user-initiated close
+    /// after reading the error title still propagates the correct exit status.
+    pending_close_code: Option<Code>,
     /// Whether the window is currently in borderless fullscreen mode.
     is_fullscreen: bool,
     /// Tracks the Ctrl modifier state, updated from `ModifiersChanged` events.
@@ -103,6 +108,7 @@ impl App {
             overwritten_frame_count: 0,
             pending_after_immediate_draw_count: 0,
             exit_code: Code::SUCCESS,
+            pending_close_code: None,
             is_fullscreen: false,
             ctrl_pressed: false,
             alt_pressed: false,
@@ -268,8 +274,11 @@ impl ApplicationHandler<RdpOutputEvent> for App {
             }
             WindowEvent::CloseRequested => {
                 if self.input_event_sender.send(RdpInputEvent::Close).is_err() {
-                    error!("Failed to send graceful shutdown event, closing the window");
-                    self.exit_with_code(event_loop, Code::FAILURE);
+                    // The session task has already exited (e.g. after a connection failure or
+                    // normal termination).  Use the stored error code so the process exits with
+                    // the status that was set when the failure was first reported.
+                    let code = self.pending_close_code.unwrap_or(Code::FAILURE);
+                    self.exit_with_code(event_loop, code);
                 }
             }
             WindowEvent::DroppedFile(_) => {
@@ -568,25 +577,43 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                 }
             }
             RdpOutputEvent::ConnectionFailure(error) => {
-                window.set_title("IronRDP \u{2014} Connection Failed");
-                error!(?error);
-                eprintln!("Connection error: {}", error.report());
-                self.exit_with_code(event_loop, proc_exit::sysexits::PROTOCOL_ERR);
+                let msg = error.report().to_string();
+                error!(?error, "Connection failed");
+                eprintln!("Connection error: {msg}");
+                // Keep the window open so the user can read the error message.
+                // Truncate to 100 characters so the title bar remains readable.
+                let truncated = truncate_for_title(&msg, 100);
+                window.set_title(&format!("IronRDP \u{2014} Connection failed: {truncated}"));
+                // Store the exit code so that when the user manually closes the window
+                // the process exits with the correct status.
+                self.pending_close_code = Some(proc_exit::sysexits::PROTOCOL_ERR);
             }
             RdpOutputEvent::Terminated(result) => {
-                window.set_title("IronRDP \u{2014} Disconnected");
-                let exit_code = match result {
+                match result {
                     Ok(reason) => {
-                        println!("Terminated gracefully: {reason}");
-                        proc_exit::sysexits::OK
+                        let msg = capitalize_first(&format!("terminated gracefully: {reason}"));
+                        info!(%reason, "Session ended: graceful disconnect");
+                        println!("{msg}");
+                        window.set_title(&format!("IronRDP \u{2014} {msg}"));
+                        self.exit_with_code(event_loop, proc_exit::sysexits::OK);
+                    }
+                    Err(ref error) if error.to_string().contains("GUI stopped unexpectedly") => {
+                        // The input channel was dropped because the event loop exited before the
+                        // RDP task.  This is an expected teardown race; do not show an error UI.
+                        debug!("Session task observed GUI shutdown; exiting cleanly");
+                        self.exit_with_code(event_loop, proc_exit::sysexits::OK);
                     }
                     Err(error) => {
-                        error!(?error);
-                        eprintln!("Active session error: {}", error.report());
-                        proc_exit::sysexits::PROTOCOL_ERR
+                        let msg = error.report().to_string();
+                        error!(?error, "Session ended: transport or protocol error");
+                        eprintln!("Active session error: {msg}");
+                        // Keep the window open so the user can read the error message.
+                        let truncated = truncate_for_title(&msg, 100);
+                        window.set_title(&format!("IronRDP \u{2014} Session error: {truncated}"));
+                        // Store the exit code for when the user closes the window.
+                        self.pending_close_code = Some(proc_exit::sysexits::PROTOCOL_ERR);
                     }
-                };
-                self.exit_with_code(event_loop, exit_code);
+                }
             }
             RdpOutputEvent::PointerHidden => {
                 window.set_cursor_visible(false);
@@ -651,6 +678,32 @@ fn send_fast_path_events(
     }
 }
 
+/// Capitalizes the first Unicode scalar value of `s`.
+///
+/// Returns `s` unchanged when it is empty or its first character has no uppercase form.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// Truncates `s` to at most `max_chars` Unicode scalar values.
+///
+/// Truncation happens on a character boundary so the result is always valid UTF-8.
+/// If the string is truncated a horizontal ellipsis (`…`) is appended to indicate
+/// that the message was cut short.
+fn truncate_for_title(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        truncated + "\u{2026}" // U+2026 HORIZONTAL ELLIPSIS
+    } else {
+        truncated
+    }
+}
+
 fn unicode_text_operations(text: &str) -> smallvec::SmallVec<[ironrdp::input::Operation; 8]> {
     let mut operations = smallvec::SmallVec::new();
 
@@ -670,7 +723,52 @@ mod tests {
     use tokio::sync::mpsc;
     use winit::dpi::PhysicalSize;
 
-    use super::{App, unicode_text_operations};
+    use super::{App, capitalize_first, truncate_for_title, unicode_text_operations};
+
+    #[test]
+    fn capitalize_first_empty_string() {
+        assert_eq!(capitalize_first(""), "");
+    }
+
+    #[test]
+    fn capitalize_first_already_capitalized() {
+        assert_eq!(capitalize_first("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn capitalize_first_lowercase_ascii() {
+        assert_eq!(capitalize_first("hello world"), "Hello world");
+    }
+
+    #[test]
+    fn capitalize_first_multibyte_char() {
+        // 'é' → 'É'
+        assert_eq!(capitalize_first("été"), "Été");
+    }
+
+    #[test]
+    fn truncate_for_title_short_string_unchanged() {
+        assert_eq!(truncate_for_title("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_for_title_exact_length_unchanged() {
+        assert_eq!(truncate_for_title("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_for_title_long_string_truncated_with_ellipsis() {
+        let result = truncate_for_title("abcdefghij", 5);
+        assert_eq!(result, "abcde\u{2026}");
+    }
+
+    #[test]
+    fn truncate_for_title_multibyte_chars_respected() {
+        // Each '中' is 3 bytes but 1 char; limit=2 should give "中中…"
+        let s = "中中中中";
+        let result = truncate_for_title(s, 2);
+        assert_eq!(result, "中中\u{2026}");
+    }
 
     #[test]
     fn unicode_text_operations_emit_press_and_release_pairs() {

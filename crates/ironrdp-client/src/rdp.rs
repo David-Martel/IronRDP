@@ -163,6 +163,7 @@ impl RdpClient {
                 {
                     Ok(result) => result,
                     Err(e) => {
+                        error!(error = %e, "Connection failed (WebSocket/RDCleanPath transport)");
                         let _ = self.event_loop_proxy.send_event(RdpOutputEvent::ConnectionFailure(e));
                         break;
                     }
@@ -177,6 +178,7 @@ impl RdpClient {
                 {
                     Ok(result) => result,
                     Err(e) => {
+                        error!(error = %e, "Connection failed (TCP/TLS transport)");
                         let _ = self.event_loop_proxy.send_event(RdpOutputEvent::ConnectionFailure(e));
                         break;
                     }
@@ -223,10 +225,12 @@ impl RdpClient {
                     self.config.connector.desktop_size.height = height;
                 }
                 Ok(RdpControlFlow::TerminatedGracefully(reason)) => {
+                    info!(%reason, "Session terminated gracefully");
                     self.send_terminal_event(Ok(reason));
                     break;
                 }
                 Err(e) => {
+                    error!(error = %e, "Session terminated with error");
                     self.send_terminal_event(Err(e));
                     break;
                 }

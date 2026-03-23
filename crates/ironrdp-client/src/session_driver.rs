@@ -150,7 +150,10 @@ impl SessionDriver {
                 }
                 Ok(SessionDriverFlow::Outputs(Vec::new()))
             }
-            RdpInputEvent::Close => Ok(SessionDriverFlow::Outputs(self.active_stage.graceful_shutdown()?)),
+            RdpInputEvent::Close => {
+                info!("User-initiated disconnect: sending graceful shutdown to server");
+                Ok(SessionDriverFlow::Outputs(self.active_stage.graceful_shutdown()?))
+            }
             RdpInputEvent::Clipboard(event) => {
                 trace!(
                     message_kind = clipboard_message_kind(&event),
@@ -336,7 +339,10 @@ impl SessionDriver {
                 );
                 Ok(None)
             }
-            ActiveStageOutput::Terminate(reason) => Ok(Some(reason)),
+            ActiveStageOutput::Terminate(reason) => {
+                info!(%reason, "Server-initiated graceful disconnect received");
+                Ok(Some(reason))
+            }
         }
     }
 
@@ -517,7 +523,17 @@ where
                 SessionDriverFlow::Outputs(driver.process_server_frame(action, &payload)?)
             }
             input_event = input_event_receiver.recv() => {
-                let input_event = input_event.ok_or_else(|| session::general_err!("GUI is stopped"))?;
+                let input_event = match input_event {
+                    Some(event) => event,
+                    None => {
+                        // The GUI event loop dropped the input channel — this happens when the
+                        // window is destroyed before a graceful-shutdown sequence completes
+                        // (e.g., the process is killed or the event loop exits abnormally).
+                        // Treat it as a hard disconnect rather than a protocol error.
+                        debug!("Input channel closed (GUI stopped); treating as hard disconnect");
+                        return Err(session::general_err!("GUI stopped unexpectedly"));
+                    }
+                };
                 driver.handle_input_event(input_event)?
             }
             _ = pacing_sleep => {

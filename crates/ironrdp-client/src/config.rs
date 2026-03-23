@@ -163,6 +163,28 @@ fn parse_hex(input: &str) -> Result<u32, ParseIntError> {
     }
 }
 
+/// Returns the active keyboard layout code for the current thread.
+///
+/// On Windows, this reads the low 16 bits of the thread keyboard layout handle
+/// (`HKL`) returned by `GetKeyboardLayout(0)`, which is the language identifier
+/// that RDP uses as the keyboard layout code.  On all other platforms, returns
+/// `0` so the server falls back to its own default active input locale.
+fn detect_keyboard_layout() -> u32 {
+    #[cfg(windows)]
+    {
+        // SAFETY: GetKeyboardLayout(0) queries the layout of the calling thread.
+        // It always returns a valid HKL (null means no layout, treated as 0 here).
+        // The low 16 bits of the pointer-sized HKL value are the language identifier.
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+        let hkl = unsafe { GetKeyboardLayout(0) };
+        (hkl.0 as usize as u32) & 0xFFFF
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
     name: String,
@@ -430,6 +452,15 @@ struct Args {
     /// may switch from bitmap updates to EGFX traffic. Requires the `egfx` feature.
     #[clap(long, default_value_t = false)]
     egfx: bool,
+
+    /// Keyboard layout code sent to the server (e.g., 0x00000409 for US English).
+    ///
+    /// When omitted, the layout is auto-detected from the active input locale on Windows.
+    /// On other platforms, 0 is used so the server falls back to its own default layout.
+    /// Common codes: 0x00000409 (en-US), 0x00000809 (en-GB), 0x0000040C (fr-FR),
+    /// 0x00000407 (de-DE), 0x00000411 (ja-JP), 0x00000412 (ko-KR).
+    #[clap(long, value_parser = parse_hex)]
+    keyboard_layout: Option<u32>,
 }
 
 impl Config {
@@ -566,6 +597,17 @@ impl Config {
             properties.desktop_height(),
         )?;
 
+        let keyboard_layout = match args.keyboard_layout {
+            Some(layout) => layout,
+            None => {
+                let detected = detect_keyboard_layout();
+                if detected != 0 {
+                    tracing::debug!(keyboard_layout = format_args!("0x{detected:08X}"), "Auto-detected keyboard layout");
+                }
+                detected
+            }
+        };
+
         let connector = connector::Config {
             credentials: Credentials::UsernamePassword { username, password },
             domain: args.domain,
@@ -573,7 +615,7 @@ impl Config {
             enable_credssp: !args.no_credssp,
             keyboard_type: KeyboardType::parse(args.keyboard_type),
             keyboard_subtype: args.keyboard_subtype,
-            keyboard_layout: 0, // the server SHOULD use the default active input locale identifier
+            keyboard_layout,
             keyboard_functional_keys_count: args.keyboard_functional_keys_count,
             ime_file_name: args.ime_file_name,
             dig_product_id: args.dig_product_id,
