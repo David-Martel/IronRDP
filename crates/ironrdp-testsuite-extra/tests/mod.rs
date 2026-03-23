@@ -329,6 +329,254 @@ where
         .await;
 }
 
+/// Variant of [`client_server`] that additionally passes the server [`ServerEvent`] sender to the
+/// callback.
+///
+/// This lets a test trigger server-side events (such as [`ServerEvent::Quit`]) from within the
+/// client body without altering the existing `client_server` helper signature.  The function
+/// builds its own complete server+client pair so the callback receives the `ev` sender directly.
+async fn client_server_with_ev_inner<F, Fut>(client_config: connector::Config, clientfn: F)
+where
+    F: FnOnce(
+            ActiveStage,
+            Framed<TokioStream<TlsStream<TcpStream>>>,
+            UnboundedSender<DisplayUpdate>,
+            UnboundedSender<ServerEvent>,
+        ) -> Fut
+        + 'static,
+    Fut: Future<Output = (ActiveStage, Framed<TokioStream<TlsStream<TcpStream>>>)>,
+{
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let (display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+        })
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let ev_for_client = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                server.run().await.unwrap();
+            });
+
+            let client_task = tokio::task::spawn_local(async move {
+                let (tx, rx) = oneshot::channel();
+                ev_for_client.send(ServerEvent::GetLocalAddr(tx)).unwrap();
+                let server_addr = rx.await.unwrap().unwrap();
+                let tcp_stream = TcpStream::connect(server_addr).await.expect("TCP connect");
+                let client_addr = tcp_stream.local_addr().expect("local_addr");
+                let mut framed = ironrdp_tokio::TokioFramed::new(tcp_stream);
+                let mut connector = connector::ClientConnector::new(client_config, client_addr);
+                let should_upgrade = ironrdp_async::connect_begin(&mut framed, &mut connector)
+                    .await
+                    .expect("begin connection");
+                let initial_stream = framed.into_inner_no_leftover();
+                let (upgraded_stream, tls_cert) = ironrdp_tls::upgrade(initial_stream, "localhost")
+                    .await
+                    .expect("TLS upgrade");
+                let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+                let mut upgraded_framed = ironrdp_tokio::TokioFramed::new(upgraded_stream);
+                let server_public_key =
+                    ironrdp_tls::extract_tls_server_public_key(&tls_cert).expect("extract server public key");
+                let connection_result = ironrdp_async::connect_finalize(
+                    upgraded,
+                    connector,
+                    &mut upgraded_framed,
+                    &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                    "localhost".into(),
+                    server_public_key.to_owned(),
+                    None,
+                )
+                .await
+                .expect("finalize connection");
+
+                let active_stage = ActiveStage::new(connection_result);
+                let (active_stage, mut upgraded_framed) =
+                    clientfn(active_stage, upgraded_framed, display_tx, ev_for_client.clone()).await;
+                let outputs = active_stage.graceful_shutdown().expect("shutdown");
+                for out in outputs {
+                    match out {
+                        ActiveStageOutput::ResponseFrame(frame) => {
+                            upgraded_framed.write_all(&frame).await.expect("write frame");
+                        }
+                        _ => unimplemented!(),
+                    }
+                }
+
+                while let Ok(pdu) = upgraded_framed.read_pdu().await {
+                    debug!(?pdu);
+                }
+                // The test body may already have sent a Quit; ignore a closed-channel error here.
+                let _ = ev_for_client.send(ServerEvent::Quit("bye".into()));
+            });
+
+            tokio::try_join!(server_task, client_task).expect("join");
+        })
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// New focused tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that the server handles a `ServerEvent::Quit` sent while a client session is active.
+///
+/// The server's `dispatch_server_events` path converts `ServerEvent::Quit` into
+/// `RunState::Disconnect`, which causes `accept_finalize` to return and the connection to close
+/// cleanly. The client side should drain to EOF without errors.
+#[tokio::test]
+async fn test_graceful_disconnect() {
+    client_server_with_ev_inner(
+        default_client_config(),
+        |stage, framed, _display_tx, ev| async move {
+            // Ask the server to quit while we are in the active-session phase.
+            // The server's client_loop will see the Quit event and return RunState::Disconnect.
+            ev.send(ServerEvent::Quit("test graceful disconnect".into()))
+                .expect("send Quit");
+            (stage, framed)
+        },
+    )
+    .await;
+}
+
+/// Verifies that dropping the display sender while the session is active does not panic.
+///
+/// When the `UnboundedSender<DisplayUpdate>` is dropped the server's `TestDisplayUpdates::next_update`
+/// returns `Ok(None)`, which is interpreted as `RunState::Disconnect`.  The server and client
+/// should both wind down cleanly without any unwrap panic or error.
+#[tokio::test]
+async fn test_server_display_write_failure() {
+    client_server(
+        default_client_config(),
+        |stage, framed, display_tx| async move {
+            // Dropping the sender closes the display channel.  The server observes Ok(None) from
+            // next_update and disconnects the session gracefully.
+            drop(display_tx);
+            (stage, framed)
+        },
+    )
+    .await;
+}
+
+/// Verifies that two consecutive resize / reactivation sequences complete without error.
+///
+/// This exercises the decompressor-state preservation across multiple reactivations: after the
+/// first reactivation `stage.reactivate_fastpath_processor` is called to update channel IDs and
+/// pointer settings while retaining the decompressor context; the second resize must then also
+/// complete successfully, proving that the preserved state is compatible with a further
+/// reactivation cycle.
+#[tokio::test]
+async fn test_double_reactivation() {
+    let client_config = default_client_config();
+    let mut image = DecodedImage::new(
+        PixelFormat::RgbA32,
+        client_config.desktop_size.width,
+        client_config.desktop_size.height,
+    );
+
+    client_server(client_config, |mut stage, mut framed, display_tx| async move {
+        // Helper that drives a single deactivation-reactivation sequence to completion and
+        // updates `stage` in-place.  Returns `stage` and `framed` for continued use.
+        async fn run_reactivation(
+            stage: &mut ActiveStage,
+            framed: &mut Framed<TokioStream<TlsStream<TcpStream>>>,
+            image: &mut DecodedImage,
+        ) {
+            let (action, payload) = framed.read_pdu().await.expect("valid PDU");
+            let outputs = stage.process(image, action, &payload).expect("stage process");
+            let out = outputs.into_iter().next().unwrap();
+            match out {
+                ActiveStageOutput::DeactivateAll(mut connection_activation) => {
+                    let mut buf = pdu::WriteBuf::new();
+                    'seq: loop {
+                        let written = ironrdp_async::single_sequence_step_read(
+                            framed,
+                            &mut *connection_activation,
+                            &mut buf,
+                        )
+                        .await
+                        .map_err(|e| session::custom_err!("read deactivation-reactivation sequence step", e))
+                        .unwrap();
+
+                        if written.size().is_some() {
+                            framed
+                                .write_all(buf.filled())
+                                .await
+                                .map_err(|e| {
+                                    session::custom_err!("write deactivation-reactivation sequence step", e)
+                                })
+                                .unwrap();
+                        }
+
+                        if let connector::connection_activation::ConnectionActivationState::Finalized {
+                            io_channel_id,
+                            user_channel_id,
+                            desktop_size,
+                            share_id,
+                            enable_server_pointer,
+                            pointer_software_rendering,
+                        } = connection_activation.connection_activation_state()
+                        {
+                            debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
+                            stage.reactivate_fastpath_processor(
+                                io_channel_id,
+                                user_channel_id,
+                                share_id,
+                                enable_server_pointer,
+                                pointer_software_rendering,
+                            );
+                            stage.set_share_id(share_id);
+                            stage.set_enable_server_pointer(enable_server_pointer);
+                            break 'seq;
+                        }
+                    }
+                }
+                _ => unreachable!("expected DeactivateAll"),
+            }
+        }
+
+        // First resize → first reactivation.
+        display_tx
+            .send(DisplayUpdate::Resize(DesktopSize {
+                width: 1280,
+                height: 1024,
+            }))
+            .unwrap();
+        run_reactivation(&mut stage, &mut framed, &mut image).await;
+
+        // Second resize → second reactivation, verifying decompressor state is preserved.
+        display_tx
+            .send(DisplayUpdate::Resize(DesktopSize {
+                width: 800,
+                height: 600,
+            }))
+            .unwrap();
+        run_reactivation(&mut stage, &mut framed, &mut image).await;
+
+        (stage, framed)
+    })
+    .await;
+}
+
 // Maybe implement Default for Config
 fn default_client_config() -> connector::Config {
     connector::Config {
