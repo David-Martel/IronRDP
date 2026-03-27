@@ -41,28 +41,26 @@ use crate::session_driver::{RdpControlFlow, run_active_session};
 
 /// Logging-only EGFX graphics pipeline handler.
 ///
-/// Advertises AVC420 capability so that the server may choose to switch from bitmap
-/// updates to EGFX traffic.  Every received GFX PDU is logged at `debug` level.
-/// This handler intentionally does not decode H.264 frames.
-///
-/// # Errors
-///
-/// This handler does not return errors from `handle_pdu`.
+/// Uses the default capability set which advertises V10.7/V8.1/V8 so that the
+/// server may choose to switch from bitmap updates to EGFX traffic.  Surface
+/// and frame events are logged at `debug` level.  This handler intentionally
+/// does not provide an H.264 decoder, so AVC-capable capability sets are
+/// automatically filtered out at advertisement time.
 #[cfg(feature = "egfx")]
 struct LoggingEgfxHandler;
 
 #[cfg(feature = "egfx")]
 impl ironrdp_egfx::client::GraphicsPipelineHandler for LoggingEgfxHandler {
-    fn capabilities(&self) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
-        // Advertise V8_1 with AVC420_ENABLED to encourage the server to switch
-        // from bitmap updates to EGFX traffic (MS-RDPEGFX 2.2.3.2).
-        vec![ironrdp_egfx::pdu::CapabilitySet::V8_1 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED,
-        }]
+    fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
+        debug!(?caps, "EGFX capabilities confirmed");
     }
 
-    fn handle_pdu(&mut self, pdu: ironrdp_egfx::pdu::GfxPdu) {
-        debug!(?pdu, "Received EGFX GFX PDU");
+    fn on_bitmap_updated(&mut self, update: &ironrdp_egfx::client::BitmapUpdate) {
+        debug!(surface_id = update.surface_id, "EGFX bitmap update received");
+    }
+
+    fn on_frame_complete(&mut self, frame_id: u32) {
+        debug!(frame_id, "EGFX frame complete");
     }
 }
 
@@ -341,6 +339,7 @@ async fn connect(
         info!("Registering EGFX graphics pipeline DVC channel");
         drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
             Box::new(LoggingEgfxHandler),
+            None, // no H.264 decoder — AVC frames are logged and skipped
         ));
     }
 
@@ -482,6 +481,7 @@ async fn connect_ws(
         info!("Registering EGFX graphics pipeline DVC channel");
         drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
             Box::new(LoggingEgfxHandler),
+            None, // no H.264 decoder — AVC frames are logged and skipped
         ));
     }
 
