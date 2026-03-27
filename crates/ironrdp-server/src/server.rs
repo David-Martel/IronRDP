@@ -20,8 +20,8 @@ use ironrdp_pdu::{PduResult, decode_err, nego};
 use ironrdp_rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use ironrdp_svc::StaticChannelSet;
 use ironrdp_tokio::TokioFramed;
-use tokio::io::AsyncWriteExt as _;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
 use tokio_rustls::TlsAcceptor;
@@ -397,7 +397,10 @@ impl RdpServer {
         acceptor.attach_static_channel(dvc);
     }
 
-    pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
+    pub async fn run_connection<S>(&mut self, stream: S) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+    {
         // Mark session active; the guard clears the flag on drop regardless of
         // how this function exits (normal return or propagated error).
         let _guard = SessionGuard(Arc::clone(&self.active_session));
@@ -434,9 +437,10 @@ impl RdpServer {
                 acceptor.mark_security_upgrade_as_done();
 
                 if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
-                    // how to get the client name?
-                    // doesn't seem to matter yet
-                    let client_name = framed.get_inner().0.get_ref().0.peer_addr()?.to_string();
+                    // Generic streams don't expose peer address. Use a neutral
+                    // placeholder; it's unclear whether CredSSP/NTLM actually
+                    // uses this value in practice.
+                    let client_name = "rdp-client".to_owned();
 
                     ironrdp_acceptor::accept_credssp(
                         &mut framed,
