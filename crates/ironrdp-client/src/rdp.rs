@@ -39,24 +39,58 @@ use winit::event_loop::EventLoopProxy;
 use crate::config::{Config, RDCleanPathConfig};
 use crate::session_driver::{RdpControlFlow, run_active_session};
 
-/// Logging-only EGFX graphics pipeline handler.
+/// EGFX graphics pipeline handler that forwards decoded frames to the event loop.
 ///
-/// Uses the default capability set which advertises V10.7/V8.1/V8 so that the
-/// server may choose to switch from bitmap updates to EGFX traffic.  Surface
-/// and frame events are logged at `debug` level.  This handler intentionally
-/// does not provide an H.264 decoder, so AVC-capable capability sets are
-/// automatically filtered out at advertisement time.
+/// Implements [`ironrdp_egfx::client::GraphicsPipelineHandler`] and sends every
+/// decoded EGFX bitmap update directly to the presentation layer via the winit
+/// event-loop proxy as an [`RdpOutputEvent::Image`].
+///
+/// When the `openh264` feature is enabled, an [`ironrdp_egfx::decode::OpenH264Decoder`]
+/// is created and passed to [`ironrdp_egfx::client::GraphicsPipelineClient`] so
+/// that AVC420/AVC444 streams are decoded to RGBA.  Without `openh264`, the decoder
+/// slot is left empty and AVC capability sets are automatically filtered from
+/// capability advertisement, so the server falls back to non-AVC EGFX modes.
 #[cfg(feature = "egfx")]
-struct LoggingEgfxHandler;
+struct EgfxRenderHandler {
+    event_loop_proxy: EventLoopProxy<RdpOutputEvent>,
+}
 
 #[cfg(feature = "egfx")]
-impl ironrdp_egfx::client::GraphicsPipelineHandler for LoggingEgfxHandler {
+impl EgfxRenderHandler {
+    fn new(event_loop_proxy: EventLoopProxy<RdpOutputEvent>) -> Self {
+        Self { event_loop_proxy }
+    }
+}
+
+#[cfg(feature = "egfx")]
+impl ironrdp_egfx::client::GraphicsPipelineHandler for EgfxRenderHandler {
     fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
         debug!(?caps, "EGFX capabilities confirmed");
     }
 
     fn on_bitmap_updated(&mut self, update: &ironrdp_egfx::client::BitmapUpdate) {
-        debug!(surface_id = update.surface_id, "EGFX bitmap update received");
+        if update.data.is_empty() {
+            trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (no decoder or empty frame)");
+            return;
+        }
+
+        let Some(width) = NonZeroU16::new(update.width) else {
+            trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (zero width)");
+            return;
+        };
+        let Some(height) = NonZeroU16::new(update.height) else {
+            trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (zero height)");
+            return;
+        };
+
+        let buffer = update.data.clone();
+
+        if let Err(e) = self
+            .event_loop_proxy
+            .send_event(RdpOutputEvent::Image { buffer, width, height })
+        {
+            debug!(error = %e, "Failed to forward EGFX bitmap update to event loop");
+        }
     }
 
     fn on_frame_complete(&mut self, frame_id: u32) {
@@ -156,6 +190,7 @@ impl RdpClient {
                     rdcleanpath,
                     self.cliprdr_factory.as_deref(),
                     &self.dvc_pipe_proxy_factory,
+                    &self.event_loop_proxy,
                 )
                 .await
                 {
@@ -171,6 +206,7 @@ impl RdpClient {
                     &self.config,
                     self.cliprdr_factory.as_deref(),
                     &self.dvc_pipe_proxy_factory,
+                    &self.event_loop_proxy,
                 )
                 .await
                 {
@@ -299,7 +335,13 @@ async fn connect(
     config: &Config,
     cliprdr_factory: Option<&(dyn CliprdrBackendFactory + Send)>,
     dvc_pipe_proxy_factory: &DvcPipeProxyFactory,
+    event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
 ) -> ConnectorResult<(ConnectionResult, UpgradedFramed)> {
+    // `event_loop_proxy` is forwarded to `EgfxRenderHandler` when the `egfx` feature is active.
+    // Suppress the "unused variable" lint for builds that do not enable `egfx`.
+    #[cfg(not(feature = "egfx"))]
+    let _ = event_loop_proxy;
+
     let dest = format!("{}:{}", config.destination.name(), config.destination.port());
 
     let (client_addr, stream) = if let Some(ref gw_config) = config.gw {
@@ -336,10 +378,29 @@ async fn connect(
     // Register EGFX graphics pipeline DVC channel (requires `egfx` feature)
     #[cfg(feature = "egfx")]
     if config.egfx {
+        // Build the optional H.264 decoder. With the `openh264` feature the
+        // bundled OpenH264 library is compiled in; without it the slot stays
+        // empty and AVC capability sets are filtered at advertisement time so
+        // the server falls back to non-AVC EGFX modes.
+        #[cfg(feature = "openh264")]
+        let h264_decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> =
+            match ironrdp_egfx::decode::OpenH264Decoder::new() {
+                Ok(decoder) => {
+                    info!("OpenH264 decoder initialized; EGFX AVC420 decode enabled");
+                    Some(Box::new(decoder))
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create OpenH264 decoder; EGFX will run without H.264");
+                    None
+                }
+            };
+        #[cfg(not(feature = "openh264"))]
+        let h264_decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> = None;
+
         info!("Registering EGFX graphics pipeline DVC channel");
         drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
-            Box::new(LoggingEgfxHandler),
-            None, // no H.264 decoder — AVC frames are logged and skipped
+            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone())),
+            h264_decoder,
         ));
     }
 
@@ -435,7 +496,13 @@ async fn connect_ws(
     rdcleanpath: &RDCleanPathConfig,
     cliprdr_factory: Option<&(dyn CliprdrBackendFactory + Send)>,
     dvc_pipe_proxy_factory: &DvcPipeProxyFactory,
+    event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
 ) -> ConnectorResult<(ConnectionResult, UpgradedFramed)> {
+    // `event_loop_proxy` is forwarded to `EgfxRenderHandler` when the `egfx` feature is active.
+    // Suppress the "unused variable" lint for builds that do not enable `egfx`.
+    #[cfg(not(feature = "egfx"))]
+    let _ = event_loop_proxy;
+
     let hostname = rdcleanpath
         .url
         .host_str()
@@ -478,10 +545,29 @@ async fn connect_ws(
     // Register EGFX graphics pipeline DVC channel (requires `egfx` feature)
     #[cfg(feature = "egfx")]
     if config.egfx {
+        // Build the optional H.264 decoder. With the `openh264` feature the
+        // bundled OpenH264 library is compiled in; without it the slot stays
+        // empty and AVC capability sets are filtered at advertisement time so
+        // the server falls back to non-AVC EGFX modes.
+        #[cfg(feature = "openh264")]
+        let h264_decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> =
+            match ironrdp_egfx::decode::OpenH264Decoder::new() {
+                Ok(decoder) => {
+                    info!("OpenH264 decoder initialized; EGFX AVC420 decode enabled");
+                    Some(Box::new(decoder))
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create OpenH264 decoder; EGFX will run without H.264");
+                    None
+                }
+            };
+        #[cfg(not(feature = "openh264"))]
+        let h264_decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> = None;
+
         info!("Registering EGFX graphics pipeline DVC channel");
         drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
-            Box::new(LoggingEgfxHandler),
-            None, // no H.264 decoder — AVC frames are logged and skipped
+            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone())),
+            h264_decoder,
         ));
     }
 

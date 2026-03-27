@@ -30,6 +30,7 @@ native-tls = ["ironrdp-tls/native-tls", "tokio-tungstenite/native-tls", "ironrdp
 qoi = ["ironrdp/qoi"]
 qoiz = ["ironrdp/qoiz"]
 egfx = ["ironrdp-egfx"]
+openh264 = ["egfx", "ironrdp-egfx/openh264-bundled"]
 
 [dependencies]
 # Protocols
