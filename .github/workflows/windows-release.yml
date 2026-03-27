@@ -1,0 +1,115 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish. When omitted, use the checked-out ref name.
+        required: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build Windows release assets
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare signing material
+        id: signing
+        shell: pwsh
+        run: |
+          $pfxSecret = '${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}'
+          $pfxPassword = '${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}'
+
+          if (-not [string]::IsNullOrWhiteSpace($pfxSecret)) {
+              $pfxPath = Join-Path $env:RUNNER_TEMP 'ironrdp-signing.pfx'
+              [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($pfxSecret))
+              "path=$pfxPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              "password=$pfxPassword" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } else {
+              "path=" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              "password=" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+
+      - name: Build publish artifacts
+        shell: pwsh
+        env:
+          GH_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          $publishArgs = @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', '.\build.ps1',
+            '-Mode', 'publish',
+            '-Release',
+            '-BootstrapTools',
+            '-UseNextest',
+            '-ArtifactRoot', (Join-Path $env:GITHUB_WORKSPACE 'release-artifacts'),
+            '-DeploymentName', 'windows-server-only',
+            '-TargetMachine', 'github-release',
+            '-ReleaseRepo', '${{ github.repository }}',
+            '-ReleaseTag', $env:GH_TAG
+          )
+
+          if (-not [string]::IsNullOrWhiteSpace('${{ steps.signing.outputs.path }}')) {
+              $publishArgs += @('-InstallerCertificatePath', '${{ steps.signing.outputs.path }}')
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace('${{ steps.signing.outputs.password }}')) {
+              $publishArgs += @('-InstallerCertificatePassword', '${{ steps.signing.outputs.password }}')
+          }
+
+          & pwsh @publishArgs
+
+      - name: Collect release assets
+        id: assets
+        shell: pwsh
+        env:
+          GH_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          $assetRoot = Join-Path $env:GITHUB_WORKSPACE 'release-artifacts'
+          $files = Get-ChildItem -Path $assetRoot -Recurse -File -Include *.zip,*.msix,*.msi,*.appinstaller,*.json,*.cer
+          if (-not $files) {
+              throw 'no release assets were generated'
+          }
+
+          $assetListPath = Join-Path $env:RUNNER_TEMP 'ironrdp-release-assets.txt'
+          $files.FullName | Set-Content -Path $assetListPath -Encoding utf8
+          "list=$assetListPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IronRDP-windows-release-assets
+          path: release-artifacts
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:GH_TAG
+          $assetList = Get-Content -LiteralPath '${{ steps.assets.outputs.list }}'
+
+          $existingRelease = gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+              gh release create $tag --generate-notes
+          }
+
+          gh release upload $tag $assetList --clobber

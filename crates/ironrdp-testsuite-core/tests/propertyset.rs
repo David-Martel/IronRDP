@@ -60,13 +60,13 @@ fn parse_file() {
                 kind: MalformedLine {
                     line: "MalformedLine:s",
                 },
-                line: 9,
+                line: 10,
             },
             Error {
                 kind: UnknownType {
                     ty: "z",
                 },
-                line: 10,
+                line: 11,
             },
         ]
     "#]]

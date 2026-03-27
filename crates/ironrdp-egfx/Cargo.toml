@@ -5,6 +5,7 @@ readme = "README.md"
 description = "Graphics pipeline dynamic channel extension implementation"
 publish = false # TODO: publish
 edition.workspace = true
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -33,3 +34,4 @@ openh264-libloading = ["openh264", "openh264/libloading"]
 
 [lints]
 workspace = true
+

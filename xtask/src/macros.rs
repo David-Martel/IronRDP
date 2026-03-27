@@ -18,13 +18,3 @@ macro_rules! trace {
 }
 
 pub(crate) use trace;
-
-macro_rules! run_cmd_in {
-    ($sh:expr, $prefix:expr, $args:literal) => {{
-        let _guard = $sh.push_dir($prefix);
-        eprintln!("In {}:", $sh.current_dir().display());
-        ::xshell::cmd!($sh, $args).run()
-    }};
-}
-
-pub(crate) use run_cmd_in;

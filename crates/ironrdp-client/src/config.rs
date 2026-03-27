@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use clap::Parser;
 use clap::clap_derive::ValueEnum;
 use ironrdp::connector::{self, Credentials};
+use ironrdp::pdu::gcc::MultiTransportFlags;
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp_mstsgu::GwConnectTarget;
@@ -16,6 +17,37 @@ use url::Url;
 
 const DEFAULT_WIDTH: u16 = 1920;
 const DEFAULT_HEIGHT: u16 = 1080;
+
+fn resolve_desktop_size(
+    width: Option<u16>,
+    height: Option<u16>,
+    property_width: Option<i64>,
+    property_height: Option<i64>,
+) -> anyhow::Result<connector::DesktopSize> {
+    match (width, height) {
+        (Some(width), Some(height)) => {
+            return Ok(connector::DesktopSize { width, height });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("desktop width and height must be provided together");
+        }
+        (None, None) => {}
+    }
+
+    match (property_width, property_height) {
+        (Some(width), Some(height)) => Ok(connector::DesktopSize {
+            width: u16::try_from(width).context("desktop width from .rdp file")?,
+            height: u16::try_from(height).context("desktop height from .rdp file")?,
+        }),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("desktop width and height from .rdp file must both be present");
+        }
+        (None, None) => Ok(connector::DesktopSize {
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+        }),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -39,6 +71,13 @@ pub struct Config {
     /// to obtain DVC plugin COM objects. Example: `C:\Windows\System32\webauthn.dll`.
     #[cfg(windows)]
     pub dvc_plugins: Vec<PathBuf>,
+
+    /// Register the EGFX graphics pipeline DVC channel and log received PDUs.
+    ///
+    /// When enabled, the client advertises AVC420 capability and logs every GFX PDU
+    /// received from the server. This is useful for observing whether the server switches
+    /// from bitmap updates to EGFX traffic. Requires the `egfx` feature flag.
+    pub egfx: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -59,6 +98,35 @@ fn compression_type_from_level(level: u32) -> anyhow::Result<ironrdp::pdu::rdp::
         2 => Ok(CompressionType::Rdp6),
         3 => Ok(CompressionType::Rdp61),
         _ => anyhow::bail!("Invalid compression level. Valid values are 0, 1, 2, 3."),
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum MultitransportMode {
+    Off,
+    Reliable,
+    PreferReliable,
+    Lossy,
+    PreferLossy,
+}
+
+fn multitransport_flags_from_mode(mode: MultitransportMode) -> Option<MultiTransportFlags> {
+    use MultitransportMode as Mode;
+
+    match mode {
+        Mode::Off => None,
+        Mode::Reliable => Some(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR),
+        Mode::PreferReliable => Some(
+            MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
+                | MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED
+                | MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
+        ),
+        Mode::Lossy => Some(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL),
+        Mode::PreferLossy => Some(
+            MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL
+                | MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED
+                | MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
+        ),
     }
 }
 
@@ -92,6 +160,28 @@ fn parse_hex(input: &str) -> Result<u32, ParseIntError> {
         u32::from_str_radix(input.get(2..).unwrap_or(""), 16)
     } else {
         input.parse::<u32>()
+    }
+}
+
+/// Returns the active keyboard layout code for the current thread.
+///
+/// On Windows, this reads the low 16 bits of the thread keyboard layout handle
+/// (`HKL`) returned by `GetKeyboardLayout(0)`, which is the language identifier
+/// that RDP uses as the keyboard layout code.  On all other platforms, returns
+/// `0` so the server falls back to its own default active input locale.
+fn detect_keyboard_layout() -> u32 {
+    #[cfg(windows)]
+    {
+        // SAFETY: GetKeyboardLayout(0) queries the layout of the calling thread.
+        // It always returns a valid HKL (null means no layout, treated as 0 here).
+        // The low 16 bits of the pointer-sized HKL value are the language identifier.
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+        let hkl = unsafe { GetKeyboardLayout(0) };
+        (hkl.0 as usize as u32) & 0xFFFF
+    }
+    #[cfg(not(windows))]
+    {
+        0
     }
 }
 
@@ -197,7 +287,7 @@ impl FromStr for DvcProxyInfo {
 /// Devolutions IronRDP client
 #[derive(Parser, Debug)]
 #[clap(author = "Devolutions", about = "Devolutions-IronRDP client")]
-#[clap(version, long_about = None)]
+#[clap(version = crate::version::VERSION, long_about = None)]
 struct Args {
     /// A file with IronRDP client logs
     #[clap(short, long, value_parser)]
@@ -269,6 +359,14 @@ struct Args {
     #[clap(long)]
     color_depth: Option<u32>,
 
+    /// Initial desktop width to request from the server.
+    #[clap(long, requires("height"))]
+    width: Option<u16>,
+
+    /// Initial desktop height to request from the server.
+    #[clap(long, requires("width"))]
+    height: Option<u16>,
+
     /// Ignore mouse pointer messages sent by the server. Increases performance when enabled, as the
     /// client could skip costly software rendering of the pointer with alpha blending
     #[clap(long)]
@@ -325,6 +423,14 @@ struct Args {
     #[clap(long, value_parser = clap::value_parser!(u32).range(0..=3), default_value_t = 3)]
     compression_level: u32,
 
+    /// Advertise RDP multitransport capability.
+    ///
+    /// This is currently experimental on the Windows-native client. When the
+    /// server requests a UDP sideband, IronRDP still replies with a standards-
+    /// compliant abort response until the native UDP transport path is implemented.
+    #[clap(long, value_enum, default_value_t = MultitransportMode::Off)]
+    multitransport: MultitransportMode,
+
     /// Add DVC channel named pipe proxy
     ///
     /// The format is `<name>=<pipe>`, e.g., `ChannelName=PipeName` where `ChannelName` is the name of the channel,
@@ -339,6 +445,22 @@ struct Args {
     #[cfg(windows)]
     #[clap(long)]
     dvc_plugin: Vec<PathBuf>,
+
+    /// Enable experimental EGFX graphics pipeline (logs GFX PDUs, does not decode H.264)
+    ///
+    /// Registers the RDPEGFX DVC channel and advertises AVC420 capability so the server
+    /// may switch from bitmap updates to EGFX traffic. Requires the `egfx` feature.
+    #[clap(long, default_value_t = false)]
+    egfx: bool,
+
+    /// Keyboard layout code sent to the server (e.g., 0x00000409 for US English).
+    ///
+    /// When omitted, the layout is auto-detected from the active input locale on Windows.
+    /// On other platforms, 0 is used so the server falls back to its own default layout.
+    /// Common codes: 0x00000409 (en-US), 0x00000809 (en-GB), 0x0000040C (fr-FR),
+    /// 0x00000407 (de-DE), 0x00000411 (ja-JP), 0x00000412 (ko-KR).
+    #[clap(long, value_parser = parse_hex)]
+    keyboard_layout: Option<u32>,
 }
 
 impl Config {
@@ -468,6 +590,24 @@ impl Config {
             None
         };
 
+        let desktop_size = resolve_desktop_size(
+            args.width,
+            args.height,
+            properties.desktop_width(),
+            properties.desktop_height(),
+        )?;
+
+        let keyboard_layout = match args.keyboard_layout {
+            Some(layout) => layout,
+            None => {
+                let detected = detect_keyboard_layout();
+                if detected != 0 {
+                    tracing::debug!(keyboard_layout = format_args!("0x{detected:08X}"), "Auto-detected keyboard layout");
+                }
+                detected
+            }
+        };
+
         let connector = connector::Config {
             credentials: Credentials::UsernamePassword { username, password },
             domain: args.domain,
@@ -475,20 +615,17 @@ impl Config {
             enable_credssp: !args.no_credssp,
             keyboard_type: KeyboardType::parse(args.keyboard_type),
             keyboard_subtype: args.keyboard_subtype,
-            keyboard_layout: 0, // the server SHOULD use the default active input locale identifier
+            keyboard_layout,
             keyboard_functional_keys_count: args.keyboard_functional_keys_count,
             ime_file_name: args.ime_file_name,
             dig_product_id: args.dig_product_id,
-            desktop_size: connector::DesktopSize {
-                width: DEFAULT_WIDTH,
-                height: DEFAULT_HEIGHT,
-            },
+            desktop_size,
             desktop_scale_factor: 0, // Default to 0 per FreeRDP
             bitmap: Some(bitmap),
-            client_build: semver::Version::parse(env!("CARGO_PKG_VERSION"))
-                .map_or(0, |version| version.major * 100 + version.minor * 10 + version.patch)
+            client_build: semver::Version::parse(crate::version::VERSION)
+                .map_or(0, |v| v.major * 100 + v.minor * 10 + v.patch)
                 .pipe(u32::try_from)
-                .context("cargo package version")?,
+                .context("build version")?,
             client_name: whoami::hostname().unwrap_or_else(|_| "ironrdp".to_owned()),
             // NOTE: hardcode this value like in freerdp
             // https://github.com/FreeRDP/FreeRDP/blob/4e24b966c86fdf494a782f0dfcfc43a057a2ea60/libfreerdp/core/settings.c#LL49C34-L49C70
@@ -508,7 +645,7 @@ impl Config {
             enable_audio_playback: true,
             request_data: None,
             pointer_software_rendering: false,
-            multitransport_flags: None,
+            multitransport_flags: multitransport_flags_from_mode(args.multitransport),
             compression_type,
             performance_flags: PerformanceFlags::default(),
             timezone_info: TimezoneInfo::default(),
@@ -531,6 +668,84 @@ impl Config {
             dvc_pipe_proxies: args.dvc_proxy,
             #[cfg(windows)]
             dvc_plugins: args.dvc_plugin,
+            egfx: args.egfx,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+    use ironrdp::pdu::gcc::MultiTransportFlags;
+
+    use super::{Args, MultitransportMode, multitransport_flags_from_mode, resolve_desktop_size};
+
+    #[test]
+    fn resolve_desktop_size_prefers_cli_values() {
+        let size = resolve_desktop_size(Some(1600), Some(900), Some(1280), Some(720)).expect("desktop size");
+
+        assert_eq!(size.width, 1600);
+        assert_eq!(size.height, 900);
+    }
+
+    #[test]
+    fn resolve_desktop_size_uses_rdp_file_values() {
+        let size = resolve_desktop_size(None, None, Some(1366), Some(768)).expect("desktop size");
+
+        assert_eq!(size.width, 1366);
+        assert_eq!(size.height, 768);
+    }
+
+    #[test]
+    fn resolve_desktop_size_rejects_partial_values() {
+        let error = resolve_desktop_size(Some(1280), None, None, None).expect_err("partial cli size must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("desktop width and height must be provided together")
+        );
+    }
+
+    #[test]
+    fn multitransport_mode_off_disables_capability() {
+        assert_eq!(multitransport_flags_from_mode(MultitransportMode::Off), None);
+    }
+
+    #[test]
+    fn multitransport_mode_prefer_reliable_sets_expected_flags() {
+        let flags = multitransport_flags_from_mode(MultitransportMode::PreferReliable).expect("flags should be set");
+
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR));
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED));
+        assert!(flags.contains(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP));
+        assert!(!flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL));
+    }
+
+    #[test]
+    fn multitransport_mode_lossy_sets_only_lossy_flag() {
+        let flags = multitransport_flags_from_mode(MultitransportMode::Lossy).expect("flags should be set");
+
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL));
+        assert!(!flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR));
+        assert!(!flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED));
+        assert!(!flags.contains(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP));
+    }
+
+    #[test]
+    fn multitransport_mode_prefer_lossy_sets_expected_flags() {
+        let flags = multitransport_flags_from_mode(MultitransportMode::PreferLossy).expect("flags should be set");
+
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL));
+        assert!(flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED));
+        assert!(flags.contains(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP));
+        assert!(!flags.contains(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR));
+    }
+
+    #[test]
+    fn cli_parser_accepts_multitransport_mode() {
+        let args = Args::try_parse_from(["ironrdp-client", "server.example", "--multitransport", "prefer-lossy"])
+            .expect("multitransport CLI parse");
+
+        assert_eq!(args.multitransport, MultitransportMode::PreferLossy);
     }
 }

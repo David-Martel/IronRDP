@@ -1,43 +1,73 @@
+//! Connection setup and reconnect policy for the native client.
+//!
+//! This module owns transport establishment, gateway/WebSocket/TLS upgrade,
+//! static and dynamic channel wiring, and top-level reconnect behavior.
+//! The live session loop itself lives in the crate-private `session_driver` module.
+
 use core::num::NonZeroU16;
+use core::time::Duration;
 use std::sync::Arc;
 
 use ironrdp::cliprdr::backend::{ClipboardMessage, CliprdrBackendFactory};
-use ironrdp::connector::connection_activation::ConnectionActivationState;
 use ironrdp::connector::{ConnectionResult, ConnectorResult};
 use ironrdp::displaycontrol::client::DisplayControlClient;
-use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 #[cfg(windows)]
 use ironrdp::dvc::DvcProcessor as _;
 use ironrdp::echo::client::EchoClient;
-use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::graphics::pointer::DecodedPointer;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::{PduResult, pdu_other_err};
-use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
+use ironrdp::session::{GracefulDisconnectReason, SessionResult};
 use ironrdp::svc::SvcMessage;
-use ironrdp::{cliprdr, connector, rdpdr, rdpsnd, session};
+use ironrdp::{cliprdr, connector, rdpdr, rdpsnd};
 use ironrdp_core::WriteBuf;
 #[cfg(windows)]
 use ironrdp_dvc_com_plugin::load_dvc_plugin;
 use ironrdp_dvc_pipe_proxy::DvcNamedPipeProxy;
 use ironrdp_rdpsnd_native::cpal;
+use ironrdp_tokio::FramedWrite;
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
-use ironrdp_tokio::{FramedWrite, single_sequence_step_read, split_tokio_framed};
 use rdpdr::NoopRdpdrBackend;
 use smallvec::SmallVec;
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 use winit::event_loop::EventLoopProxy;
 
 use crate::config::{Config, RDCleanPathConfig};
+use crate::session_driver::{RdpControlFlow, run_active_session};
+
+/// Logging-only EGFX graphics pipeline handler.
+///
+/// Uses the default capability set which advertises V10.7/V8.1/V8 so that the
+/// server may choose to switch from bitmap updates to EGFX traffic.  Surface
+/// and frame events are logged at `debug` level.  This handler intentionally
+/// does not provide an H.264 decoder, so AVC-capable capability sets are
+/// automatically filtered out at advertisement time.
+#[cfg(feature = "egfx")]
+struct LoggingEgfxHandler;
+
+#[cfg(feature = "egfx")]
+impl ironrdp_egfx::client::GraphicsPipelineHandler for LoggingEgfxHandler {
+    fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
+        debug!(?caps, "EGFX capabilities confirmed");
+    }
+
+    fn on_bitmap_updated(&mut self, update: &ironrdp_egfx::client::BitmapUpdate) {
+        debug!(surface_id = update.surface_id, "EGFX bitmap update received");
+    }
+
+    fn on_frame_complete(&mut self, frame_id: u32) {
+        debug!(frame_id, "EGFX frame complete");
+    }
+}
 
 #[derive(Debug)]
 pub enum RdpOutputEvent {
     Image {
-        buffer: Vec<u32>,
+        buffer: Vec<u8>,
         width: NonZeroU16,
         height: NonZeroU16,
     },
@@ -62,8 +92,10 @@ pub enum RdpInputEvent {
         physical_size: Option<(u32, u32)>,
     },
     FastPath(SmallVec<[FastPathInputEvent; 2]>),
+    FramePresented,
     Close,
     Clipboard(ClipboardMessage),
+    RecycleFrameBuffer(Vec<u8>),
     SendDvcMessages {
         channel_id: u32,
         messages: Vec<SvcMessage>,
@@ -115,6 +147,8 @@ pub struct RdpClient {
 
 impl RdpClient {
     pub async fn run(mut self) {
+        let mut same_size_reconnects = 0;
+
         loop {
             let (connection_result, framed) = if let Some(rdcleanpath) = self.config.rdcleanpath.as_ref() {
                 match connect_ws(
@@ -127,6 +161,7 @@ impl RdpClient {
                 {
                     Ok(result) => result,
                     Err(e) => {
+                        error!(error = %e, "Connection failed (WebSocket/RDCleanPath transport)");
                         let _ = self.event_loop_proxy.send_event(RdpOutputEvent::ConnectionFailure(e));
                         break;
                     }
@@ -141,13 +176,14 @@ impl RdpClient {
                 {
                     Ok(result) => result,
                     Err(e) => {
+                        error!(error = %e, "Connection failed (TCP/TLS transport)");
                         let _ = self.event_loop_proxy.send_event(RdpOutputEvent::ConnectionFailure(e));
                         break;
                     }
                 }
             };
 
-            match active_session(
+            match run_active_session(
                 framed,
                 connection_result,
                 &self.event_loop_proxy,
@@ -156,25 +192,53 @@ impl RdpClient {
             .await
             {
                 Ok(RdpControlFlow::ReconnectWithNewSize { width, height }) => {
+                    let current_width = self.config.connector.desktop_size.width;
+                    let current_height = self.config.connector.desktop_size.height;
+
+                    match update_resize_reconnect_state(
+                        current_width,
+                        current_height,
+                        width,
+                        height,
+                        same_size_reconnects,
+                    ) {
+                        Ok(next_same_size_reconnects) => {
+                            same_size_reconnects = next_same_size_reconnects;
+                        }
+                        Err(error) => {
+                            self.send_terminal_event(Err(error));
+                            break;
+                        }
+                    }
+
+                    info!(
+                        current_width,
+                        current_height,
+                        next_width = width,
+                        next_height = height,
+                        same_size_reconnects,
+                        "Restarting session with updated desktop size"
+                    );
                     self.config.connector.desktop_size.width = width;
                     self.config.connector.desktop_size.height = height;
                 }
                 Ok(RdpControlFlow::TerminatedGracefully(reason)) => {
-                    let _ = self.event_loop_proxy.send_event(RdpOutputEvent::Terminated(Ok(reason)));
+                    info!(%reason, "Session terminated gracefully");
+                    self.send_terminal_event(Ok(reason));
                     break;
                 }
                 Err(e) => {
-                    let _ = self.event_loop_proxy.send_event(RdpOutputEvent::Terminated(Err(e)));
+                    error!(error = %e, "Session terminated with error");
+                    self.send_terminal_event(Err(e));
                     break;
                 }
             }
         }
     }
-}
 
-enum RdpControlFlow {
-    ReconnectWithNewSize { width: u16, height: u16 },
-    TerminatedGracefully(GracefulDisconnectReason),
+    fn send_terminal_event(&self, result: SessionResult<GracefulDisconnectReason>) {
+        let _ = self.event_loop_proxy.send_event(RdpOutputEvent::Terminated(result));
+    }
 }
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite {}
@@ -182,6 +246,54 @@ trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite {}
 
 type UpgradedFramed = ironrdp_tokio::TokioFramed<Box<dyn AsyncReadWrite + Unpin + Send + Sync>>;
+
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_SAME_SIZE_RECONNECTS: u8 = 3;
+
+fn update_resize_reconnect_state(
+    current_width: u16,
+    current_height: u16,
+    next_width: u16,
+    next_height: u16,
+    same_size_reconnects: u8,
+) -> SessionResult<u8> {
+    if current_width == next_width && current_height == next_height {
+        let next_same_size_reconnects = same_size_reconnects.saturating_add(1);
+
+        if next_same_size_reconnects > MAX_SAME_SIZE_RECONNECTS {
+            return Err(ironrdp::session::general_err!(
+                "too many resize reconnects without a desktop size change"
+            ));
+        }
+
+        return Ok(next_same_size_reconnects);
+    }
+
+    Ok(0)
+}
+
+fn configure_tcp_stream(stream: &TcpStream) -> ConnectorResult<()> {
+    stream
+        .set_nodelay(true)
+        .map_err(|e| connector::custom_err!("set TCP_NODELAY", e))?;
+
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+
+    SockRef::from(stream)
+        .set_tcp_keepalive(&keepalive)
+        .map_err(|e| connector::custom_err!("set TCP keepalive", e))?;
+
+    debug!(
+        keepalive_time = ?TCP_KEEPALIVE_TIME,
+        keepalive_interval = ?TCP_KEEPALIVE_INTERVAL,
+        "Configured TCP socket"
+    );
+
+    Ok(())
+}
 
 async fn connect(
     config: &Config,
@@ -199,6 +311,7 @@ async fn connect(
         let stream = TcpStream::connect(dest)
             .await
             .map_err(|e| connector::custom_err!("TCP connect", e))?;
+        configure_tcp_stream(&stream)?;
         let client_addr = stream
             .local_addr()
             .map_err(|e| connector::custom_err!("get socket local address", e))?;
@@ -218,6 +331,16 @@ async fn connect(
         trace!(%channel_name, %pipe_name, "Creating DVC proxy");
 
         drdynvc = drdynvc.with_dynamic_channel(dvc_pipe_proxy_factory.create(channel_name, pipe_name));
+    }
+
+    // Register EGFX graphics pipeline DVC channel (requires `egfx` feature)
+    #[cfg(feature = "egfx")]
+    if config.egfx {
+        info!("Registering EGFX graphics pipeline DVC channel");
+        drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
+            Box::new(LoggingEgfxHandler),
+            None, // no H.264 decoder — AVC frames are logged and skipped
+        ));
     }
 
     // Load DVC COM plugins (Windows only)
@@ -250,12 +373,15 @@ async fn connect(
         }
     }
 
+    info!("Enable RDPSND playback channel");
+    info!("Configured RDPDR backend backend=NoopRdpdrBackend");
     let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
         .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(0));
 
     if let Some(builder) = cliprdr_factory {
+        info!("Attach CLIPRDR channel");
         let backend = builder.build_cliprdr_backend();
 
         let cliprdr = cliprdr::Cliprdr::new(backend);
@@ -292,6 +418,13 @@ async fn connect(
     )
     .await?;
 
+    info!(
+        desktop_width = connection_result.desktop_size.width,
+        desktop_height = connection_result.desktop_size.height,
+        io_channel_id = connection_result.io_channel_id,
+        user_channel_id = connection_result.user_channel_id,
+        "Connection established"
+    );
     debug!(?connection_result);
 
     Ok((connection_result, upgraded_framed))
@@ -314,9 +447,7 @@ async fn connect_ws(
         .await
         .map_err(|e| connector::custom_err!("TCP connect", e))?;
 
-    socket
-        .set_nodelay(true)
-        .map_err(|e| connector::custom_err!("set TCP_NODELAY", e))?;
+    configure_tcp_stream(&socket)?;
 
     let client_addr = socket
         .local_addr()
@@ -342,6 +473,16 @@ async fn connect_ws(
         trace!(%channel_name, %pipe_name, "Creating DVC proxy");
 
         drdynvc = drdynvc.with_dynamic_channel(dvc_pipe_proxy_factory.create(channel_name, pipe_name));
+    }
+
+    // Register EGFX graphics pipeline DVC channel (requires `egfx` feature)
+    #[cfg(feature = "egfx")]
+    if config.egfx {
+        info!("Registering EGFX graphics pipeline DVC channel");
+        drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
+            Box::new(LoggingEgfxHandler),
+            None, // no H.264 decoder — AVC frames are logged and skipped
+        ));
     }
 
     // Load DVC COM plugins (Windows only)
@@ -374,12 +515,15 @@ async fn connect_ws(
         }
     }
 
+    info!("Enable RDPSND playback channel");
+    info!("Configured RDPDR backend backend=NoopRdpdrBackend");
     let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
         .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(0));
 
     if let Some(builder) = cliprdr_factory {
+        info!("Attach CLIPRDR channel");
         let backend = builder.build_cliprdr_backend();
 
         let cliprdr = cliprdr::Cliprdr::new(backend);
@@ -516,15 +660,14 @@ where
                 if let Ok(x224_confirm) = ironrdp_core::decode::<
                     ironrdp::pdu::x224::X224<ironrdp::pdu::nego::ConnectionConfirm>,
                 >(&x224_connection_response)
+                    && let ironrdp::pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0
                 {
-                    if let ironrdp::pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0 {
-                        // Convert to negotiation failure instead of generic RDCleanPath error.
-                        let negotiation_failure = connector::NegotiationFailure::from(code);
-                        return Err(connector::ConnectorError::new(
-                            "RDP negotiation failed",
-                            connector::ConnectorErrorKind::Negotiation(negotiation_failure),
-                        ));
-                    }
+                    // Convert to negotiation failure instead of generic RDCleanPath error.
+                    let negotiation_failure = connector::NegotiationFailure::from(code);
+                    return Err(connector::ConnectorError::new(
+                        "RDP negotiation failed",
+                        connector::ConnectorErrorKind::Negotiation(negotiation_failure),
+                    ));
                 }
 
                 // Fallback to generic error if we can't decode the negotiation failure.
@@ -569,222 +712,35 @@ where
     }
 }
 
-async fn active_session(
-    framed: UpgradedFramed,
-    connection_result: ConnectionResult,
-    event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
-    input_event_receiver: &mut mpsc::UnboundedReceiver<RdpInputEvent>,
-) -> SessionResult<RdpControlFlow> {
-    let (mut reader, mut writer) = split_tokio_framed(framed);
-    let mut image = DecodedImage::new(
-        PixelFormat::RgbA32,
-        connection_result.desktop_size.width,
-        connection_result.desktop_size.height,
-    );
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SAME_SIZE_RECONNECTS, update_resize_reconnect_state};
 
-    let mut active_stage = ActiveStage::new(connection_result);
+    #[test]
+    fn resize_reconnect_resets_counter_when_size_changes() {
+        let counter = update_resize_reconnect_state(1024, 768, 1600, 900, MAX_SAME_SIZE_RECONNECTS)
+            .expect("size change should be accepted");
 
-    let disconnect_reason = 'outer: loop {
-        let outputs = tokio::select! {
-            frame = reader.read_pdu() => {
-                let (action, payload) = frame.map_err(|e| session::custom_err!("read frame", e))?;
-                trace!(?action, frame_length = payload.len(), "Frame received");
+        assert_eq!(counter, 0);
+    }
 
-                active_stage.process(&mut image, action, &payload)?
-            }
-            input_event = input_event_receiver.recv() => {
-                let input_event = input_event.ok_or_else(|| session::general_err!("GUI is stopped"))?;
+    #[test]
+    fn resize_reconnect_counts_unchanged_size_retries() {
+        let counter =
+            update_resize_reconnect_state(1024, 768, 1024, 768, 1).expect("same size retry should be tracked");
 
-                match input_event {
-                    RdpInputEvent::Resize { width, height, scale_factor, physical_size } => {
-                        trace!(width, height, "Resize event");
-                        let width = u32::from(width);
-                        let height = u32::from(height);
-                        // TODO: Make adjust_display_size take and return width and height as u16.
-                        // From the function's doc comment, the width and height values must be less than or equal to 8192 pixels.
-                        // Therefore, we can remove unnecessary casts from u16 to u32 and back.
-                        let (width, height) = MonitorLayoutEntry::adjust_display_size(width, height);
-                        debug!(width, height, "Adjusted display size");
-                        if let Some(response_frame) = active_stage.encode_resize(width, height, Some(scale_factor), physical_size) {
-                            vec![ActiveStageOutput::ResponseFrame(response_frame?)]
-                        } else {
-                            // TODO(#271): use the "auto-reconnect cookie": https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/15b0d1c9-2891-4adb-a45e-deb4aeeeab7c
-                            debug!("Reconnecting with new size");
-                            let width = u16::try_from(width).expect("always in the range");
-                            let height = u16::try_from(height).expect("always in the range");
-                            return Ok(RdpControlFlow::ReconnectWithNewSize { width, height })
-                        }
-                    },
-                    RdpInputEvent::FastPath(events) => {
-                        trace!(?events);
-                        active_stage.process_fastpath_input(&mut image, &events)?
-                    }
-                    RdpInputEvent::Close => {
-                        active_stage.graceful_shutdown()?
-                    }
-                    RdpInputEvent::Clipboard(event) => {
-                        if let Some(cliprdr) = active_stage.get_svc_processor::<cliprdr::CliprdrClient>() {
-                            if let Some(svc_messages) = match event {
-                                ClipboardMessage::SendInitiateCopy(formats) => {
-                                    Some(cliprdr.initiate_copy(&formats)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendFormatData(response) => {
-                                    Some(cliprdr.submit_format_data(response)
-                                    .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendInitiatePaste(format) => {
-                                    Some(cliprdr.initiate_paste(format)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendLockClipboard { clip_data_id } => {
-                                    Some(cliprdr.lock_clipboard(clip_data_id)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendUnlockClipboard { clip_data_id } => {
-                                    Some(cliprdr.unlock_clipboard(clip_data_id)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendFileContentsRequest(request) => {
-                                    Some(cliprdr.request_file_contents(request)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::SendFileContentsResponse(response) => {
-                                    Some(cliprdr.submit_file_contents(response)
-                                        .map_err(|e| session::custom_err!("CLIPRDR", e))?)
-                                }
-                                ClipboardMessage::Error(e) => {
-                                    error!("Clipboard backend error: {}", e);
-                                    None
-                                }
-                            } {
-                                let frame = active_stage.process_svc_processor_messages(svc_messages)?;
-                                // Send the messages to the server
-                                vec![ActiveStageOutput::ResponseFrame(frame)]
-                            } else {
-                                // No messages to send to the server
-                                Vec::new()
-                            }
-                        } else  {
-                            warn!("Clipboard event received, but Cliprdr is not available");
-                            Vec::new()
-                        }
-                    }
-                    RdpInputEvent::SendDvcMessages { channel_id, messages } => {
-                        trace!(channel_id, ?messages, "Send DVC messages");
+        assert_eq!(counter, 2);
+    }
 
-                        let frame = active_stage.encode_dvc_messages(messages)?;
-                        vec![ActiveStageOutput::ResponseFrame(frame)]
-                    }
-                }
-            }
-        };
+    #[test]
+    fn resize_reconnect_rejects_excessive_unchanged_size_retries() {
+        let error = update_resize_reconnect_state(1024, 768, 1024, 768, MAX_SAME_SIZE_RECONNECTS)
+            .expect_err("same size retry limit should be enforced");
 
-        for out in outputs {
-            match out {
-                ActiveStageOutput::ResponseFrame(frame) => writer
-                    .write_all(&frame)
-                    .await
-                    .map_err(|e| session::custom_err!("write response", e))?,
-                ActiveStageOutput::GraphicsUpdate(_region) => {
-                    let buffer: Vec<u32> = image
-                        .data()
-                        .chunks_exact(4)
-                        .map(|pixel| {
-                            let r = pixel[0];
-                            let g = pixel[1];
-                            let b = pixel[2];
-                            u32::from_be_bytes([0, r, g, b])
-                        })
-                        .collect();
-
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::Image {
-                            buffer,
-                            width: NonZeroU16::new(image.width())
-                                .ok_or_else(|| session::general_err!("width is zero"))?,
-                            height: NonZeroU16::new(image.height())
-                                .ok_or_else(|| session::general_err!("height is zero"))?,
-                        })
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::PointerDefault => {
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::PointerDefault)
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::PointerHidden => {
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::PointerHidden)
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::PointerPosition { x, y } => {
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::PointerPosition { x, y })
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::PointerBitmap(pointer) => {
-                    event_loop_proxy
-                        .send_event(RdpOutputEvent::PointerBitmap(pointer))
-                        .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                }
-                ActiveStageOutput::DeactivateAll(mut connection_activation) => {
-                    // Execute the Deactivation-Reactivation Sequence:
-                    // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
-                    debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
-                    let mut buf = WriteBuf::new();
-                    'activation_seq: loop {
-                        let written = single_sequence_step_read(&mut reader, &mut *connection_activation, &mut buf)
-                            .await
-                            .map_err(|e| session::custom_err!("read deactivation-reactivation sequence step", e))?;
-
-                        if written.size().is_some() {
-                            writer.write_all(buf.filled()).await.map_err(|e| {
-                                session::custom_err!("write deactivation-reactivation sequence step", e)
-                            })?;
-                        }
-
-                        if let ConnectionActivationState::Finalized {
-                            io_channel_id,
-                            user_channel_id,
-                            desktop_size,
-                            share_id,
-                            enable_server_pointer,
-                            pointer_software_rendering,
-                        } = connection_activation.connection_activation_state()
-                        {
-                            debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
-                            // Update image size with the new desktop size.
-                            image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
-                            // Update the active stage with the new channel IDs and pointer settings.
-                            active_stage.set_fastpath_processor(
-                                fast_path::ProcessorBuilder {
-                                    io_channel_id,
-                                    user_channel_id,
-                                    share_id,
-                                    enable_server_pointer,
-                                    pointer_software_rendering,
-                                    bulk_decompressor: None,
-                                }
-                                .build(),
-                            );
-                            active_stage.set_share_id(share_id);
-                            active_stage.set_enable_server_pointer(enable_server_pointer);
-                            break 'activation_seq;
-                        }
-                    }
-                }
-                ActiveStageOutput::MultitransportRequest(pdu) => {
-                    debug!(
-                        request_id = pdu.request_id,
-                        requested_protocol = ?pdu.requested_protocol,
-                        "Multitransport request received (UDP transport not implemented)"
-                    );
-                }
-                ActiveStageOutput::Terminate(reason) => break 'outer reason,
-            }
-        }
-    };
-
-    Ok(RdpControlFlow::TerminatedGracefully(disconnect_reason))
+        assert!(
+            error
+                .to_string()
+                .contains("too many resize reconnects without a desktop size change")
+        );
+    }
 }

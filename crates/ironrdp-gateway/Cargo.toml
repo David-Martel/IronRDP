@@ -1,0 +1,30 @@
+[package]
+name = "ironrdp-gateway"
+version = "0.1.0"
+readme = "README.md"
+description = "RDCleanPath-compatible RDP gateway: auth, policy, and data-plane relay"
+edition.workspace = true
+rust-version = "1.94"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Not publishing for now — gateway is a server-side internal crate.
+publish = false
+
+[lib]
+doctest = false
+test = false
+
+[dependencies]
+ironrdp-rdcleanpath = { path = "../ironrdp-rdcleanpath", version = "0.2" }
+
+anyhow = "1"
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+tracing = { version = "0.1", features = ["log"] }
+
+[lints]
+workspace = true

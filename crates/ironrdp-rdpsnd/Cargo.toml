@@ -4,7 +4,7 @@ version = "0.7.0"
 readme = "README.md"
 description = "RDPSND static channel for audio output implemented as described in MS-RDPEA"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -17,15 +17,16 @@ doctest = false
 test = false
 
 [features]
-default = []
-std = []
+default = ["std"]
+std = ["ironrdp-core/std", "ironrdp-pdu/std", "ironrdp-svc/std", "tracing/std"]
 
 [dependencies]
 bitflags = "2.9"
-tracing = { version = "0.1", features = ["log"] }
+tracing = { version = "0.1", default-features = false, features = ["log"] }
 ironrdp-svc = { path = "../ironrdp-svc", version = "0.6" } # public
 ironrdp-core = { path = "../ironrdp-core", version = "0.1", features = ["alloc"] }
 ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.7", features = ["alloc"] } # public
 
 [lints]
 workspace = true
+

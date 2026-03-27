@@ -25,9 +25,10 @@ Pay attention to the "**Architecture Invariant**" sections.
 
 **Architectural Invariant**: all these crates must be fuzzed.
 
-**Architectural Invariant**: must be `#[no_std]`-compatible (optionally using the `alloc` crate). Usage of the standard
-library must be opt-in through a feature flag called `std` that is enabled by default. When the `alloc` crate is optional,
-a feature flag called `alloc` must exist to enable its use.
+**Architectural Guideline**: preserve existing `#[no_std]` compatibility where it remains cheap and valuable, but it is no
+longer a hard requirement for foundational crates. Using `std` is acceptable when it materially improves implementation
+simplicity, performance, or Windows/server-focused maintainability. When `std`/`alloc` feature separation is intentionally
+retained, keep `std` opt-in through a `std` feature and use an `alloc` feature where appropriate.
 
 **Architectural Invariant**: no platform-dependant code (`#[cfg(windows)]` and such).
 
@@ -116,7 +117,7 @@ Utilities to manage and build input packets.
 
 #### [`crates/ironrdp-rdcleanpath`](./crates/ironrdp-rdcleanpath)
 
-RDCleanPath PDU structure used by IronRDP web client and Devolutions Gateway.
+RDCleanPath PDU structure used by Devolutions Gateway and related gateway integrations.
 
 #### [`crates/ironrdp-error`](./crates/ironrdp-error)
 
@@ -170,27 +171,19 @@ NOTE: it’s not yet clear if this crate is an API Boundary or an implementation
 
 Portable RDP client without GPU acceleration.
 
-#### [`crates/ironrdp-web`](./crates/ironrdp-web)
+The current native client is intentionally split between:
+- `app.rs` for the window/rendering boundary,
+- `rdp.rs` for connection setup and reconnect policy,
+- `session_driver.rs` for the active-session runtime over an established transport.
 
-WebAssembly high-level bindings targeting web browsers.
-
-This crate is an **API Boundary** (WASM module).
-
-#### [`web-client/iron-remote-desktop`](./web-client/iron-remote-desktop)
-
-Core frontend UI used by `iron-svelte-client` as a Web Component.
-
-This crate is an **API Boundary**.
-
-#### [`web-client/iron-remote-desktop-rdp`](./web-client/iron-remote-desktop-rdp)
-
-Implementation of the TypeScript interfaces exposed by WebAssembly bindings from `ironrdp-web` and used by `iron-svelte-client`.
-
-This crate is an **API Boundary**.
-
-#### [`web-client/iron-svelte-client`](./web-client/iron-svelte-client)
-
-Web-based frontend using `Svelte` and `Material` frameworks.
+Keeping the active-session driver separate from connection establishment reduces coupling
+between GUI concerns, transport setup, and protocol/session processing. The Windows-native
+path also keeps text input and presentation concerns at the top of the stack: `app.rs`
+translates `winit` IME commit events into Unicode fast-path input, and `session_driver.rs`
+reuses packed presentation buffers so the software-render path can be optimized without
+leaking windowing assumptions into transport/session code. The reconnect policy in `rdp.rs`
+also now treats repeated resize reconnects without an actual size change as a bounded error
+condition rather than an implicit infinite loop.
 
 #### [`crates/ironrdp-cliprdr-native`](./crates/ironrdp-cliprdr-native)
 
@@ -254,7 +247,10 @@ State machines to drive an RDP connection acceptance sequence
 
 #### [`crates/ironrdp-server`](./crates/ironrdp-server) (@mihneabuz)
 
-Extendable skeleton for implementing custom RDP servers.
+Extendable skeleton for implementing custom RDP servers. The crate now keeps
+listener/bootstrap/channel wiring in `server.rs` and the accepted-session state
+machine in `session_driver.rs`, mirroring the client-side split between
+connection setup and live session runtime.
 
 #### [`crates/ironrdp-mstsgu`](./crates/ironrdp-mstsgu) (@steffengy)
 
@@ -280,7 +276,7 @@ This section talks about the things which are everywhere and nowhere in particul
 
 - Dependency injection when runtime information is necessary in core tier crates (no system call such as `gethostname`)
 - Keep non-portable code out of core tier crates
-- Make crate `no_std`-compatible wherever possible
+- Prefer keeping crate `no_std`-compatible when it remains low-cost and useful
 - Facilitate fuzzing
 - In libraries, provide concrete error types either hand-crafted or using `thiserror` crate
 - In binaries, use the convenient catch-all error type `anyhow::Error`
@@ -289,12 +285,13 @@ This section talks about the things which are everywhere and nowhere in particul
 ### Avoid I/O wherever possible
 
 **Architecture Invariant**: core tier crates must never interact with the outside world. Only extra tier crates
-such as `ironrdp-client`, `ironrdp-web` or `ironrdp-async` are allowed to do I/O.
+such as `ironrdp-client` or `ironrdp-async` are allowed to do I/O.
 
 ### Continuous integration
 
 We use GitHub action and our workflows simply run `cargo xtask`.
 The expectation is that, if `cargo xtask ci` passes locally, the CI will be green as well.
+Windows-only FFI checks are skipped by `cargo xtask ci` on non-Windows hosts and are validated in the dedicated Windows CI job.
 
 **Architecture Invariant**: `cargo xtask ci` and CI workflow must be logically equivalents. It must
 be the case that a successful `cargo xtask ci` run implies a successful CI workflow run and vice versa.

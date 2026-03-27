@@ -8,10 +8,10 @@ use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_dvc::{DrdynvcClient, DvcProcessor, DynamicVirtualChannel};
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::geometry::InclusiveRectangle;
-use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
+use ironrdp_pdu::input::fast_path::{FastPathInputEvent, FastPathInputRef};
 use ironrdp_pdu::rdp::client_info::CompressionType as PduCompressionType;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
-use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
+use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu};
 use ironrdp_pdu::{Action, mcs};
 use ironrdp_svc::{SvcMessage, SvcProcessor, SvcProcessorMessages};
 use tracing::{debug, info};
@@ -98,8 +98,7 @@ impl ActiveStage {
         let mut output = Vec::with_capacity(2);
 
         // Encoding fastpath response frame
-        // PERF: unnecessary copy
-        let fastpath_input = FastPathInput::new(events.to_vec()).map_err(SessionError::decode)?;
+        let fastpath_input = FastPathInputRef::new(events).map_err(SessionError::decode)?;
         let frame = ironrdp_core::encode_vec(&fastpath_input).map_err(SessionError::encode)?;
         output.push(ActiveStageOutput::ResponseFrame(frame));
 
@@ -184,6 +183,23 @@ impl ActiveStage {
         self.fast_path_processor = processor;
     }
 
+    pub fn reactivate_fastpath_processor(
+        &mut self,
+        io_channel_id: u16,
+        user_channel_id: u16,
+        share_id: u32,
+        enable_server_pointer: bool,
+        pointer_software_rendering: bool,
+    ) {
+        self.fast_path_processor.reactivate(
+            io_channel_id,
+            user_channel_id,
+            share_id,
+            enable_server_pointer,
+            pointer_software_rendering,
+        );
+    }
+
     /// Updates the share_id used by the x224 processor for encoding ShareDataPdu.
     /// Must be called during Deactivation-Reactivation if the server assigns a new share_id.
     pub fn set_share_id(&mut self, share_id: u32) {
@@ -211,6 +227,16 @@ impl ActiveStage {
     /// Send a pdu on the static global channel. Typically used to send input events
     pub fn encode_static(&self, output: &mut WriteBuf, pdu: ShareDataPdu) -> SessionResult<usize> {
         self.x224_processor.encode_static(output, pdu)
+    }
+
+    /// Fully encodes a multitransport response on the IO channel.
+    ///
+    /// This is used by client runtimes that want to keep negotiation explicit
+    /// even before a UDP sideband transport has been implemented.
+    pub fn encode_multitransport_response(&self, response: &MultitransportResponsePdu) -> SessionResult<Vec<u8>> {
+        let mut frame = WriteBuf::new();
+        self.x224_processor.encode_io_channel(&mut frame, response)?;
+        Ok(frame.into_inner())
     }
 
     pub fn get_svc_processor<T: SvcProcessor + 'static>(&mut self) -> Option<&T> {

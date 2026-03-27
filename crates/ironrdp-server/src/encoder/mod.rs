@@ -1,7 +1,7 @@
 use core::fmt;
 use core::num::NonZeroU16;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use ironrdp_acceptor::DesktopSize;
 use ironrdp_graphics::diff::{Rect, find_different_rects_sub};
 use ironrdp_pdu::encode_vec;
@@ -116,6 +116,27 @@ impl UpdateEncoder {
         codecs: UpdateEncoderCodecs,
         max_request_size: u32,
     ) -> Result<Self> {
+        // RDP protocol allows at most 8192×8192; zero dimensions are also invalid
+        // because downstream code (e.g., split_diff) divides by width/height.
+        ensure!(
+            desktop_size.width > 0,
+            "desktop width must be non-zero"
+        );
+        ensure!(
+            desktop_size.height > 0,
+            "desktop height must be non-zero"
+        );
+        ensure!(
+            desktop_size.width <= 8192,
+            "desktop width {} exceeds protocol maximum of 8192",
+            desktop_size.width
+        );
+        ensure!(
+            desktop_size.height <= 8192,
+            "desktop height {} exceeds protocol maximum of 8192",
+            desktop_size.height
+        );
+
         let bitmap_updater = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
             match codecs {
                 #[cfg(feature = "qoiz")]
@@ -435,6 +456,31 @@ enum BitmapUpdater {
 
 impl BitmapUpdater {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
+        // Validate that stride is wide enough to hold a full row of pixels.
+        // Handlers index each row as `row[..bytes_per_pixel * width]`; a stride
+        // narrower than that would cause an out-of-bounds slice panic.
+        let min_stride = usize::from(bitmap.format.bytes_per_pixel()) * usize::from(bitmap.width.get());
+        ensure!(
+            bitmap.stride.get() >= min_stride,
+            "bitmap stride {} is narrower than required row width {} ({}bpp × {} px)",
+            bitmap.stride.get(),
+            min_stride,
+            bitmap.format.bytes_per_pixel() * 8,
+            bitmap.width,
+        );
+
+        // Validate that the data buffer is large enough for stride × height rows.
+        let expected_data_len = bitmap.stride.get() * usize::from(bitmap.height.get());
+        if bitmap.data.len() < expected_data_len {
+            bail!(
+                "bitmap data length {} is too small for {} stride × {} height rows (expected at least {})",
+                bitmap.data.len(),
+                bitmap.stride,
+                bitmap.height,
+                expected_data_len,
+            );
+        }
+
         match self {
             Self::None(up) => up.handle(bitmap),
             Self::Bitmap(up) => up.handle(bitmap),
@@ -474,6 +520,7 @@ impl BitmapUpdateHandler for NoneHandler {
 #[derive(Clone)]
 struct BitmapHandler {
     bitmap: BitmapEncoder,
+    buffer: Vec<u8>,
 }
 
 impl fmt::Debug for BitmapHandler {
@@ -486,20 +533,25 @@ impl BitmapHandler {
     fn new() -> Self {
         Self {
             bitmap: BitmapEncoder::new(),
+            buffer: Vec::new(),
         }
     }
 }
 
 impl BitmapUpdateHandler for BitmapHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
-        let mut buffer = vec![0; bitmap.data.len() * 2]; // TODO: estimate bitmap encoded size
+        let initial_len = bitmap.data.len() * 2;
+        if self.buffer.len() < initial_len {
+            self.buffer.resize(initial_len, 0);
+        }
         let len = loop {
-            match self.bitmap.encode(bitmap, buffer.as_mut_slice()) {
+            match self.bitmap.encode(bitmap, self.buffer.as_mut_slice()) {
                 Err(err) => match err {
                     BitmapEncodeError::Encode(e) => match e.kind() {
                         ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
-                            buffer.resize(buffer.len() * 2, 0);
-                            debug!("encoder buffer resized to: {}", buffer.len() * 2);
+                            let next_len = self.buffer.len().saturating_mul(2).max(1);
+                            self.buffer.resize(next_len, 0);
+                            debug!(buffer_len = self.buffer.len(), "Bitmap encoder buffer resized");
                         }
                         _ => Err(e).context("bitmap encode error")?,
                     },
@@ -509,8 +561,7 @@ impl BitmapUpdateHandler for BitmapHandler {
             }
         };
 
-        buffer.truncate(len);
-        Ok(UpdateFragmenter::new(UpdateCode::Bitmap, buffer))
+        Ok(UpdateFragmenter::new(UpdateCode::Bitmap, self.buffer[..len].to_vec()))
     }
 }
 
@@ -519,6 +570,7 @@ struct RemoteFxHandler {
     remotefx: RfxEncoder,
     codec_id: u8,
     desktop_size: Option<DesktopSize>,
+    buffer: Vec<u8>,
 }
 
 impl RemoteFxHandler {
@@ -527,6 +579,7 @@ impl RemoteFxHandler {
             remotefx: RfxEncoder::new(algo),
             desktop_size: Some(desktop_size),
             codec_id,
+            buffer: Vec::new(),
         }
     }
 
@@ -537,16 +590,19 @@ impl RemoteFxHandler {
 
 impl BitmapUpdateHandler for RemoteFxHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
-        let mut buffer = vec![0; bitmap.data.len()];
+        if self.buffer.len() < bitmap.data.len() {
+            self.buffer.resize(bitmap.data.len(), 0);
+        }
         let len = loop {
             match self
                 .remotefx
-                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size.take())
+                .encode(bitmap, self.buffer.as_mut_slice(), self.desktop_size.take())
             {
                 Err(e) => match e.kind() {
                     ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
-                        buffer.resize(buffer.len() * 2, 0);
-                        debug!("encoder buffer resized to: {}", buffer.len() * 2);
+                        let next_len = self.buffer.len().saturating_mul(2).max(1);
+                        self.buffer.resize(next_len, 0);
+                        debug!(buffer_len = self.buffer.len(), "RemoteFX encoder buffer resized");
                     }
                     _ => Err(e).context("RemoteFX encode error")?,
                 },
@@ -554,7 +610,7 @@ impl BitmapUpdateHandler for RemoteFxHandler {
             }
         };
 
-        set_surface(bitmap, self.codec_id, &buffer[..len])
+        set_surface(bitmap, self.codec_id, &self.buffer[..len])
     }
 }
 

@@ -24,6 +24,26 @@ Custom logic for your RDP server can be added by implementing these traits:
  - `RdpServerInputHandler` - callbacks used when the server receives input events from a client
  - `RdpServerDisplay`      - notifies the server of display updates
 
+## Internal layout
+
+The Tokio server is now split into a few coarse responsibilities:
+
+- `builder.rs`: typed builder for assembling `RdpServer` instances.
+- `server.rs`: listener lifecycle, transport/security bootstrap, and channel registration.
+- `session_driver.rs`: accepted-client runtime, including input dispatch, display updates, server events, and deactivation/reactivation handling.
+- `display.rs` / `handler.rs`: integration traits for host display and input backends.
+
+That split keeps the long-lived listener/bootstrap path separate from the per-client session state machine, which reduces coupling between connection setup and runtime event handling.
+The session driver is also the place where backlog handling, display-update dispatch,
+and resize-triggered reactivation are coordinated, so reliability and protocol tests
+for those paths should land close to that boundary rather than in the listener/bootstrap code.
+The current Windows-native fork enforces a **single-session-at-a-time** contract as an explicit
+invariant. When `run_connection` is entered, `RdpServer::active_session` (`Arc<AtomicBool>`) is set
+to `true` and cleared on exit via a `SessionGuard` RAII wrapper. Any new inbound TCP connection
+that arrives while a session is active is immediately dropped and logged at `INFO` level. This is
+intentional behaviour: multi-session support must be designed and validated explicitly before this
+invariant can be relaxed.
+
 This crate is part of the [IronRDP] project.
 
 ## Echo RTT probes (feature `echo`)

@@ -31,12 +31,6 @@ TASKS:
   fuzz install            Install dependencies required for fuzzing
   fuzz run [--duration <SECONDS>] [--target <NAME>]
                           Fuzz a specific target if any or all targets for a limited duration (default is 5s)
-  wasm check              Ensure WASM module is compatible for the web
-  wasm install            Install dependencies required to build the WASM target
-  web check               Ensure Web Client is building without error
-  web install             Install dependencies required to build and run Web Client
-  web build               Build the Web Client
-  web run                 Run SvelteKit-based standalone Web Client
   ffi install             Install all requirements for ffi tasks
   ffi build [--release]   Build DLL for FFI (default is debug)
   ffi bindings [--skip-dotnet-build]            
@@ -85,12 +79,6 @@ pub enum Action {
         duration: Option<u32>,
         target: Option<String>,
     },
-    WasmCheck,
-    WasmInstall,
-    WebCheck,
-    WebInstall,
-    WebBuild,
-    WebRun,
     FfiInstall,
     FfiBuildDll {
         release: bool,
@@ -151,20 +139,6 @@ pub fn parse_args() -> anyhow::Result<Args> {
                     target: None,
                 },
                 Some(unknown) => anyhow::bail!("unknown fuzz action: {unknown}"),
-            },
-            Some("wasm") => match args.subcommand()?.as_deref() {
-                Some("check") => Action::WasmCheck,
-                Some("install") => Action::WasmInstall,
-                Some(unknown) => anyhow::bail!("unknown wasm action: {unknown}"),
-                None => Action::ShowHelp,
-            },
-            Some("web") => match args.subcommand()?.as_deref() {
-                Some("check") => Action::WebCheck,
-                Some("install") => Action::WebInstall,
-                Some("build") => Action::WebBuild,
-                Some("run") => Action::WebRun,
-                Some(unknown) => anyhow::bail!("unknown web action: {unknown}"),
-                None => Action::ShowHelp,
             },
             Some("ffi") => match args.subcommand()?.as_deref() {
                 Some("install") => Action::FfiInstall,

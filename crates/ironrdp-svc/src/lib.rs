@@ -1,15 +1,16 @@
 #![cfg_attr(doc, doc = include_str!("../README.md"))]
 #![doc(html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg")]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 // TODO: #![warn(missing_docs)]
 
 extern crate alloc;
 
+use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use core::any::TypeId;
 use core::fmt;
 use core::marker::PhantomData;
-use std::borrow::Cow;
 
 use bitflags::bitflags;
 use ironrdp_core::{

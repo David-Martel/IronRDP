@@ -50,6 +50,21 @@ pub struct Processor {
 }
 
 impl Processor {
+    pub fn reactivate(
+        &mut self,
+        io_channel_id: u16,
+        user_channel_id: u16,
+        share_id: u32,
+        enable_server_pointer: bool,
+        pointer_software_rendering: bool,
+    ) {
+        self.complete_data = CompleteData::new();
+        self.marker_processor = FrameMarkerProcessor::new(user_channel_id, io_channel_id, share_id);
+        self.mouse_pos_update = None;
+        self.enable_server_pointer = enable_server_pointer;
+        self.pointer_software_rendering = pointer_software_rendering;
+    }
+
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.mouse_pos_update = Some((x, y));
     }
@@ -63,10 +78,10 @@ impl Processor {
     ) -> SessionResult<Vec<UpdateKind>> {
         let mut processor_updates = Vec::new();
 
-        if let Some((x, y)) = self.mouse_pos_update.take() {
-            if let Some(rect) = image.move_pointer(x, y)? {
-                processor_updates.push(UpdateKind::Region(rect));
-            }
+        if let Some((x, y)) = self.mouse_pos_update.take()
+            && let Some(rect) = image.move_pointer(x, y)?
+        {
+            processor_updates.push(UpdateKind::Region(rect));
         }
 
         let mut input = ReadCursor::new(input);

@@ -1,6 +1,7 @@
 #[diplomat::bridge]
 pub mod ffi {
     use core::fmt::Write as _;
+    use std::collections::VecDeque;
 
     use anyhow::Context as _;
     use diplomat_runtime::DiplomatWriteable;
@@ -116,7 +117,7 @@ pub mod ffi {
                     .as_ref()
                     .ok_or_else(|| Self::missing_field("server_cert_chain"))?;
 
-                Ok(Box::new(VecU8(x224.as_bytes().to_vec())))
+                Ok(VecU8::from_bytes(x224.as_bytes()))
             } else if let Some(error) = &self.0.error {
                 if error.error_code == ironrdp_rdcleanpath::NEGOTIATION_ERROR_CODE {
                     let x224 = self
@@ -125,7 +126,7 @@ pub mod ffi {
                         .as_ref()
                         .ok_or_else(|| Self::missing_field("x224_connection_pdu"))?;
 
-                    Ok(Box::new(VecU8(x224.as_bytes().to_vec())))
+                    Ok(VecU8::from_bytes(x224.as_bytes()))
                 } else {
                     Err(GenericError(anyhow::anyhow!("RDCleanPath variant does not contain X.224 response")).into())
                 }
@@ -148,8 +149,11 @@ pub mod ffi {
                     .as_ref()
                     .ok_or_else(|| Self::missing_field("server_cert_chain"))?;
 
-                let certs: Vec<Vec<u8>> = certs.iter().map(|cert| cert.as_bytes().to_vec()).collect();
-                Ok(Box::new(CertificateChainIterator { certs, index: 0 }))
+                let certs = certs
+                    .iter()
+                    .map(|cert| VecU8(cert.as_bytes().to_vec()))
+                    .collect::<VecDeque<_>>();
+                Ok(Box::new(CertificateChainIterator { certs }))
             } else {
                 Err(GenericError(anyhow::anyhow!(
                     "RDCleanPath variant does not contain certificate chain"
@@ -163,10 +167,9 @@ pub mod ffi {
             if self.0.server_addr.is_some()
                 && self.0.server_cert_chain.is_some()
                 && self.0.x224_connection_pdu.is_some()
+                && let Some(server_addr) = &self.0.server_addr
             {
-                if let Some(server_addr) = &self.0.server_addr {
-                    let _ = write!(writeable, "{server_addr}");
-                }
+                let _ = write!(writeable, "{server_addr}");
             }
         }
 
@@ -242,19 +245,12 @@ pub mod ffi {
 
     #[diplomat::opaque]
     pub struct CertificateChainIterator {
-        certs: Vec<Vec<u8>>,
-        index: usize,
+        certs: VecDeque<VecU8>,
     }
 
     impl CertificateChainIterator {
         pub fn next(&mut self) -> Option<Box<VecU8>> {
-            if self.index < self.certs.len() {
-                let cert = self.certs[self.index].clone();
-                self.index += 1;
-                Some(Box::new(VecU8(cert)))
-            } else {
-                None
-            }
+            self.certs.pop_front().map(Box::new)
         }
 
         pub fn len(&self) -> usize {

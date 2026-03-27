@@ -22,8 +22,6 @@ extend-exclude = ["*.bin", "*.bmp", "package-lock.json"]
 
 [default]
 extend-ignore-re = [
-   # Ignore false-positives for auth tokens in the following file:
-   # - web-client\iron-svelte-client\src\lib\login\login.svelte
    "(?m)let authtoken =\\s+'.+';\\s?$",
 
    # False-positive fix for Base64 ironrdp-testsuite-core\tests\pcb.rs:

@@ -4,7 +4,7 @@ version = "0.1.5"
 readme = "README.md"
 description = "IronRDP common traits and types"
 edition.workspace = true
-rust-version = "1.89"
+rust-version = "1.94"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -23,3 +23,4 @@ alloc = ["ironrdp-error/alloc"]
 
 [dependencies]
 ironrdp-error = { path = "../ironrdp-error", version = "0.1" } # public
+

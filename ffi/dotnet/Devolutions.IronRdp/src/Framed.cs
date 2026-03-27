@@ -1,12 +1,20 @@
+using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Devolutions.IronRdp;
 
 public class Framed<TS> where TS : Stream
 {
+    private const int ReadChunkSize = 8096;
+
     private readonly TS _stream;
     private List<byte> _buffer;
-    private readonly Mutex _writeLock = new();
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     public Framed(TS stream)
     {
@@ -21,9 +29,10 @@ public class Framed<TS> where TS : Stream
 
     public async Task<(Action, byte[])> ReadPdu()
     {
+        var pdu = IronRdpPdu.New();
         while (true)
         {
-            var pduInfo = IronRdpPdu.New().FindSize(this._buffer.ToArray());
+            var pduInfo = pdu.FindSize(SnapshotBuffer());
 
             // Don't remove, FindSize is generated and can return null
             if (null != pduInfo)
@@ -60,13 +69,16 @@ public class Framed<TS> where TS : Stream
     /// <returns>An array of bytes containing the read data.</returns>
     public async Task<byte[]> ReadExact(nuint size)
     {
+        var exactSize = checked((int)size);
+
         while (true)
         {
-            if (_buffer.Count >= (int)size)
+            if (_buffer.Count >= exactSize)
             {
-                var res = this._buffer.Take((int)size).ToArray();
-                this._buffer = this._buffer.Skip((int)size).ToList();
-                return res;
+                var result = new byte[exactSize];
+                CollectionsMarshal.AsSpan(this._buffer)[..exactSize].CopyTo(result);
+                this._buffer.RemoveRange(0, exactSize);
+                return result;
             }
 
             var len = await this.Read();
@@ -79,16 +91,30 @@ public class Framed<TS> where TS : Stream
 
     async Task<int> Read()
     {
-        var buffer = new byte[8096];
-        Memory<byte> memory = buffer;
-        var size = await this._stream.ReadAsync(memory);
-        this._buffer.AddRange(buffer.Take(size));
-        return size;
+        var rented = ArrayPool<byte>.Shared.Rent(ReadChunkSize);
+        try
+        {
+            var size = await this._stream.ReadAsync(rented.AsMemory(0, ReadChunkSize));
+            if (size > 0)
+            {
+                this._buffer.Capacity = Math.Max(this._buffer.Capacity, this._buffer.Count + size);
+                for (var i = 0; i < size; i++)
+                {
+                    this._buffer.Add(rented[i]);
+                }
+            }
+
+            return size;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     public async Task Write(byte[] data)
     {
-        _writeLock.WaitOne();
+        await _writeLock.WaitAsync();
         try
         {
             ReadOnlyMemory<byte> memory = data;
@@ -96,7 +122,7 @@ public class Framed<TS> where TS : Stream
         }
         finally
         {
-            _writeLock.ReleaseMutex();
+            _writeLock.Release();
         }
     }
 
@@ -119,7 +145,7 @@ public class Framed<TS> where TS : Stream
     {
         while (true)
         {
-            var size = pduHint.FindSize(this._buffer.ToArray());
+            var size = pduHint.FindSize(SnapshotBuffer());
             if (size.IsSome())
             {
                 return await this.ReadExact(size.Get());
@@ -144,7 +170,7 @@ public class Framed<TS> where TS : Stream
     {
         while (true)
         {
-            var result = customHint.FindSize(this._buffer.ToArray());
+            var result = customHint.FindSize(SnapshotBuffer());
             if (result.HasValue)
             {
                 return await this.ReadExact((nuint)result.Value.Item2);
@@ -158,6 +184,11 @@ public class Framed<TS> where TS : Stream
                 }
             }
         }
+    }
+
+    byte[] SnapshotBuffer()
+    {
+        return CollectionsMarshal.AsSpan(this._buffer).ToArray();
     }
 }
 

@@ -1,5 +1,5 @@
+# Prefer `.\build.ps1` on Windows for optimized local/client/FFI builds.
+# It layers CargoTools, sccache, lld/rust-lld, cargo-nextest, and cargo-llvm-cov
+# without forcing aggressive global Rust flags into the workspace.
 [alias]
 xtask = "run --package xtask --"
-
-[target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

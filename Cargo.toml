@@ -7,7 +7,8 @@ members = [
 ]
 resolver = "2"
 
-# FIXME: fix compilation
+# Legacy crates excluded from the active workspace. They are currently unmaintained
+# and do not participate in CI until explicitly revived.
 exclude = [
   "crates/ironrdp-client-glutin",
   "crates/ironrdp-glutin-renderer",
@@ -186,17 +187,13 @@ opt-level = 1
 
 [profile.production]
 inherits = "release"
+codegen-units = 1
 lto = true
 
 [profile.production-ffi]
 inherits = "release"
 strip = "symbols"
 codegen-units = 1
-lto = true
-
-[profile.production-wasm]
-inherits = "release"
-opt-level = "s"
 lto = true
 
 [profile.test.package.proptest]

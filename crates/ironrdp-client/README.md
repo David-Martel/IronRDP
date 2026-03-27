@@ -6,11 +6,59 @@ This is a a full-fledged RDP client based on IronRDP crates suite, and implement
 non-blocking, asynchronous I/O. Portability is achieved by using softbuffer for rendering
 and winit for windowing.
 
+## Internal layout
+
+The native client is split into a few coarse responsibilities:
+
+- `main.rs`: CLI bootstrap, logging, Tokio runtime startup, and top-level app wiring.
+- `app.rs`: window creation, initial sizing, resize/DPI handling, presentation backend dispatch, IME/unicode translation, and translation of `winit` events into client input events.
+- `presentation.rs`: presentation backend seam; the current implementation converts RGBA frames directly into the `softbuffer` surface so the client no longer builds an extra packed `Vec<u32>` staging buffer.
+- `rdp.rs`: connection establishment, transport upgrades, channel wiring, and reconnect policy.
+- `session_driver.rs`: active-session runtime that drives an established connection and translates
+  protocol output into window events while reusing RGBA frame buffers to reduce render-path churn.
+
+That split keeps the live session loop separate from connection setup, which makes the runtime easier
+to reason about and reduces coupling between transport code and window/rendering code.
+The native window now starts at the configured desktop size instead of a hard-coded fallback, which makes
+the first connection and resize path more predictable for local demo use.
+The native input path now uses `winit` IME commit events for Unicode text entry while keeping
+scancode input for non-text keys, which closes a major Windows usability gap without changing
+the transport/session split.
+The reconnect path now also guards against repeated resize-triggered reconnects that do not
+actually change the negotiated desktop size, which makes resize churn easier to diagnose instead
+of silently looping forever.
+The native client can now also advertise experimental multitransport policy through the CLI, but
+it still responds with a standards-compliant `E_ABORT` until a real UDP sideband transport is
+implemented. This keeps protocol negotiation visible without pretending the Windows-native client
+already supports multitransport data flow.
+The client now also emits lightweight frame-path diagnostics through `tracing`: frame-copy
+time, backend conversion/present time, and resize/reconnect churn are visible at `trace`/`debug`
+level to guide the next GPU/render and multitransport work.
+
 ## Sample usage
 
 ```shell
 ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
 ```
+
+For repeatable demo sizing on Windows, you can also request an initial desktop size explicitly:
+
+```shell
+ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD> --width 1600 --height 900
+```
+
+If you provide an `.rdp` file, `desktopwidth` and `desktopheight` are now used as the initial
+desktop request when explicit CLI sizing is not supplied.
+
+For multitransport protocol testing, the Windows-native client can advertise optional UDP
+capability:
+
+```shell
+ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD> --multitransport prefer-reliable
+```
+
+Current behavior: if the server follows up with a multitransport request, the client replies
+with `E_ABORT` on the TCP control path until the sideband UDP transport is implemented.
 
 ## Configuring log filter directives
 
@@ -18,6 +66,12 @@ The `IRONRDP_LOG` environment variable is used to set the log filter directives.
 
 ```shell
 IRONRDP_LOG="info,ironrdp_connector=trace" ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
+```
+
+For frame-path diagnostics on the Windows-native branch:
+
+```shell
+IRONRDP_LOG="info,ironrdp_client=trace" ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
 ```
 
 See [`tracing-subscriber`’s documentation][tracing-doc] for more details.
@@ -45,4 +99,3 @@ This crate is part of the [IronRDP] project.
 
 [IronRDP]: https://github.com/Devolutions/IronRDP
 [awakecoding-repository]: https://github.com/awakecoding/wireshark-rdp#sslkeylogfile
-

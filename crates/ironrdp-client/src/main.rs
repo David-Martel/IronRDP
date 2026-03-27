@@ -4,26 +4,38 @@ use anyhow::Context as _;
 use ironrdp_client::app::App;
 use ironrdp_client::config::{ClipboardType, Config};
 use ironrdp_client::rdp::{DvcPipeProxyFactory, RdpClient, RdpInputEvent, RdpOutputEvent};
+use mimalloc::MiMalloc;
 use tokio::runtime;
-use tracing::debug;
+use tracing::{debug, info};
+use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoop;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     let mut config = Config::parse_args().context("CLI arguments parsing")?;
 
     setup_logging(config.log_file.as_deref()).context("unable to initialize logging")?;
 
+    info!(
+        version = ironrdp_client::version::VERSION,
+        git_hash = ironrdp_client::version::GIT_HASH,
+        "IronRDP client starting"
+    );
+
     debug!("Initialize App");
     let event_loop = EventLoop::<RdpOutputEvent>::with_user_event().build()?;
     let event_loop_proxy = event_loop.create_proxy();
     let (input_event_sender, input_event_receiver) = RdpInputEvent::create_channel();
-    let mut app = App::new(&event_loop, &input_event_sender).context("unable to initialize App")?;
+    let initial_window_size = PhysicalSize::new(
+        u32::from(config.connector.desktop_size.width),
+        u32::from(config.connector.desktop_size.height),
+    );
+    let mut app = App::new(&input_event_sender, initial_window_size, config.destination.name().to_owned())
+        .context("unable to initialize App")?;
 
-    // TODO: get window size & scale factor from GUI/App
-    let window_size = (1024, 768);
     config.connector.desktop_scale_factor = 0;
-    config.connector.desktop_size.width = window_size.0;
-    config.connector.desktop_size.height = window_size.1;
 
     let rt = runtime::Builder::new_multi_thread()
         .enable_all()
@@ -39,6 +51,7 @@ fn main() -> anyhow::Result<()> {
         ClipboardType::Stub => {
             use ironrdp_cliprdr_native::StubClipboard;
 
+            info!("Configured stub clipboard backend");
             let cliprdr = StubClipboard::new();
             let factory = cliprdr.backend_factory();
             Some(factory)
@@ -48,13 +61,17 @@ fn main() -> anyhow::Result<()> {
             use ironrdp_client::clipboard::ClientClipboardMessageProxy;
             use ironrdp_cliprdr_native::WinClipboard;
 
+            info!("Configured Windows clipboard backend");
             let cliprdr = WinClipboard::new(ClientClipboardMessageProxy::new(input_event_sender.clone()))?;
 
             let factory = cliprdr.backend_factory();
             _win_clipboard = cliprdr;
             Some(factory)
         }
-        _ => None,
+        _ => {
+            info!("Clipboard integration disabled");
+            None
+        }
     };
 
     let dvc_pipe_proxy_factory = DvcPipeProxyFactory::new(input_event_sender);
@@ -74,6 +91,9 @@ fn main() -> anyhow::Result<()> {
 
     debug!("Run App");
     event_loop.run_app(&mut app)?;
+    if app.exit_code().is_err() {
+        app.exit_code().process_exit();
+    }
     Ok(())
 }
 

@@ -29,18 +29,16 @@ public partial class Log: IDisposable
         _inner = handle;
     }
 
-    /// <summary>
-    /// # Panics
-    /// </summary>
-    /// <remarks>
-    /// - Panics if log directory creation fails.
-    /// - Panics if tracing initialization fails.
-    /// </remarks>
+    /// <exception cref="IronRdpException"></exception>
     public static void InitWithEnv()
     {
         unsafe
         {
-            Raw.Log.InitWithEnv();
+            Raw.LogFfiResultVoidBoxIronRdpError result = Raw.Log.InitWithEnv();
+            if (!result.isOk)
+            {
+                throw new IronRdpException(new IronRdpError(result.Err));
+            }
         }
     }
 

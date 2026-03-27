@@ -3,7 +3,7 @@ use core::fmt;
 use crate::prelude::*;
 
 const COV_IGNORE_REGEX: &str =
-    "(crates/ironrdp-(session|.+generators|.+glutin.+|replay|client|fuzzing|tokio|web|futures|tls)|xtask|testsuite)";
+    "(crates/ironrdp-(session|.+generators|.+glutin.+|replay|client|fuzzing|tokio|futures|tls)|xtask|testsuite)";
 
 pub fn install(sh: &Shell) -> anyhow::Result<()> {
     let _s = Section::new("COV-INSTALL");
@@ -219,12 +219,11 @@ pub fn grcov(sh: &Shell) -> anyhow::Result<()> {
         --ignore src/*
         --ignore **/tests/*
         --ignore crates/*-generators/*
-        --ignore crates/web/*
-        --ignore crates/client/*
-        --ignore crates/glutin-renderer/*
-        --ignore crates/glutin-client/*
-        --ignore crates/replay-client/*
-        --ignore crates/tls/*
+        --ignore crates/ironrdp-client/*
+        --ignore crates/ironrdp-glutin-renderer/*
+        --ignore crates/ironrdp-client-glutin/*
+        --ignore crates/ironrdp-replay-client/*
+        --ignore crates/ironrdp-tls/*
         --ignore fuzz/fuzz_targets/*
         --ignore target/*
         --ignore fuzz/target/*

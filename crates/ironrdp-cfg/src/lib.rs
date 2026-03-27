@@ -8,6 +8,10 @@ pub trait PropertySetExt {
 
     fn server_port(&self) -> Option<i64>;
 
+    fn desktop_width(&self) -> Option<i64>;
+
+    fn desktop_height(&self) -> Option<i64>;
+
     fn alternate_full_address(&self) -> Option<&str>;
 
     fn gateway_hostname(&self) -> Option<&str>;
@@ -31,6 +35,14 @@ impl PropertySetExt for PropertySet {
 
     fn server_port(&self) -> Option<i64> {
         self.get::<i64>("server port")
+    }
+
+    fn desktop_width(&self) -> Option<i64> {
+        self.get::<i64>("desktopwidth")
+    }
+
+    fn desktop_height(&self) -> Option<i64> {
+        self.get::<i64>("desktopheight")
     }
 
     fn alternate_full_address(&self) -> Option<&str> {

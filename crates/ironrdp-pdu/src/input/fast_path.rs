@@ -258,14 +258,26 @@ pub struct FastPathInput(
     Vec<FastPathInputEvent>,
 );
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastPathInputRef<'a>(&'a [FastPathInputEvent]);
+
+fn validate_fast_path_input_len(len: usize) -> DecodeResult<u8> {
+    if !(1..=255usize).contains(&len) {
+        return Err(invalid_field_err!("nEvents", "invalid number of input events"));
+    }
+
+    Ok(u8::try_from(len).expect("INVARIANT: num_events is within the range of 1 to 255, inclusive"))
+}
+
+fn fast_path_input_data_length(events: &[FastPathInputEvent]) -> usize {
+    events.iter().map(Encode::size).sum::<usize>()
+}
+
 impl FastPathInput {
     const NAME: &'static str = "FastPathInput";
 
     pub fn new(input_events: Vec<FastPathInputEvent>) -> DecodeResult<Self> {
-        // Ensure the invariant on `input_events.len()` is respected.
-        if !(1..=255usize).contains(&input_events.len()) {
-            return Err(invalid_field_err!("nEvents", "invalid number of input events"));
-        }
+        validate_fast_path_input_len(input_events.len())?;
 
         Ok(Self(input_events))
     }
@@ -280,6 +292,19 @@ impl FastPathInput {
     }
 }
 
+impl<'a> FastPathInputRef<'a> {
+    const NAME: &'static str = "FastPathInputRef";
+
+    pub fn new(input_events: &'a [FastPathInputEvent]) -> DecodeResult<Self> {
+        validate_fast_path_input_len(input_events.len())?;
+        Ok(Self(input_events))
+    }
+
+    pub fn input_events(&self) -> &'a [FastPathInputEvent] {
+        self.0
+    }
+}
+
 impl Encode for FastPathInput {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
@@ -288,9 +313,10 @@ impl Encode for FastPathInput {
             return Err(other_err!("Empty fast-path input"));
         }
 
-        let data_length = self.0.iter().map(Encode::size).sum::<usize>();
+        let data_length = fast_path_input_data_length(&self.0);
         let header = FastPathInputHeader {
-            num_events: u8::try_from(self.0.len()).expect("per invariant (1..=255).contains(num_events.len())"),
+            num_events: validate_fast_path_input_len(self.0.len())
+                .expect("INVARIANT: num_events is within the range of 1 to 255, inclusive"),
             flags: EncryptionFlags::empty(),
             data_length,
         };
@@ -308,13 +334,54 @@ impl Encode for FastPathInput {
     }
 
     fn size(&self) -> usize {
-        let data_length = self.0.iter().map(Encode::size).sum::<usize>();
+        let data_length = fast_path_input_data_length(&self.0);
         let header = FastPathInputHeader {
-            num_events: u8::try_from(self.0.len())
+            num_events: validate_fast_path_input_len(self.0.len())
                 .expect("INVARIANT: num_events is within the range of 1 to 255, inclusive"),
             flags: EncryptionFlags::empty(),
             data_length,
         };
+        header.size() + data_length
+    }
+}
+
+impl Encode for FastPathInputRef<'_> {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+
+        if self.0.is_empty() {
+            return Err(other_err!("Empty fast-path input"));
+        }
+
+        let data_length = fast_path_input_data_length(self.0);
+        let header = FastPathInputHeader {
+            num_events: validate_fast_path_input_len(self.0.len())
+                .expect("INVARIANT: num_events is within the range of 1 to 255, inclusive"),
+            flags: EncryptionFlags::empty(),
+            data_length,
+        };
+        header.encode(dst)?;
+
+        for event in self.0 {
+            event.encode(dst)?;
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        let data_length = fast_path_input_data_length(self.0);
+        let header = FastPathInputHeader {
+            num_events: validate_fast_path_input_len(self.0.len())
+                .expect("INVARIANT: num_events is within the range of 1 to 255, inclusive"),
+            flags: EncryptionFlags::empty(),
+            data_length,
+        };
+
         header.size() + data_length
     }
 }
