@@ -493,6 +493,113 @@ Effort: small.
 Refs: `build.ps1`, local machine configuration, future benchmark notes.
 Effort: medium.
 
+## Priority 3: Upstream fork integration
+
+Tracked in `.claude/plans/upstream-fork-integration-plan.md`. Organized into
+three tracks with prioritized phases based on upstream fork analysis.
+
+### Track A: Authentication & credential management
+
+1. Port CredentialValidator trait for server-side auth.
+Source: upstream PR #1172 (glamberson, 49 lines, additive).
+Refs: `crates/ironrdp-acceptor/src/lib.rs`.
+Do next:
+- Add `CredentialValidator` trait to acceptor crate
+- Wire into `RdpServer` builder as optional validator
+- Enables gateway to validate credentials per-connection
+Effort: small.
+
+2. Port dynamic credential provider for CredSSP/NLA path.
+Source: formalco fork (commit 1993dad4) — code only, without sspi version upgrade.
+Refs: `crates/ironrdp-acceptor/src/credssp.rs`, `crates/ironrdp-acceptor/src/connection.rs`.
+Do next:
+- Port `CredentialProvider` trait and `set_credential_provider()` method
+- Port CredSSP server-side credential resolution changes
+- Do NOT take the sspi git rev upgrade (picky rand_core conflict)
+Effort: medium.
+
+3. NTLM fallback when Kerberos is unavailable.
+Source: formalco fork + upstream PR #1143 (ramnes).
+Status: blocked — sspi/picky pins rand_core to an RC version.
+Do next: wait for sspi stable release, then port NtlmConfig server mode.
+Effort: small (once unblocked).
+
+### Track B: Graphics acceleration pipeline
+
+4. Enable H.264 decode in the native client EGFX pipeline.
+Source: already in repo (upstream commits b6200c7a + 5e316bba).
+Refs: `crates/ironrdp-egfx/src/client.rs`, `crates/ironrdp-client/src/rdp.rs`.
+Do next:
+- Enable `openh264` feature in `ironrdp-client/Cargo.toml`
+- Create `EgfxRenderHandler` that forwards decoded frames to presentation layer
+- Pass `Some(decoder)` to `GraphicsPipelineClient::new()`
+- Hyper-V validation: `--egfx` flag should trigger server codec switch
+Effort: medium.
+
+5. Port ClearCodec bitmap compression codec and client decode.
+Source: upstream PRs #1174 + #1175 (glamberson, ~5600 lines).
+Refs: `crates/ironrdp-graphics/`, `crates/ironrdp-egfx/src/client.rs`.
+Do next:
+- Port ClearCodec decoder from #1174 into ironrdp-graphics
+- Port EGFX client dispatch additions from #1175
+- Both are additive (new files, new match arms)
+Effort: medium.
+
+6. Port ZGFX O(1) hash table compression optimization.
+Source: glamberson fork (commits a0eacc50, 4a93ffae, 57608dad).
+Refs: `crates/ironrdp-graphics/src/zgfx/`.
+Do next:
+- Read hash table implementation from glamberson fork
+- Port optimization into our zgfx module layout (too diverged for cherry-pick)
+- Also port duplicate-entry fix and size limits
+Effort: medium.
+
+7. Direct2D presentation backend.
+Source: original fork work.
+Refs: `crates/ironrdp-client/src/presentation.rs`, `crates/ironrdp-client/src/app.rs`.
+Do next:
+- Implement `PresentationBackend` trait using `ID2D1HwndRenderTarget`
+- Eliminate softbuffer conversion step
+- Keep softbuffer as fallback for non-Windows or headless
+Effort: medium to large.
+
+### Track C: Device redirection
+
+8. Implement drive redirection backend.
+Source: original fork work.
+Refs: `crates/ironrdp-rdpdr/src/backend/`, `crates/ironrdp-rdpdr-native/`.
+Do next:
+- Implement `handle_drive_io_request()` for IRP_MJ_CREATE/READ/WRITE/CLOSE/QUERY
+- Add `--redirect-drive <name>=<path>` CLI flag
+- Wire device announcement during connection setup
+- Hyper-V validation: file copy from host to guest
+Effort: large.
+
+9. Port clipboard file transfer support.
+Source: upstream PR #1166 (gabrielbauman, 93 files — manual port of cliprdr additions only).
+Refs: `crates/ironrdp-cliprdr/src/`, `crates/ironrdp-cliprdr-native/`.
+Do next:
+- Port `request_file_contents()`, `SendFileContentsResponse`, data locking from PR
+- Skip web/FFI changes
+- Implement native backend using Windows clipboard APIs
+Effort: medium.
+
+10. Port USB redirection PDU definitions.
+Source: upstream PR #1165 (playbahn, 13 files, 2134 lines).
+Refs: `crates/ironrdp-rdpeusb/`.
+Do next:
+- Port URBDRC PDU definitions per MS-RDPEUSB into the stub crate
+- Foundation work only — actual USB backend (WinUSB/USBDK) is separate
+Effort: small.
+
+11. Auto-Detect RTT measurement.
+Source: upstream PRs #1177 + #1178 (glamberson).
+Refs: `crates/ironrdp-pdu/src/rdp/autodetect.rs` (already integrated).
+Do next:
+- Port server-side RTT measurement from #1177
+- Port client-side auto-detect PDU handling from #1178
+Effort: small to medium.
+
 ## Priority 3: Windows-native feature parity and usability
 
 1. Decide whether end-to-end EGFX/H.264 becomes a first-class Windows track.

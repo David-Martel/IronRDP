@@ -102,21 +102,36 @@ Host connector/agent
 
 ### Phase 1: Minimal useful gateway
 
-- New crate: `crates/ironrdp-gateway`
-- HTTPS/WSS listener
-- RDCleanPath request parsing and response generation
-- RADIUS auth
-- local static policy file
-- relay to reachable internal hosts
-- audit log for who connected to what
+- [x] New crate: `crates/ironrdp-gateway` — scaffolded with trait-based architecture
+- [ ] CredentialValidator trait in acceptor — enables per-connection auth validation
+      Source: upstream PR #1172 (glamberson, 49 lines). Port manually.
+- [ ] Dynamic credential provider for CredSSP — enables runtime credential resolution
+      Source: formalco fork. Port code without sspi version upgrade.
+- [ ] HTTPS/WSS listener with TLS termination on `443`
+      Use `tokio-tungstenite` + `tokio-rustls`. Informed by upstream PR #855.
+- [ ] RDCleanPath request parsing and response generation
+      Reuse `ironrdp-rdcleanpath` crate (already a dependency).
+- [ ] RADIUS auth implementation
+      Add `radius-client` crate dependency. Target UDMPRO at `192.168.1.1`.
+      Implement `GatewayAuthenticator` trait for RADIUS Access-Request/Accept/Reject.
+- [ ] Local static policy file
+      Implement `GatewayPolicy` trait backed by a TOML/JSON policy file.
+      Map user/group to allowed target hosts.
+- [ ] Relay to reachable internal hosts
+      Use existing `GatewayRelay` implementation (bidirectional tokio::io::copy).
+      Connect to target host TCP after auth+authz passes.
+- [ ] Audit log for who connected to what
+      Structured tracing with session ID, identity, target, start/end times.
 
 ### Phase 2: Operational maturity
 
-- short-lived signed gateway session tokens
-- idle/session timeout enforcement
-- session inventory and admin visibility
-- RADIUS accounting
-- structured metrics
+- [ ] Short-lived signed gateway session tokens (JWT or similar)
+- [ ] Idle/session timeout enforcement using `GatewaySession::elapsed()`
+- [ ] Session inventory and admin visibility (REST API or structured log)
+- [ ] RADIUS accounting start/stop/interim-update messages
+- [ ] Structured metrics (connection count, relay bytes, auth failures)
+- [ ] Auto-Detect RTT measurement for transport quality baseline
+      Source: upstream PRs #1177 + #1178 (glamberson)
 
 ### Phase 3: Border traversal
 
@@ -126,10 +141,12 @@ Host connector/agent
 
 ### Phase 4: Feature expansion
 
-- richer IdP support
-- policy service instead of static file
-- optional MS-TSGU server-compatibility track
-- optional UDP/QUIC transport experiments
+- [ ] Richer IdP support (OIDC, SAML) — only if RADIUS becomes too limiting
+- [ ] Policy service instead of static file (REST-backed GatewayPolicy impl)
+- [ ] Optional MS-TSGU server-compatibility track
+- [ ] Optional UDP/QUIC transport experiments
+- [ ] NTLM fallback for standalone Windows hosts without domain controllers
+      Source: formalco fork + upstream PR #1143. Blocked on sspi/picky rand_core.
 
 ## References
 
