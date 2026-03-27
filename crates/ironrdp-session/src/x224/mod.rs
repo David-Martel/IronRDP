@@ -3,12 +3,13 @@ use ironrdp_connector::legacy::SendDataIndicationCtx;
 use ironrdp_core::{Encode, WriteBuf};
 use ironrdp_dvc::{DrdynvcClient, DvcProcessor, DynamicVirtualChannel};
 use ironrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason, McsMessage};
+use ironrdp_pdu::rdp::autodetect::AutoDetectResponse;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages, client_encode_svc_messages};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{SessionError, SessionErrorExt as _, SessionResult, reason_err};
 
@@ -181,6 +182,92 @@ impl Processor {
                             )),
                         ])
                     }
+
+                    // Server-initiated Auto-Detect Request PDU ([MS-RDPBCGR] §2.2.14).
+                    ShareDataPdu::AutoDetectReq(req) => {
+                        use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
+
+                        match req {
+                            AutoDetectRequest::RttRequest { sequence_number, request_type } => {
+                                // Respond immediately with an RTT Measure Response carrying the
+                                // same sequence number as the request.
+                                //
+                                // [MS-RDPBCGR] §2.2.14.2.1
+                                debug!(
+                                    sequence_number,
+                                    request_type,
+                                    "Received Auto-Detect RTT Request; sending RTT Response"
+                                );
+
+                                let rsp = AutoDetectResponse::RttResponse {
+                                    sequence_number,
+                                };
+
+                                let mut buf = WriteBuf::new();
+                                self.encode_static(&mut buf, ShareDataPdu::AutoDetectRsp(rsp))?;
+                                Ok(vec![ProcessorOutput::ResponseFrame(buf.filled().to_vec())])
+                            }
+
+                            AutoDetectRequest::BandwidthMeasureStart {
+                                sequence_number,
+                                request_type,
+                            } => {
+                                // A bandwidth measurement window is opening.  Tracking start time
+                                // and byte counts for a full BW-measurement state machine is out of
+                                // scope for this pass; log and continue.
+                                debug!(
+                                    sequence_number,
+                                    request_type,
+                                    "Received Auto-Detect Bandwidth Measure Start"
+                                );
+                                Ok(Vec::new())
+                            }
+
+                            AutoDetectRequest::BandwidthMeasurePayload { sequence_number, payload } => {
+                                // Payload-only PDU sent during connect-time BW detection; no
+                                // response required.
+                                debug!(
+                                    sequence_number,
+                                    payload_len = payload.len(),
+                                    "Received Auto-Detect Bandwidth Measure Payload"
+                                );
+                                Ok(Vec::new())
+                            }
+
+                            AutoDetectRequest::BandwidthMeasureStop {
+                                sequence_number,
+                                request_type,
+                                ..
+                            } => {
+                                // A full BW-results response (BandwidthMeasureResults) requires
+                                // accurate timeDelta and byteCount from the measurement window.
+                                // Without that state machine the best we can do is log.
+                                warn!(
+                                    sequence_number,
+                                    request_type,
+                                    "Received Auto-Detect Bandwidth Measure Stop; \
+                                     BW measurement response not yet implemented"
+                                );
+                                Ok(Vec::new())
+                            }
+
+                            AutoDetectRequest::NetworkCharacteristicsResult {
+                                sequence_number,
+                                request_type,
+                                ..
+                            } => {
+                                // The server is informing us of its network view; no response
+                                // required per [MS-RDPBCGR] §2.2.14.1.5.
+                                debug!(
+                                    sequence_number,
+                                    request_type,
+                                    "Received Auto-Detect Network Characteristics Result from server"
+                                );
+                                Ok(Vec::new())
+                            }
+                        }
+                    }
+
                     _ => Err(reason_err!(
                         "IO channel",
                         "unhandled PDU: {:?}",
