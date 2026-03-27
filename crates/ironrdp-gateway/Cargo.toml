@@ -23,7 +23,13 @@ test = false
 ironrdp-rdcleanpath = { path = "../ironrdp-rdcleanpath", version = "0.2" }
 
 anyhow = "1"
+futures-util = "0.3"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+tokio-rustls = "0.26"
+tokio-tungstenite = "0.28"
+toml = "0.8"
 tracing = { version = "0.1", features = ["log"] }
 
 [lints]
