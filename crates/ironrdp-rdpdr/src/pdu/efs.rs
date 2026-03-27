@@ -772,6 +772,12 @@ pub struct ClientDeviceListAnnounce {
 impl ClientDeviceListAnnounce {
     const FIXED_PART_SIZE: usize = size_of::<u32>(); // DeviceCount
 
+    /// Library users should not typically call this directly, use [`Rdpdr::add_smartcard`] instead.
+    pub(crate) fn new_smartcard(device_id: u32) -> Self {
+        Self {
+            device_list: vec![DeviceAnnounceHeader::new_smartcard(device_id)],
+        }
+    }
     /// Library users should not typically call this directly, use [`Rdpdr::add_drive`] instead.
     pub(crate) fn new_drive(device_id: u32, name: String) -> Self {
         Self {

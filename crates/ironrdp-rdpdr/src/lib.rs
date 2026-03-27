@@ -61,9 +61,11 @@ impl Rdpdr {
     }
 
     #[must_use]
-    pub fn with_smartcard(mut self, device_id: u32) -> Self {
+    pub fn with_smartcard(mut self, device_id: Option<u32>) -> Self {
         self.capabilities.add_smartcard();
-        self.device_list.add_smartcard(device_id);
+        if let Some(device_id) = device_id {
+            self.device_list.add_smartcard(device_id);
+        }
         self
     }
 
@@ -88,6 +90,14 @@ impl Rdpdr {
     pub fn add_drive(&mut self, device_id: u32, name: String) -> ClientDeviceListAnnounce {
         self.device_list.add_drive(device_id, name.clone());
         ClientDeviceListAnnounce::new_drive(device_id, name)
+    }
+
+    /// Users should call this method to re-announce a smartcard device to the server
+    /// (e.g. after a previous release). It's the caller's responsibility to take the
+    /// returned [ClientDeviceListAnnounce] and send it to the server.
+    pub fn add_smartcard(&mut self, device_id: u32) -> ClientDeviceListAnnounce {
+        self.device_list.add_smartcard(device_id);
+        ClientDeviceListAnnounce::new_smartcard(device_id)
     }
 
     pub fn remove_device(&mut self, device_id: u32) -> Option<ClientDeviceListRemove> {
@@ -230,3 +240,4 @@ impl SvcProcessor for Rdpdr {
 }
 
 impl SvcClientProcessor for Rdpdr {}
+

@@ -28,9 +28,15 @@ pub enum ScardCall {
     ListReadersCall(ListReadersCall),
     GetStatusChangeCall(GetStatusChangeCall),
     ConnectCall(ConnectCall),
+    ReconnectCall(ReconnectCall),
     HCardAndDispositionCall(HCardAndDispositionCall),
     TransmitCall(TransmitCall),
+    ControlCall(ControlCall),
+    GetAttribCall(GetAttribCall),
+    SetAttribCall(SetAttribCall),
+    StateCall(StateCall),
     StatusCall(StatusCall),
+    GetTransmitCountCall(GetTransmitCountCall),
     ContextCall(ContextCall),
     GetDeviceTypeIdCall(GetDeviceTypeIdCall),
     ReadCacheCall(ReadCacheCall),
@@ -74,7 +80,15 @@ impl ScardCall {
                 HCardAndDispositionCall::decode(src)?,
             )),
             ScardIoCtlCode::Transmit => Ok(ScardCall::TransmitCall(TransmitCall::decode(src)?)),
+            ScardIoCtlCode::Control => Ok(ScardCall::ControlCall(ControlCall::decode(src)?)),
             ScardIoCtlCode::StatusW | ScardIoCtlCode::StatusA => Ok(ScardCall::StatusCall(StatusCall::decode(src)?)),
+            ScardIoCtlCode::Reconnect => Ok(ScardCall::ReconnectCall(ReconnectCall::decode(src)?)),
+            ScardIoCtlCode::State => Ok(ScardCall::StateCall(StateCall::decode(src)?)),
+            ScardIoCtlCode::GetAttrib => Ok(ScardCall::GetAttribCall(GetAttribCall::decode(src)?)),
+            ScardIoCtlCode::SetAttrib => Ok(ScardCall::SetAttribCall(SetAttribCall::decode(src)?)),
+            ScardIoCtlCode::GetTransmitCount => {
+                Ok(ScardCall::GetTransmitCountCall(GetTransmitCountCall::decode(src)?))
+            }
             ScardIoCtlCode::ReleaseContext => Ok(ScardCall::ContextCall(ContextCall::decode(src)?)),
             ScardIoCtlCode::EndTransaction => Ok(ScardCall::HCardAndDispositionCall(HCardAndDispositionCall::decode(
                 src,
@@ -755,13 +769,18 @@ impl rpce::HeaderlessDecode for ListReadersCall {
 pub struct ListReadersReturn {
     pub return_code: ReturnCode,
     pub readers: Vec<String>,
+    pub encoding: CharacterSet,
 }
 
 impl ListReadersReturn {
     const NAME: &'static str = "ListReaders_Return";
 
-    pub fn new(return_code: ReturnCode, readers: Vec<String>) -> rpce::Pdu<Self> {
-        rpce::Pdu(Self { return_code, readers })
+    pub fn new(return_code: ReturnCode, readers: Vec<String>, encoding: CharacterSet) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            readers,
+            encoding,
+        })
     }
 }
 
@@ -772,12 +791,12 @@ impl rpce::HeaderlessEncode for ListReadersReturn {
         let readers_length: u32 = cast_length!(
             "ListReadersReturn",
             "readers",
-            encoded_multistring_len(&self.readers, CharacterSet::Unicode)
+            encoded_multistring_len(&self.readers, self.encoding)
         )?;
         let mut index = 0;
         ndr::encode_ptr(Some(readers_length), &mut index, dst)?;
         dst.write_u32(readers_length);
-        write_multistring_to_cursor(dst, &self.readers, CharacterSet::Unicode)?;
+        write_multistring_to_cursor(dst, &self.readers, self.encoding)?;
         Ok(())
     }
 
@@ -789,7 +808,7 @@ impl rpce::HeaderlessEncode for ListReadersReturn {
         self.return_code.size() // dst.write_u32(self.return_code.into());
         + ndr::ptr_size(true) // ndr::encode_ptr(...);
         + 4 // dst.write_u32(readers_length);
-        + encoded_multistring_len(&self.readers, CharacterSet::Unicode) // write_multistring_to_cursor(...);
+        + encoded_multistring_len(&self.readers, self.encoding) // write_multistring_to_cursor(...);
     }
 }
 
@@ -1363,6 +1382,447 @@ impl rpce::HeaderlessEncode for TransmitReturn {
         + ndr::ptr_size(true) // ndr::encode_ptr(Some(recv_buffer_len), &mut index, dst)?;
         + 4 // dst.write_u32(recv_buffer_len);
         + self.recv_buffer.len() // dst.write_slice(&self.recv_buffer);
+    }
+}
+
+/// [2.2.2.20] Control_Call
+///
+/// [2.2.2.20]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/d228a529-542c-4561-86a5-b6a0e5606c46
+#[derive(Debug, PartialEq, Clone)]
+pub struct ControlCall {
+    pub handle: ScardHandle,
+    pub control_code: u32,
+    pub in_buffer_length: u32,
+    pub in_buffer: Vec<u8>,
+    pub out_buffer_is_null: bool,
+    pub out_buffer_size: u32,
+}
+
+impl ControlCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for ControlCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 2);
+        let control_code = src.read_u32();
+        let _in_buffer_length = src.read_u32();
+        let _in_buffer_ptr = ndr::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 2);
+        let out_buffer_is_null = src.read_u32() == 1;
+        let out_buffer_size = src.read_u32();
+
+        handle.decode_value(src, None)?;
+
+        ensure_size!(in: src, size: size_of::<u32>());
+        let in_buffer_length = src.read_u32();
+        let in_buffer_length_usize: usize = cast_length!("ControlCall", "in_buffer_length", in_buffer_length)?;
+        ensure_size!(in: src, size: in_buffer_length_usize);
+        let in_buffer = src.read_slice(in_buffer_length_usize).to_vec();
+
+        Ok(Self {
+            handle,
+            control_code,
+            in_buffer_length,
+            in_buffer,
+            out_buffer_is_null,
+            out_buffer_size,
+        })
+    }
+}
+
+/// [2.2.3.6] Control_Return
+///
+/// [2.2.3.6]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/1e844ff1-3554-4e3a-a57d-ac07defa7204
+#[derive(Debug, PartialEq, Clone)]
+pub struct ControlReturn {
+    pub return_code: ReturnCode,
+    pub out_buffer: Vec<u8>,
+}
+
+impl ControlReturn {
+    const NAME: &'static str = "Control_Return";
+
+    pub fn new(return_code: ReturnCode, out_buffer: Vec<u8>) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            out_buffer,
+        })
+    }
+}
+
+impl rpce::HeaderlessEncode for ControlReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+
+        let out_buffer_len: u32 = cast_length!("ControlReturn", "out_buffer_len", self.out_buffer.len())?;
+        let mut index = 0;
+        ndr::encode_ptr(Some(out_buffer_len), &mut index, dst)?;
+        dst.write_u32(out_buffer_len);
+        dst.write_slice(&self.out_buffer);
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        self.return_code.size() // dst.write_u32(self.return_code.into());
+        + ndr::ptr_size(true) // ndr::encode_ptr(Some(out_buffer_len), &mut index, dst)?;
+        + 4 // dst.write_u32(out_buffer_len);
+        + self.out_buffer.len() // dst.write_slice(&self.out_buffer);
+    }
+}
+
+/// [2.2.2.21] GetAttrib_Call
+///
+/// [2.2.2.21]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/b990635a-7637-464a-8923-361ed3e3d67a
+#[derive(Debug, PartialEq, Clone)]
+pub struct GetAttribCall {
+    pub handle: ScardHandle,
+    pub attr_id: u32,
+    pub attr_is_null: bool,
+    pub attr_len: u32,
+}
+
+impl GetAttribCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for GetAttribCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 3);
+        let attr_id = src.read_u32();
+        let attr_is_null = src.read_u32() == 1;
+        let attr_len = src.read_u32();
+        handle.decode_value(src, None)?;
+        Ok(Self {
+            handle,
+            attr_id,
+            attr_is_null,
+            attr_len,
+        })
+    }
+}
+
+/// [2.2.3.12] GetAttrib_Return
+///
+/// [2.2.3.12]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/1e844ff1-3554-4e3a-a57d-ac07defa7204
+#[derive(Debug, PartialEq, Clone)]
+pub struct GetAttribReturn {
+    pub return_code: ReturnCode,
+    pub attr: Vec<u8>,
+}
+
+impl GetAttribReturn {
+    const NAME: &'static str = "GetAttrib_Return";
+
+    pub fn new(return_code: ReturnCode, attr: Vec<u8>) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self { return_code, attr })
+    }
+}
+
+impl rpce::HeaderlessEncode for GetAttribReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+
+        let attr_len: u32 = cast_length!("GetAttribReturn", "attr_len", self.attr.len())?;
+        let mut index = 0;
+        ndr::encode_ptr(Some(attr_len), &mut index, dst)?;
+        dst.write_u32(attr_len);
+        dst.write_slice(&self.attr);
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        self.return_code.size() // dst.write_u32(self.return_code.into());
+        + ndr::ptr_size(true) // ndr::encode_ptr(Some(attr_len), &mut index, dst)?;
+        + 4 // dst.write_u32(attr_len);
+        + self.attr.len() // dst.write_slice(&self.attr);
+    }
+}
+
+/// [2.2.2.22] SetAttrib_Call
+///
+/// [2.2.2.22]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/b990635a-7637-464a-8923-361ed3e3d67a
+#[derive(Debug, PartialEq, Clone)]
+pub struct SetAttribCall {
+    pub handle: ScardHandle,
+    pub attr_id: u32,
+    pub attr: Vec<u8>,
+}
+
+impl SetAttribCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for SetAttribCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 2);
+        let attr_id = src.read_u32();
+        let _attr_len = src.read_u32();
+        let _attr_ptr = ndr::decode_ptr(src, &mut index)?;
+
+        handle.decode_value(src, None)?;
+
+        ensure_size!(in: src, size: size_of::<u32>());
+        let attr_len = src.read_u32();
+        let attr_len_usize: usize = cast_length!("SetAttribCall", "attr_len", attr_len)?;
+        ensure_size!(in: src, size: attr_len_usize);
+        let attr = src.read_slice(attr_len_usize).to_vec();
+
+        Ok(Self {
+            handle,
+            attr_id,
+            attr,
+        })
+    }
+}
+
+/// [2.2.2.15] Reconnect_Call
+///
+/// [2.2.2.15]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/060abee1-e520-4149-9ef7-ce79eb500a59
+#[derive(Debug, PartialEq, Clone)]
+pub struct ReconnectCall {
+    pub handle: ScardHandle,
+    pub share_mode: u32,
+    pub preferred_protocols: CardProtocol,
+    pub initialization: u32,
+}
+
+impl ReconnectCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for ReconnectCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 3);
+        let share_mode = src.read_u32();
+        let preferred_protocols = CardProtocol::from_bits_retain(src.read_u32());
+        let initialization = src.read_u32();
+        handle.decode_value(src, None)?;
+        Ok(Self {
+            handle,
+            share_mode,
+            preferred_protocols,
+            initialization,
+        })
+    }
+}
+
+/// [2.2.3.7] Reconnect_Return
+///
+/// [2.2.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/1e844ff1-3554-4e3a-a57d-ac07defa7204
+#[derive(Debug, PartialEq, Clone)]
+pub struct ReconnectReturn {
+    pub return_code: ReturnCode,
+    pub active_protocol: CardProtocol,
+}
+
+impl ReconnectReturn {
+    const NAME: &'static str = "Reconnect_Return";
+
+    pub fn new(return_code: ReturnCode, active_protocol: CardProtocol) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            active_protocol,
+        })
+    }
+}
+
+impl rpce::HeaderlessEncode for ReconnectReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+        dst.write_u32(self.active_protocol.bits());
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        self.return_code.size() // dst.write_u32(self.return_code.into());
+        + 4 // dst.write_u32(self.active_protocol.bits());
+    }
+}
+
+/// [2.2.2.17] State_Call
+///
+/// [2.2.2.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/060abee1-e520-4149-9ef7-ce79eb500a59
+#[derive(Debug, PartialEq, Clone)]
+pub struct StateCall {
+    pub handle: ScardHandle,
+    pub atr_is_null: bool,
+    pub atr_len: u32,
+}
+
+impl StateCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for StateCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 2);
+        let atr_is_null = src.read_u32() == 1;
+        let atr_len = src.read_u32();
+        handle.decode_value(src, None)?;
+        Ok(Self {
+            handle,
+            atr_is_null,
+            atr_len,
+        })
+    }
+}
+
+/// [2.2.3.9] State_Return
+///
+/// [2.2.3.9]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/1e844ff1-3554-4e3a-a57d-ac07defa7204
+#[derive(Debug, PartialEq, Clone)]
+pub struct StateReturn {
+    pub return_code: ReturnCode,
+    pub state: CardState,
+    pub protocol: CardProtocol,
+    pub atr: Vec<u8>,
+}
+
+impl StateReturn {
+    const NAME: &'static str = "State_Return";
+
+    pub fn new(return_code: ReturnCode, state: CardState, protocol: CardProtocol, atr: Vec<u8>) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            state,
+            protocol,
+            atr,
+        })
+    }
+}
+
+impl rpce::HeaderlessEncode for StateReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+        dst.write_u32(self.state.into());
+        dst.write_u32(self.protocol.bits());
+
+        let atr_len: u32 = cast_length!("StateReturn", "atr_len", self.atr.len())?;
+        let mut index = 0;
+        ndr::encode_ptr(Some(atr_len), &mut index, dst)?;
+        dst.write_u32(atr_len);
+        dst.write_slice(&self.atr);
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        self.return_code.size() // dst.write_u32(self.return_code.into());
+        + 4 // dst.write_u32(self.state.into());
+        + 4 // dst.write_u32(self.protocol.bits());
+        + ndr::ptr_size(true) // ndr::encode_ptr(Some(atr_len), &mut index, dst)?;
+        + 4 // dst.write_u32(atr_len);
+        + self.atr.len() // dst.write_slice(&self.atr);
+    }
+}
+
+/// [2.2.2.29] GetTransmitCount_Call
+///
+/// [2.2.2.29]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/060abee1-e520-4149-9ef7-ce79eb500a59
+#[derive(Debug, PartialEq, Clone)]
+pub struct GetTransmitCountCall {
+    pub handle: ScardHandle,
+}
+
+impl GetTransmitCountCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for GetTransmitCountCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        handle.decode_value(src, None)?;
+        Ok(Self { handle })
+    }
+}
+
+/// [2.2.3.13] GetTransmitCount_Return
+///
+/// [2.2.3.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/1e844ff1-3554-4e3a-a57d-ac07defa7204
+#[derive(Debug, PartialEq, Clone)]
+pub struct GetTransmitCountReturn {
+    pub return_code: ReturnCode,
+    pub transmit_count: u32,
+}
+
+impl GetTransmitCountReturn {
+    const NAME: &'static str = "GetTransmitCount_Return";
+
+    pub fn new(return_code: ReturnCode, transmit_count: u32) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            transmit_count,
+        })
+    }
+}
+
+impl rpce::HeaderlessEncode for GetTransmitCountReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+        dst.write_u32(self.transmit_count);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        self.return_code.size() // dst.write_u32(self.return_code.into());
+        + 4 // dst.write_u32(self.transmit_count);
     }
 }
 

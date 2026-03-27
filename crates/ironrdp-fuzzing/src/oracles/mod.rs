@@ -140,7 +140,7 @@ pub fn channel_process(input: &[u8]) {
     use ironrdp_svc::SvcProcessor as _;
 
     let mut rdpdr = ironrdp_rdpdr::Rdpdr::new(Box::new(ironrdp_rdpdr::NoopRdpdrBackend), "Backend".to_owned())
-        .with_smartcard(1)
+        .with_smartcard(Some(1))
         .with_drives(None);
 
     let _ = rdpdr.process(input);
