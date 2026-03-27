@@ -6,7 +6,7 @@
 
 use std::rc::Rc;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, DesktopSize};
 use ironrdp_async::Framed;
 use ironrdp_cliprdr::CliprdrServer;
@@ -684,6 +684,23 @@ impl RdpServer {
             let (new_framed, result) = ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
                 .await
                 .context("failed to accept client during finalize")?;
+
+            // Validate credentials for TLS-mode connections on the initial handshake.
+            // Deactivation-reactivation cycles re-use an already-authenticated session
+            // and are not subject to re-validation.
+            if !result.reactivation {
+                if let Some(validator) = self.credential_validator.as_deref() {
+                    if let Some(creds) = result.credentials.as_ref() {
+                        let accepted = validator
+                            .validate(creds)
+                            .context("credential validator returned an error")?;
+                        if !accepted {
+                            warn!("credential validation rejected the connection");
+                            return Err(anyhow!("credential validation failed"));
+                        }
+                    }
+                }
+            }
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 

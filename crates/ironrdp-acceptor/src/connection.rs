@@ -1,4 +1,5 @@
 use core::mem;
+use std::sync::Arc;
 
 use ironrdp_connector::{
     ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize, Sequence, State, Written, encode_x224_packet,
@@ -19,6 +20,7 @@ use tracing::{debug, warn};
 
 use super::channel_connection::ChannelConnectionSequence;
 use super::finalization::FinalizationSequence;
+use crate::credssp::CredentialProvider;
 use crate::util::{self, wrap_share_data};
 
 const IO_CHANNEL_ID: u16 = 1003;
@@ -34,6 +36,7 @@ pub struct Acceptor {
     static_channels: StaticChannelSet,
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
+    pub(crate) credential_provider: Option<Arc<dyn CredentialProvider>>,
     received_credentials: Option<Credentials>,
     reactivation: bool,
 }
@@ -74,9 +77,18 @@ impl Acceptor {
             static_channels: StaticChannelSet::new(),
             saved_for_reactivation: Default::default(),
             creds,
+            credential_provider: None,
             received_credentials: None,
             reactivation: false,
         }
+    }
+
+    /// Set a dynamic credential provider used to resolve credentials at runtime.
+    ///
+    /// When set, the provider takes precedence over the static credentials
+    /// supplied to [`Acceptor::new`] for TLS-mode connections.
+    pub fn set_credential_provider(&mut self, provider: Arc<dyn CredentialProvider>) {
+        self.credential_provider = Some(provider);
     }
 
     pub fn new_deactivation_reactivation(
@@ -116,6 +128,7 @@ impl Acceptor {
             static_channels,
             saved_for_reactivation,
             creds: consumed.creds,
+            credential_provider: consumed.credential_provider,
             received_credentials: consumed.received_credentials,
             reactivation: true,
         })
@@ -567,20 +580,34 @@ impl Sequence for Acceptor {
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;
 
-                    if let Some(expected) = &self.creds {
-                        if expected != &creds {
-                            // FIXME: How authorization should be denied with standard RDP security?
-                            // Since standard RDP security is not a priority, we just send a ServerDeniedConnection ServerSetErrorInfo PDU.
-                            let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
-                                ProtocolIndependentCode::ServerDeniedConnection,
-                            ));
+                    let rejected = if let Some(provider) = &self.credential_provider {
+                        // Dynamic provider: accept only if the provider returns a
+                        // matching candidate for this username/domain pair.
+                        let candidates = provider.get_credentials(
+                            &creds.username,
+                            creds.domain.as_deref(),
+                        );
+                        !candidates.iter().any(|c| c == &creds)
+                    } else if let Some(expected) = &self.creds {
+                        // Static credential check (legacy path).
+                        expected != &creds
+                    } else {
+                        // No credentials configured — allow the connection.
+                        false
+                    };
 
-                            debug!(message = ?info, "Send");
+                    if rejected {
+                        // FIXME: How authorization should be denied with standard RDP security?
+                        // Since standard RDP security is not a priority, we just send a ServerDeniedConnection ServerSetErrorInfo PDU.
+                        let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
+                            ProtocolIndependentCode::ServerDeniedConnection,
+                        ));
 
-                            util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &info, output)?;
+                        debug!(message = ?info, "Send");
 
-                            return Err(ConnectorError::general("invalid credentials"));
-                        }
+                        util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &info, output)?;
+
+                        return Err(ConnectorError::general("invalid credentials"));
                     }
 
                     // Store credentials for later retrieval via AcceptorResult.

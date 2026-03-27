@@ -19,6 +19,7 @@ use ironrdp_pdu::nego;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
 pub use self::connection::{Acceptor, AcceptorResult, AcceptorState};
+pub use self::credssp::CredentialProvider;
 pub use self::finalization::{FinalizationSequence, FinalizationState};
 use crate::credssp::resolve_generator;
 

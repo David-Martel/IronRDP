@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use ironrdp_acceptor::{Acceptor, BeginResult};
+use ironrdp_acceptor::{Acceptor, BeginResult, CredentialProvider};
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_core::{decode, impl_as_any};
@@ -244,7 +244,15 @@ pub struct RdpServer {
     pub(crate) ev_sender: mpsc::UnboundedSender<ServerEvent>,
     pub(crate) ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     pub(crate) creds: Option<Credentials>,
+    pub(crate) credential_provider: Option<Arc<dyn CredentialProvider>>,
     pub(crate) local_addr: Option<SocketAddr>,
+    /// Optional dynamic credential validator called after `AcceptorResult` is
+    /// received for TLS-mode connections.
+    ///
+    /// When `Some`, the server calls [`CredentialValidator::validate`] with the
+    /// credentials extracted from `ClientInfoPdu`. The connection is rejected if
+    /// `validate` returns `Ok(false)` or an `Err`.
+    pub(crate) credential_validator: Option<Arc<dyn CredentialValidator>>,
     /// `true` while a client session is being serviced.
     ///
     /// INVARIANT: at most one session is active at any point in time.
@@ -266,6 +274,46 @@ pub enum ServerEvent {
 
 pub trait ServerEventSender {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>);
+}
+
+/// Server-side credential validator for TLS-mode connections.
+///
+/// Called during connection setup after `ClientInfoPdu` is received and the
+/// acceptor sequence completes. Not used for CredSSP/Hybrid connections — those
+/// authenticate via NTLM challenge-response during the CredSSP exchange and do
+/// not populate `AcceptorResult::credentials`.
+///
+/// # Errors
+///
+/// Return `Ok(true)` to accept the connection, `Ok(false)` to reject it
+/// (the connection will be dropped with a logged warning), or `Err(_)` to
+/// propagate a validation-infrastructure failure up the call stack.
+///
+/// # Example
+///
+/// ```rust
+/// use ironrdp_server::{CredentialValidator, Credentials};
+/// use anyhow::Result;
+///
+/// struct FixedValidator {
+///     expected: Credentials,
+/// }
+///
+/// impl CredentialValidator for FixedValidator {
+///     fn validate(&self, credentials: &Credentials) -> Result<bool> {
+///         Ok(credentials.username == self.expected.username
+///             && credentials.password == self.expected.password)
+///     }
+/// }
+/// ```
+pub trait CredentialValidator: Send + Sync {
+    /// Validate credentials received from the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the validation backend itself fails (e.g., database
+    /// unreachable). Use `Ok(false)` for ordinary authentication rejections.
+    fn validate(&self, credentials: &Credentials) -> Result<bool>;
 }
 
 impl ServerEvent {
@@ -322,7 +370,9 @@ impl RdpServer {
             ev_sender,
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
+            credential_provider: None,
             local_addr: None,
+            credential_validator: None,
             active_session: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -411,6 +461,10 @@ impl RdpServer {
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
         let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
+
+        if let Some(provider) = &self.credential_provider {
+            acceptor.set_credential_provider(Arc::clone(provider));
+        }
 
         self.attach_channels(&mut acceptor);
 
@@ -523,5 +577,30 @@ impl RdpServer {
     pub fn set_credentials(&mut self, creds: Option<Credentials>) {
         debug!(?creds, "Changing credentials");
         self.creds = creds
+    }
+
+    /// Set a dynamic credential provider for runtime credential resolution.
+    ///
+    /// When set, the provider is passed to the [`Acceptor`] on each new
+    /// connection and takes precedence over static credentials for TLS-mode
+    /// authentication.
+    pub fn set_credential_provider(&mut self, provider: Arc<dyn CredentialProvider>) {
+        self.credential_provider = Some(provider);
+    }
+
+    /// Register a dynamic credential validator used for TLS-mode connections.
+    ///
+    /// When set, credentials extracted from `ClientInfoPdu` are passed to
+    /// [`CredentialValidator::validate`] after the acceptor sequence completes.
+    /// Passing `None` disables dynamic validation (static `creds` are still
+    /// checked by the acceptor itself).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// server.set_credential_validator(Some(Arc::new(MyValidator::new())));
+    /// ```
+    pub fn set_credential_validator(&mut self, validator: Option<Arc<dyn CredentialValidator>>) {
+        self.credential_validator = validator;
     }
 }

@@ -1,3 +1,5 @@
+use ironrdp_pdu::rdp::client_info::Credentials;
+
 use ironrdp_async::NetworkClient;
 use ironrdp_connector::sspi::credssp::{
     CredSspServer, CredentialsProxy, ServerError, ServerMode, ServerState, TsRequest,
@@ -11,6 +13,46 @@ use ironrdp_connector::{
 use ironrdp_core::{WriteBuf, other_err};
 use ironrdp_pdu::PduHint;
 use tracing::debug;
+
+/// Dynamic credential provider for RDP authentication.
+///
+/// Used for both security paths:
+/// - CredSSP/NLA: candidates are fed to the NTLM verifier
+/// - TLS-only: client credentials from `ClientInfoPdu` are compared against candidates
+///
+/// Return an empty `Vec` to reject the user.
+///
+/// # Example
+///
+/// ```rust
+/// use ironrdp_acceptor::CredentialProvider;
+/// use ironrdp_pdu::rdp::client_info::Credentials;
+///
+/// struct StaticProvider {
+///     username: String,
+///     password: String,
+/// }
+///
+/// impl CredentialProvider for StaticProvider {
+///     fn get_credentials(&self, username: &str, _domain: Option<&str>) -> Vec<Credentials> {
+///         if username == self.username {
+///             vec![Credentials {
+///                 username: self.username.clone(),
+///                 password: self.password.clone(),
+///                 domain: None,
+///             }]
+///         } else {
+///             Vec::new()
+///         }
+///     }
+/// }
+/// ```
+pub trait CredentialProvider: Send + Sync {
+    /// Return candidate credentials for `username`/`domain`.
+    ///
+    /// Return an empty `Vec` to reject the connection outright.
+    fn get_credentials(&self, username: &str, domain: Option<&str>) -> Vec<Credentials>;
+}
 
 #[derive(Debug)]
 pub(crate) enum CredsspState {
