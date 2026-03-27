@@ -408,10 +408,10 @@ Effort: small.
 
 1. ~~Make single-session server behavior an explicit fork contract.~~ Done (item 40).
 
-2. Finish focused runtime tests around the session seams.
-Refs: `crates/ironrdp-testsuite-extra/tests/*`, `crates/ironrdp-client/src/session_driver.rs`, `crates/ironrdp-server/src/session_driver.rs`.
-Effort: medium.
-Progress: 3 new tests added (item 44). Remaining: single-session rejection, decompressor regression integration.
+2. ~~Finish focused runtime tests around the session seams.~~ Done (P1.2 complete).
+8 integration tests pass: client_server, deactivation_reactivation, graceful_disconnect,
+display_write_failure, double_reactivation, echo_virtual_channel, single_session_rejection,
+decompressor_regression.
 
 3. ~~Make display and bitmap constraints fail early and clearly.~~ Done (item 41).
 
@@ -500,23 +500,11 @@ three tracks with prioritized phases based on upstream fork analysis.
 
 ### Track A: Authentication & credential management
 
-1. Port CredentialValidator trait for server-side auth.
-Source: upstream PR #1172 (glamberson, 49 lines, additive).
-Refs: `crates/ironrdp-acceptor/src/lib.rs`.
-Do next:
-- Add `CredentialValidator` trait to acceptor crate
-- Wire into `RdpServer` builder as optional validator
-- Enables gateway to validate credentials per-connection
-Effort: small.
+1. ~~Port CredentialValidator trait for server-side auth.~~ Done.
+`CredentialValidator` trait added to ironrdp-server, wired into accept_finalize.
 
-2. Port dynamic credential provider for CredSSP/NLA path.
-Source: formalco fork (commit 1993dad4) — code only, without sspi version upgrade.
-Refs: `crates/ironrdp-acceptor/src/credssp.rs`, `crates/ironrdp-acceptor/src/connection.rs`.
-Do next:
-- Port `CredentialProvider` trait and `set_credential_provider()` method
-- Port CredSSP server-side credential resolution changes
-- Do NOT take the sspi git rev upgrade (picky rand_core conflict)
-Effort: medium.
+2. ~~Port dynamic credential provider for CredSSP/NLA path.~~ Done.
+`CredentialProvider` trait added to ironrdp-acceptor with provider -> static -> allow chain.
 
 3. NTLM fallback when Kerberos is unavailable.
 Source: formalco fork + upstream PR #1143 (ramnes).
@@ -526,15 +514,8 @@ Effort: small (once unblocked).
 
 ### Track B: Graphics acceleration pipeline
 
-4. Enable H.264 decode in the native client EGFX pipeline.
-Source: already in repo (upstream commits b6200c7a + 5e316bba).
-Refs: `crates/ironrdp-egfx/src/client.rs`, `crates/ironrdp-client/src/rdp.rs`.
-Do next:
-- Enable `openh264` feature in `ironrdp-client/Cargo.toml`
-- Create `EgfxRenderHandler` that forwards decoded frames to presentation layer
-- Pass `Some(decoder)` to `GraphicsPipelineClient::new()`
-- Hyper-V validation: `--egfx` flag should trigger server codec switch
-Effort: medium.
+4. ~~Enable H.264 decode in the native client EGFX pipeline.~~ Done.
+`EgfxRenderHandler` replaces `LoggingEgfxHandler`, `openh264` feature gates decoder.
 
 5. Port ClearCodec bitmap compression codec and client decode.
 Source: upstream PRs #1174 + #1175 (glamberson, ~5600 lines).
@@ -584,21 +565,11 @@ Do next:
 - Implement native backend using Windows clipboard APIs
 Effort: medium.
 
-10. Port USB redirection PDU definitions.
-Source: upstream PR #1165 (playbahn, 13 files, 2134 lines).
-Refs: `crates/ironrdp-rdpeusb/`.
-Do next:
-- Port URBDRC PDU definitions per MS-RDPEUSB into the stub crate
-- Foundation work only — actual USB backend (WinUSB/USBDK) is separate
-Effort: small.
+10. ~~Port USB redirection PDU definitions.~~ Done.
+URBDRC PDU structures (header, caps, device, channel, TS_URB) added to ironrdp-rdpeusb.
 
-11. Auto-Detect RTT measurement.
-Source: upstream PRs #1177 + #1178 (glamberson).
-Refs: `crates/ironrdp-pdu/src/rdp/autodetect.rs` (already integrated).
-Do next:
-- Port server-side RTT measurement from #1177
-- Port client-side auto-detect PDU handling from #1178
-Effort: small to medium.
+11. ~~Auto-Detect RTT measurement.~~ Done.
+Client-side auto-detect PDU handling added to x224 session layer.
 
 ## Priority 3: Windows-native feature parity and usability
 
