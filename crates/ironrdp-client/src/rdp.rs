@@ -88,7 +88,7 @@ impl ironrdp_egfx::client::GraphicsPipelineHandler for EgfxRenderHandler {
         debug!(?caps, "EGFX capabilities confirmed");
     }
 
-    fn on_bitmap_updated(&mut self, update: &ironrdp_egfx::client::BitmapUpdate) {
+    fn on_bitmap_updated(&mut self, update: ironrdp_egfx::client::BitmapUpdate) {
         if update.data.is_empty() {
             trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (no decoder or empty frame)");
             return;
@@ -103,7 +103,11 @@ impl ironrdp_egfx::client::GraphicsPipelineHandler for EgfxRenderHandler {
             return;
         };
 
-        let buffer = update.data.clone();
+        // Move the (potentially multi-megabyte) decoded RGBA buffer straight into
+        // the render event instead of cloning it. `update` is owned here, so the
+        // buffer travels egfx accumulator -> handler -> event loop with a single
+        // copy at the egfx boundary rather than two.
+        let buffer = update.data;
 
         if let Err(e) = self
             .event_loop_proxy

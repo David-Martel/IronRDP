@@ -39,7 +39,7 @@
 //! struct MyHandler;
 //!
 //! impl GraphicsPipelineHandler for MyHandler {
-//!     fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
+//!     fn on_bitmap_updated(&mut self, update: BitmapUpdate) {
 //!         // Render decoded bitmap to screen
 //!     }
 //! }
@@ -256,7 +256,11 @@ pub trait GraphicsPipelineHandler: Send {
     ///
     /// This is the primary output path. The `update` contains the
     /// surface ID, destination rectangle, and RGBA pixel data.
-    fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
+    ///
+    /// The update is passed by value so a presenting handler can move the
+    /// (potentially multi-megabyte) `update.data` buffer straight into its
+    /// render path instead of cloning it.
+    fn on_bitmap_updated(&mut self, _update: BitmapUpdate) {}
 
     /// Called when a logical frame is complete
     ///
@@ -770,7 +774,7 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
-        self.handler.on_bitmap_updated(&update);
+        self.handler.on_bitmap_updated(update);
         Ok(())
     }
 
@@ -793,7 +797,7 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
-        self.handler.on_bitmap_updated(&update);
+        self.handler.on_bitmap_updated(update);
     }
 
     /// Handle a `WireToSurface2` PDU carrying RemoteFX Progressive bitmap data.
@@ -899,7 +903,7 @@ impl GraphicsPipelineClient {
             height: surface_height,
         };
 
-        self.handler.on_bitmap_updated(&update);
+        self.handler.on_bitmap_updated(update);
     }
 
     #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
@@ -1109,7 +1113,7 @@ mod tests {
         fn on_surface_created(&mut self, _surface: &Surface) {}
         fn on_surface_deleted(&mut self, _surface_id: u16) {}
         fn on_surface_mapped(&mut self, _surface_id: u16, _x: u32, _y: u32) {}
-        fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
+        fn on_bitmap_updated(&mut self, _update: BitmapUpdate) {}
         fn on_frame_complete(&mut self, _frame_id: u32) {}
         fn on_close(&mut self) {}
         fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
