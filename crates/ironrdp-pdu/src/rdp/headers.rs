@@ -162,6 +162,14 @@ pub enum ShareControlPdu {
     ClientConfirmActive(ClientConfirmActive),
     Data(ShareDataHeader),
     ServerDeactivateAll(ServerDeactivateAll),
+    /// Standard RDP Server Redirection PDU ([MS-RDPBCGR] 2.2.13.1.1).
+    ///
+    /// Sent by the server (e.g. gnome-remote-desktop's system daemon during its
+    /// session handover) to redirect the client to the target session, usually
+    /// carrying a load-balance routing token.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/e5b791d4-63b9-49b2-b56b-3d879fc1ab4e
+    ServerRedirect(ServerRedirectionPdu),
 }
 
 impl ShareControlPdu {
@@ -173,6 +181,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => "Client Confirm Active PDU",
             ShareControlPdu::Data(_) => "Data PDU",
             ShareControlPdu::ServerDeactivateAll(_) => "Server Deactivate All PDU",
+            ShareControlPdu::ServerRedirect(_) => "Server Redirection PDU",
         }
     }
 
@@ -182,6 +191,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => ShareControlPduType::ConfirmActivePdu,
             ShareControlPdu::Data(_) => ShareControlPduType::DataPdu,
             ShareControlPdu::ServerDeactivateAll(_) => ShareControlPduType::DeactivateAllPdu,
+            ShareControlPdu::ServerRedirect(_) => ShareControlPduType::ServerRedirect,
         }
     }
 
@@ -197,7 +207,9 @@ impl ShareControlPdu {
             ShareControlPduType::DeactivateAllPdu => {
                 Ok(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll::decode(src)?))
             }
-            _ => Err(invalid_field_err!("share_type", "unexpected share control PDU type")),
+            ShareControlPduType::ServerRedirect => {
+                Ok(ShareControlPdu::ServerRedirect(ServerRedirectionPdu::decode(src)?))
+            }
         }
     }
 }
@@ -209,6 +221,9 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.encode(dst),
             ShareControlPdu::Data(share_data_header) => share_data_header.encode(dst),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.encode(dst),
+            // The client only ever decodes a Server Redirection PDU (it is server-to-client),
+            // so re-encoding is not supported.
+            ShareControlPdu::ServerRedirect(_) => Err(other_err!("ShareControlPdu", "cannot encode Server Redirection PDU")),
         }
     }
 
@@ -222,8 +237,111 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.size(),
             ShareControlPdu::Data(share_data_header) => share_data_header.size(),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.size(),
+            ShareControlPdu::ServerRedirect(_) => 0,
         }
     }
+}
+
+// RedirFlags bit values ([MS-RDPBCGR] 2.2.13.1.1).
+const LB_TARGET_NET_ADDRESS: u32 = 0x0000_0001;
+const LB_LOAD_BALANCE_INFO: u32 = 0x0000_0002;
+const LB_USERNAME: u32 = 0x0000_0004;
+const LB_DOMAIN: u32 = 0x0000_0008;
+const LB_PASSWORD: u32 = 0x0000_0010;
+const LB_TARGET_FQDN: u32 = 0x0000_0100;
+const LB_TARGET_NETBIOS_NAME: u32 = 0x0000_0200;
+const LB_REDIRECTION_GUID: u32 = 0x0000_8000;
+const LB_TARGET_CERTIFICATE: u32 = 0x0001_0000;
+
+/// Standard RDP Server Redirection PDU payload (RDP_SERVER_REDIRECTION_PACKET,
+/// [MS-RDPBCGR] 2.2.13.1.1).
+///
+/// Only the fields required to follow a load-balance redirection are decoded;
+/// the trailing optional fields (password cookie, redirection GUID, target
+/// certificate, ...) are intentionally left unparsed.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/1cf18d97-9c1e-4a83-95a2-df3a04c30850
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerRedirectionPdu {
+    pub session_id: u32,
+    pub redir_flags: u32,
+    /// LB_TARGET_NET_ADDRESS: target machine to reconnect to (UTF-16LE bytes).
+    /// Absent means "reconnect to the same server".
+    pub target_net_address: Option<Vec<u8>>,
+    /// LB_LOAD_BALANCE_INFO: routing token sent verbatim in the reconnect's
+    /// X.224 Connection Request so the server routes to the target session.
+    pub load_balance_info: Option<Vec<u8>>,
+    /// LB_USERNAME (UTF-16LE bytes).
+    pub username: Option<Vec<u8>>,
+    /// LB_DOMAIN (UTF-16LE bytes).
+    pub domain: Option<Vec<u8>>,
+}
+
+fn read_len_prefixed_field(src: &mut ReadCursor<'_>) -> DecodeResult<Vec<u8>> {
+    ensure_size!(in: src, size: 4);
+    let len = cast_length!("ServerRedirectionPdu::field_len", src.read_u32())?;
+    ensure_size!(in: src, size: len);
+    Ok(src.read_slice(len).to_vec())
+}
+
+impl ServerRedirectionPdu {
+    /// Decodes the packet starting at the `Length` field.
+    ///
+    /// The enclosing [`ShareControlHeader::decode`] has already consumed the
+    /// 2-byte pad + 2-byte `Flags` (= SEC_REDIRECTION_PKT) as its `shareId`
+    /// `u32`, so the cursor is positioned at `Length` on entry.
+    pub(crate) fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        ensure_size!(in: src, size: 2 + 4 + 4);
+        let _length = src.read_u16();
+        let session_id = src.read_u32();
+        let redir_flags = src.read_u32();
+
+        let target_net_address = (redir_flags & LB_TARGET_NET_ADDRESS != 0)
+            .then(|| read_len_prefixed_field(src))
+            .transpose()?;
+        let load_balance_info = (redir_flags & LB_LOAD_BALANCE_INFO != 0)
+            .then(|| read_len_prefixed_field(src))
+            .transpose()?;
+        let username = (redir_flags & LB_USERNAME != 0)
+            .then(|| read_len_prefixed_field(src))
+            .transpose()?;
+        let domain = (redir_flags & LB_DOMAIN != 0)
+            .then(|| read_len_prefixed_field(src))
+            .transpose()?;
+        // Remaining optional fields (LB_PASSWORD, LB_TARGET_FQDN,
+        // LB_TARGET_NETBIOS_NAME, LB_REDIRECTION_GUID, LB_TARGET_CERTIFICATE,
+        // ...) are not needed to follow the redirection and are left unparsed.
+        let _ = (
+            LB_PASSWORD,
+            LB_TARGET_FQDN,
+            LB_TARGET_NETBIOS_NAME,
+            LB_REDIRECTION_GUID,
+            LB_TARGET_CERTIFICATE,
+        );
+
+        Ok(Self {
+            session_id,
+            redir_flags,
+            target_net_address,
+            load_balance_info,
+            username,
+            domain,
+        })
+    }
+
+    /// Decodes UTF-16LE `target_net_address` into a `String`, if present.
+    pub fn target_net_address_string(&self) -> Option<String> {
+        self.target_net_address.as_deref().map(utf16le_to_string)
+    }
+}
+
+fn utf16le_to_string(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&u| u != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,5 +785,46 @@ impl Encode for ServerDeactivateAll {
 
     fn size(&self) -> usize {
         Self::FIXED_PART_SIZE
+    }
+}
+
+#[cfg(test)]
+mod redirection_tests {
+    use ironrdp_core::{Decode as _, ReadCursor};
+
+    use super::{ShareControlHeader, ShareControlPdu};
+
+    /// A Standard Server Redirection PDU carrying a `LoadBalanceInfo` routing
+    /// token, matching the shape gnome-remote-desktop sends during its session
+    /// handover (pduType `PDUTYPE_SERVER_REDIR_PKT` = 0xA, and the 2-byte pad +
+    /// 2-byte `Flags` = SEC_REDIRECTION_PKT that the ShareControlHeader consumes
+    /// as its `shareId`).
+    #[test]
+    fn decodes_server_redirection_with_load_balance_info() {
+        let token = b"tsv://hello-token";
+        let redir_len: u16 = 8 + 4 + 4 + 4 + token.len() as u16; // pad+flags(4) + len(2) + sid(4) + flags(4) + (len(4)+token)
+        let total_len: u16 = 6 + 2 + 2 + redir_len; // control hdr(6) + pad(2) + flags(2) + rest
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&total_len.to_le_bytes()); // totalLength
+        buf.extend_from_slice(&0x001Au16.to_le_bytes()); // pduType: version 1 (0x10) | ServerRedirect (0xA)
+        buf.extend_from_slice(&0u16.to_le_bytes()); // pduSource
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Pad2Octets
+        buf.extend_from_slice(&0x0400u16.to_le_bytes()); // Flags = SEC_REDIRECTION_PKT
+        buf.extend_from_slice(&redir_len.to_le_bytes()); // Length
+        buf.extend_from_slice(&0u32.to_le_bytes()); // SessionID
+        buf.extend_from_slice(&0x0000_0002u32.to_le_bytes()); // RedirFlags = LB_LOAD_BALANCE_INFO
+        buf.extend_from_slice(&(token.len() as u32).to_le_bytes()); // LoadBalanceInfoLength
+        buf.extend_from_slice(token); // LoadBalanceInfo
+
+        let header = ShareControlHeader::decode(&mut ReadCursor::new(&buf)).expect("decode redirection");
+        match header.share_control_pdu {
+            ShareControlPdu::ServerRedirect(redir) => {
+                assert_eq!(redir.redir_flags, 0x0000_0002);
+                assert_eq!(redir.load_balance_info.as_deref(), Some(&token[..]));
+                assert!(redir.target_net_address.is_none());
+            }
+            other => panic!("expected ServerRedirect, got {other:?}"),
+        }
     }
 }

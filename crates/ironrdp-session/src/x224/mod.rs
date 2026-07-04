@@ -34,6 +34,14 @@ pub enum ProcessorOutput {
     /// [\[MS-RDPBCGR\] 2.2.15.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/de783158-8b01-4818-8fb0-62523a5b3490
     /// [`MultitransportResponsePdu`]: ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu
     MultitransportRequest(MultitransportRequestPdu),
+    /// Received a Server Redirection PDU. The client should tear down the current
+    /// connection and reconnect to the target session, sending the load-balance
+    /// routing token in the reconnect's X.224 Connection Request.
+    ///
+    /// See [\[MS-RDPBCGR\] 2.2.13.1.1].
+    ///
+    /// [\[MS-RDPBCGR\] 2.2.13.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/1cf18d97-9c1e-4a83-95a2-df3a04c30850
+    Redirect(Box<ironrdp_pdu::rdp::headers::ServerRedirectionPdu>),
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +126,13 @@ impl Processor {
         let data_ctx: SendDataIndicationCtx<'_> =
             ironrdp_connector::legacy::decode_send_data_indication(frame).map_err(crate::legacy::map_error)?;
         let channel_id = data_ctx.channel_id;
+        tracing::debug!(
+            channel_id,
+            io_channel_id = self.io_channel_id,
+            user_data_len = data_ctx.user_data.len(),
+            head = ?&data_ctx.user_data[..core::cmp::min(24, data_ctx.user_data.len())],
+            "x224 process: routing SendDataIndication"
+        );
 
         if channel_id == self.io_channel_id {
             self.process_io_channel(data_ctx)
@@ -285,6 +300,14 @@ impl Processor {
             ironrdp_connector::legacy::IoChannelPdu::DeactivateAll(_) => Ok(vec![ProcessorOutput::DeactivateAll(
                 Box::new(self.connection_activation.reset_clone()),
             )]),
+            ironrdp_connector::legacy::IoChannelPdu::Redirection(redirection) => {
+                debug!(
+                    redir_flags = format_args!("{:#010x}", redirection.redir_flags),
+                    has_load_balance_info = redirection.load_balance_info.is_some(),
+                    "Received Server Redirection PDU"
+                );
+                Ok(vec![ProcessorOutput::Redirect(Box::new(redirection))])
+            }
         }
     }
 

@@ -182,6 +182,7 @@ pub struct RdpClient {
 impl RdpClient {
     pub async fn run(mut self) {
         let mut same_size_reconnects = 0;
+        let mut redirect_count: u8 = 0;
 
         loop {
             let (connection_result, framed) = if let Some(rdcleanpath) = self.config.rdcleanpath.as_ref() {
@@ -258,6 +259,30 @@ impl RdpClient {
                     self.config.connector.desktop_size.width = width;
                     self.config.connector.desktop_size.height = height;
                 }
+                Ok(RdpControlFlow::Redirect { routing_token }) => {
+                    redirect_count = redirect_count.saturating_add(1);
+                    if redirect_count > MAX_REDIRECTS {
+                        error!(redirect_count, "Too many server redirections; aborting");
+                        self.send_terminal_event(Err(ironrdp::session::general_err!(
+                            "too many server redirections"
+                        )));
+                        break;
+                    }
+
+                    // Forward the load-balance routing token verbatim in the reconnect's
+                    // X.224 Connection Request so the server (e.g. gnome-remote-desktop's
+                    // system daemon) routes us to the handed-over target session. The
+                    // damartel credentials are reused; GRD authenticates the redirected
+                    // connection against the same PAM/system password.
+                    self.config.connector.request_data =
+                        routing_token.map(ironrdp::pdu::nego::NegoRequestData::raw);
+
+                    info!(
+                        redirect_count,
+                        has_routing_token = self.config.connector.request_data.is_some(),
+                        "Reconnecting to follow server redirection (session handover)"
+                    );
+                }
                 Ok(RdpControlFlow::TerminatedGracefully(reason)) => {
                     info!(%reason, "Session terminated gracefully");
                     self.send_terminal_event(Ok(reason));
@@ -286,6 +311,7 @@ type UpgradedFramed = ironrdp_tokio::TokioFramed<Box<dyn AsyncReadWrite + Unpin 
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_SAME_SIZE_RECONNECTS: u8 = 3;
+const MAX_REDIRECTS: u8 = 3;
 
 fn update_resize_reconnect_state(
     current_width: u16,

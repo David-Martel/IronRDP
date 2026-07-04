@@ -170,6 +170,11 @@ pub enum IoChannelPdu {
     ///
     /// Received when the server wants the client to establish a sideband UDP transport.
     MultitransportRequest(MultitransportRequestPdu),
+    /// Server Redirection PDU ([MS-RDPBCGR] 2.2.13.1.1).
+    ///
+    /// The server is redirecting the client to a target session (used by
+    /// gnome-remote-desktop's system-daemon session handover).
+    Redirection(rdp::headers::ServerRedirectionPdu),
 }
 
 pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoChannelPdu> {
@@ -208,6 +213,7 @@ pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoCh
 
             Ok(IoChannelPdu::Data(share_data_ctx))
         }
+        rdp::headers::ShareControlPdu::ServerRedirect(redirection) => Ok(IoChannelPdu::Redirection(redirection)),
         _ => Err(general_err!(
             "received unexpected Share Control Pdu (expected Share Data Header or Server Deactivate All)"
         )),

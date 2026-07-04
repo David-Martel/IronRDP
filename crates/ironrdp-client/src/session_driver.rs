@@ -42,6 +42,9 @@ const FRAME_PACING_INTERVAL: Duration = Duration::from_millis(4);
 
 pub(crate) enum RdpControlFlow {
     ReconnectWithNewSize { width: u16, height: u16 },
+    /// The server sent a Server Redirection PDU; reconnect to the target session
+    /// carrying the load-balance routing token (if any).
+    Redirect { routing_token: Option<Vec<u8>> },
     TerminatedGracefully(GracefulDisconnectReason),
 }
 
@@ -49,6 +52,14 @@ enum SessionDriverFlow {
     Outputs(Vec<ActiveStageOutput>),
     EmitLatestImage,
     ReconnectWithNewSize { width: u16, height: u16 },
+}
+
+/// Result of handling a single (or batch of) [`ActiveStageOutput`], signalling
+/// whether the active session should continue, terminate, or reconnect.
+enum StageFlow {
+    Continue,
+    Terminate(GracefulDisconnectReason),
+    Redirect { routing_token: Option<Vec<u8>> },
 }
 
 struct SessionDriver {
@@ -237,7 +248,7 @@ impl SessionDriver {
         writer: &mut TokioFramed<W>,
         event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
         outputs: Vec<ActiveStageOutput>,
-    ) -> SessionResult<Option<GracefulDisconnectReason>>
+    ) -> SessionResult<StageFlow>
     where
         R: AsyncRead + Unpin + Send + Sync,
         W: AsyncWrite + Unpin + Send + Sync,
@@ -258,8 +269,9 @@ impl SessionDriver {
                 graphics_update_pending = false;
             }
 
-            if let Some(reason) = self.handle_stage_output(reader, writer, event_loop_proxy, out).await? {
-                return Ok(Some(reason));
+            match self.handle_stage_output(reader, writer, event_loop_proxy, out).await? {
+                StageFlow::Continue => {}
+                flow => return Ok(flow),
             }
         }
 
@@ -267,7 +279,7 @@ impl SessionDriver {
             self.queue_latest_image_update(event_loop_proxy)?;
         }
 
-        Ok(None)
+        Ok(StageFlow::Continue)
     }
 
     async fn handle_stage_output<R, W>(
@@ -276,7 +288,7 @@ impl SessionDriver {
         writer: &mut TokioFramed<W>,
         event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
         out: ActiveStageOutput,
-    ) -> SessionResult<Option<GracefulDisconnectReason>>
+    ) -> SessionResult<StageFlow>
     where
         R: AsyncRead + Unpin + Send + Sync,
         W: AsyncWrite + Unpin + Send + Sync,
@@ -287,41 +299,41 @@ impl SessionDriver {
                     .write_all(&frame)
                     .await
                     .map_err(|e| session::custom_err!("write response", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::GraphicsUpdate(region) => {
                 union_dirty_region(&mut self.dirty_region, region);
                 self.queue_latest_image_update(event_loop_proxy)?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::PointerDefault => {
                 event_loop_proxy
                     .send_event(RdpOutputEvent::PointerDefault)
                     .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::PointerHidden => {
                 event_loop_proxy
                     .send_event(RdpOutputEvent::PointerHidden)
                     .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::PointerPosition { x, y } => {
                 event_loop_proxy
                     .send_event(RdpOutputEvent::PointerPosition { x, y })
                     .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::PointerBitmap(pointer) => {
                 event_loop_proxy
                     .send_event(RdpOutputEvent::PointerBitmap(pointer))
                     .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::DeactivateAll(connection_activation) => {
                 self.handle_deactivation_reactivation(reader, writer, connection_activation)
                     .await?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::MultitransportRequest(pdu) => {
                 let response = self
@@ -337,11 +349,25 @@ impl SessionDriver {
                     response = "E_ABORT",
                     "Multitransport request received (UDP transport not implemented)"
                 );
-                Ok(None)
+                Ok(StageFlow::Continue)
+            }
+            ActiveStageOutput::Redirect(redirection) => {
+                if let Some(target) = redirection.target_net_address_string() {
+                    // A different reconnect target is not yet supported; GRD's
+                    // handover redirects back to the same endpoint (no target address).
+                    warn!(%target, "Server Redirection targets a different address; reconnecting to the same endpoint anyway");
+                }
+                let routing_token = redirection.load_balance_info.clone();
+                info!(
+                    has_routing_token = routing_token.is_some(),
+                    routing_token_len = routing_token.as_ref().map_or(0, Vec::len),
+                    "Following Server Redirection (session handover)"
+                );
+                Ok(StageFlow::Redirect { routing_token })
             }
             ActiveStageOutput::Terminate(reason) => {
                 info!(%reason, "Server-initiated graceful disconnect received");
-                Ok(Some(reason))
+                Ok(StageFlow::Terminate(reason))
             }
         }
     }
@@ -545,11 +571,15 @@ where
 
         match flow {
             SessionDriverFlow::Outputs(outputs) => {
-                if let Some(reason) = driver
+                match driver
                     .handle_stage_outputs(&mut reader, &mut writer, event_loop_proxy, outputs)
                     .await?
                 {
-                    break 'outer reason;
+                    StageFlow::Continue => {}
+                    StageFlow::Terminate(reason) => break 'outer reason,
+                    StageFlow::Redirect { routing_token } => {
+                        return Ok(RdpControlFlow::Redirect { routing_token });
+                    }
                 }
             }
             SessionDriverFlow::EmitLatestImage => {

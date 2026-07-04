@@ -338,6 +338,11 @@ pub enum ActiveStageOutput {
     ///
     /// [\[MS-RDPBCGR\] 2.2.15.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/de783158-8b01-4818-8fb0-62523a5b3490
     MultitransportRequest(MultitransportRequestPdu),
+    /// Server Redirection PDU. The application should reconnect to the target
+    /// session, carrying the load-balance routing token.
+    ///
+    /// See [\[MS-RDPBCGR\] 2.2.13.1.1].
+    Redirect(Box<ironrdp_pdu::rdp::headers::ServerRedirectionPdu>),
 }
 
 impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
@@ -360,6 +365,7 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
             }
             x224::ProcessorOutput::DeactivateAll(cas) => Ok(Self::DeactivateAll(cas)),
             x224::ProcessorOutput::MultitransportRequest(pdu) => Ok(Self::MultitransportRequest(pdu)),
+            x224::ProcessorOutput::Redirect(redirection) => Ok(Self::Redirect(redirection)),
         }
     }
 }
