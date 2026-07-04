@@ -311,6 +311,12 @@ Connector / protocol correctness:
 - #1382 (3f96d002) set COMPRESSION_USED on FastPath update header — clean.
 - #1313 (a71567e3) cover BitmapCacheV3 in CapabilitySet encoder (fixes a reachable
   `unreachable!()` panic) — core + testsuite-core test; fork's richer fuzz oracle kept.
+- #1231 (2fa7c648) advertise all colour depths + derive highColorDepth per
+  max_color_depth (modern Windows hosts reset 24bpp-only clients) — clean cherry-pick;
+  fits this branch's earlyCapabilityFlags theme.
+- Restored the upstream `connection_activation` test module (dropped by the fork)
+  so #1254/#1371 are covered: 3 tests exercise the ServerDeactivateAll path
+  (only adaptation was the fork's added `enable_graphics_pipeline` Config field).
 Graphics robustness:
 - #1298 (67f3c635) tolerate unknown EGFX capability versions — adapted (fork's
   `try_from` only mapped one sentinel; broadened to any unrecognized version →
