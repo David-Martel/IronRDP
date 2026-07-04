@@ -7,9 +7,12 @@
 extern crate alloc;
 
 use alloc::borrow::Cow;
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
+// Under `std`, `Vec`/`Box` come from the prelude; importing them from `alloc`
+// there trips `redundant_imports`. Gate the imports to `no_std`, where the
+// prelude does not provide them, so the crate compiles clean in both configs.
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 use core::any::TypeId;
 use core::fmt;
 use core::marker::PhantomData;
