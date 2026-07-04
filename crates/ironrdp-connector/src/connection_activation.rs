@@ -138,6 +138,28 @@ impl Sequence for ConnectionActivationSequence {
                     return Ok(Written::Nothing);
                 }
 
+                // A server may interleave a Set Error Info PDU (carried as a Share Data PDU)
+                // during a Deactivation-Reactivation Sequence — e.g. gnome-remote-desktop's
+                // session-handover instance emits ServerSetErrorInfo(BadCapabilities) after
+                // the client's Confirm Active. Treat it as a diagnostic notification, not a
+                // fatal decode failure: log the specific code and keep reading for the Server
+                // Demand Active PDU. If the server does intend to tear the connection down it
+                // will close the transport, surfacing an honest transport error instead of the
+                // misleading "unexpected Share Control Pdu (expected ServerDemandActive)".
+                if let rdp::headers::ShareControlPdu::Data(ref share_data) = share_control_ctx.pdu
+                    && let rdp::headers::ShareDataPdu::ServerSetErrorInfo(ref err) = share_data.share_data_pdu
+                {
+                    warn!(
+                        error_info = %err.0.description(),
+                        "Received Set Error Info PDU during Capabilities Exchange; continuing to await Server Demand Active"
+                    );
+                    self.state = ConnectionActivationState::CapabilitiesExchange {
+                        io_channel_id,
+                        user_channel_id,
+                    };
+                    return Ok(Written::Nothing);
+                }
+
                 let capability_sets = if let rdp::headers::ShareControlPdu::ServerDemandActive(server_demand_active) =
                     share_control_ctx.pdu
                 {
