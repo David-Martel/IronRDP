@@ -37,7 +37,7 @@ use tracing::{debug, error, info, trace};
 use winit::event_loop::EventLoopProxy;
 
 use crate::config::{Config, RDCleanPathConfig};
-use crate::session_driver::{RdpControlFlow, run_active_session};
+use crate::session_driver::{RdpControlFlow, RedirectInfo, run_active_session};
 
 /// EGFX graphics pipeline handler that forwards decoded frames to the event loop.
 ///
@@ -259,7 +259,11 @@ impl RdpClient {
                     self.config.connector.desktop_size.width = width;
                     self.config.connector.desktop_size.height = height;
                 }
-                Ok(RdpControlFlow::Redirect { routing_token }) => {
+                Ok(RdpControlFlow::Redirect(RedirectInfo {
+                    routing_token,
+                    username,
+                    password,
+                })) => {
                     redirect_count = redirect_count.saturating_add(1);
                     if redirect_count > MAX_REDIRECTS {
                         error!(redirect_count, "Too many server redirections; aborting");
@@ -271,11 +275,26 @@ impl RdpClient {
 
                     // Forward the load-balance routing token verbatim in the reconnect's
                     // X.224 Connection Request so the server (e.g. gnome-remote-desktop's
-                    // system daemon) routes us to the handed-over target session. The
-                    // damartel credentials are reused; GRD authenticates the redirected
-                    // connection against the same PAM/system password.
+                    // system daemon) routes us to the handed-over target session.
                     self.config.connector.request_data =
                         routing_token.map(ironrdp::pdu::nego::NegoRequestData::raw);
+
+                    // GRD's handover instance authenticates the redirected connection
+                    // against a winpr NTLM SAM populated with the redirection-provided
+                    // credentials (not the original PAM login), so switch to them when
+                    // supplied.
+                    if let connector::Credentials::UsernamePassword {
+                        username: cur_username,
+                        password: cur_password,
+                    } = &mut self.config.connector.credentials
+                    {
+                        if let Some(username) = username {
+                            *cur_username = username;
+                        }
+                        if let Some(password) = password {
+                            *cur_password = password;
+                        }
+                    }
 
                     info!(
                         redirect_count,

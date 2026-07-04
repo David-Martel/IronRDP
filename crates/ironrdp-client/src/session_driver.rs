@@ -40,11 +40,22 @@ use crate::rdp::{RdpInputEvent, RdpOutputEvent};
 /// server-update burst can be coalesced without starving the display pipeline.
 const FRAME_PACING_INTERVAL: Duration = Duration::from_millis(4);
 
+pub(crate) struct RedirectInfo {
+    /// LB_LOAD_BALANCE_INFO routing token, sent verbatim in the reconnect's
+    /// X.224 Connection Request.
+    pub routing_token: Option<Vec<u8>>,
+    /// LB_USERNAME to authenticate the handover connection with, if provided.
+    pub username: Option<String>,
+    /// LB_PASSWORD cookie to authenticate the handover connection with, if
+    /// provided and not public-key encrypted.
+    pub password: Option<String>,
+}
+
 pub(crate) enum RdpControlFlow {
     ReconnectWithNewSize { width: u16, height: u16 },
     /// The server sent a Server Redirection PDU; reconnect to the target session
-    /// carrying the load-balance routing token (if any).
-    Redirect { routing_token: Option<Vec<u8>> },
+    /// carrying the load-balance routing token and redirection credentials.
+    Redirect(RedirectInfo),
     TerminatedGracefully(GracefulDisconnectReason),
 }
 
@@ -59,7 +70,7 @@ enum SessionDriverFlow {
 enum StageFlow {
     Continue,
     Terminate(GracefulDisconnectReason),
-    Redirect { routing_token: Option<Vec<u8>> },
+    Redirect(RedirectInfo),
 }
 
 struct SessionDriver {
@@ -358,12 +369,32 @@ impl SessionDriver {
                     warn!(%target, "Server Redirection targets a different address; reconnecting to the same endpoint anyway");
                 }
                 let routing_token = redirection.load_balance_info.clone();
+                let username = redirection.username_string().filter(|s| !s.is_empty());
+                // GRD's handover instance authenticates the redirected connection
+                // against a winpr NTLM SAM populated with the redirection
+                // credentials, so reuse them rather than the original login.
+                let pk_encrypted = redirection.is_password_pk_encrypted();
+                let password = if pk_encrypted {
+                    None
+                } else {
+                    redirection.password_string()
+                };
+                if pk_encrypted {
+                    warn!("Redirection password is public-key encrypted; cannot reuse it as an NLA credential");
+                }
                 info!(
                     has_routing_token = routing_token.is_some(),
                     routing_token_len = routing_token.as_ref().map_or(0, Vec::len),
+                    redirection_username = ?username,
+                    has_password = password.is_some(),
+                    password_pk_encrypted = pk_encrypted,
                     "Following Server Redirection (session handover)"
                 );
-                Ok(StageFlow::Redirect { routing_token })
+                Ok(StageFlow::Redirect(RedirectInfo {
+                    routing_token,
+                    username,
+                    password,
+                }))
             }
             ActiveStageOutput::Terminate(reason) => {
                 info!(%reason, "Server-initiated graceful disconnect received");
@@ -577,8 +608,8 @@ where
                 {
                     StageFlow::Continue => {}
                     StageFlow::Terminate(reason) => break 'outer reason,
-                    StageFlow::Redirect { routing_token } => {
-                        return Ok(RdpControlFlow::Redirect { routing_token });
+                    StageFlow::Redirect(info) => {
+                        return Ok(RdpControlFlow::Redirect(info));
                     }
                 }
             }

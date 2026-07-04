@@ -533,15 +533,33 @@ Done: parse the redirection PDU, thread it up (ProcessorOutput/ActiveStageOutput
 ::Redirect), and reconnect carrying the LoadBalanceInfo verbatim as an X.224
 routing token (NegoRequestData::Raw). The reconnect's negotiation IS accepted
 by GRD (HYBRID confirmed, TLS upgrades).
-Remaining blocker (bounded): the handover connection's CredSSP is rejected
-(`InvalidToken`, nstatus 0xc00700ea) because GRD expects the redirection
-password cookie (LB_PASSWORD, PK-encrypted with LB_TARGET_CERTIFICATE), not the
-reused damartel credentials. To finish: parse LB_USERNAME/LB_PASSWORD/
-LB_TARGET_CERTIFICATE, and drive CredSSP with the redirection cookie (the
-PASSWORD_IS_PK_ENCRYPTED path — encrypt/pass the cookie per the target cert).
-This is the multi-day sspi-integration piece. Only after this completes will
-EGFX/bitmap graphics start, at which point the upstream EGFX caps-tolerance
-fixes (#1298/#1305) and frame-decode fixes (#1341/#1395) become relevant.
+Also done: the reconnect now switches to the redirection-provided credentials
+(LB_USERNAME / LB_PASSWORD) instead of the original login, because GRD's
+handover instance authenticates against a private winpr NTLM SAM, not PAM.
+Server-side proof (user-session journal, `org.gnome.RemoteDesktop.Handover`):
+`[com.winpr.sspi.NTLM] ntlm_fetch_ntlm_v2_hash: Could not find user in SAM
+database` when the original `damartel` username was sent. The redirection
+LB_USERNAME is a random per-handover cookie (e.g. "`@%PG..."), and LB_PASSWORD
+has PASSWORD_IS_PK_ENCRYPTED set.
+
+Remaining blocker (bounded, two parts):
+1. LB_PASSWORD is public-key encrypted with LB_TARGET_CERTIFICATE, so it cannot
+   be reused as a plaintext NTLMv2 credential. Completing the handover requires
+   the RDP "redirection with PK-encrypted password" CredSSP path (FreeRDP's
+   RedirectionPassword + RedirectionPasswordIsPkEncrypted), which IronRDP's
+   sspi/CredSSP stack does not support. Multi-day sspi-integration piece.
+2. Suspected confound: the client's DisplayControl-triggered resize-reconnect
+   fires during phase 1, and each connection to the system daemon spawns a fresh
+   handover instance with its own SAM, so the routing token may not land on the
+   instance that minted the cookie ("RDP client disconnected during the
+   handover" in the system-daemon journal). Investigate suppressing the early
+   resize-reconnect during/around handover. Also verify LB_USERNAME byte-exact
+   handling (current UTF-16LE lossy decode + NUL-trim may not match GRD's SAM
+   entry exactly).
+
+Only after handover NLA completes will EGFX/bitmap graphics start, at which
+point the upstream EGFX caps-tolerance fixes (#1298/#1305) and frame-decode
+fixes (#1341/#1395) become relevant.
 
 4. ~~Enable H.264 decode in the native client EGFX pipeline.~~ Done.
 `EgfxRenderHandler` replaces `LoggingEgfxHandler`, `openh264` feature gates decoder.

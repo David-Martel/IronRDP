@@ -250,6 +250,7 @@ const LB_DOMAIN: u32 = 0x0000_0008;
 const LB_PASSWORD: u32 = 0x0000_0010;
 const LB_TARGET_FQDN: u32 = 0x0000_0100;
 const LB_TARGET_NETBIOS_NAME: u32 = 0x0000_0200;
+const LB_PASSWORD_IS_PK_ENCRYPTED: u32 = 0x0000_4000;
 const LB_REDIRECTION_GUID: u32 = 0x0000_8000;
 const LB_TARGET_CERTIFICATE: u32 = 0x0001_0000;
 
@@ -275,6 +276,10 @@ pub struct ServerRedirectionPdu {
     pub username: Option<Vec<u8>>,
     /// LB_DOMAIN (UTF-16LE bytes).
     pub domain: Option<Vec<u8>>,
+    /// LB_PASSWORD: redirection password/cookie. UTF-16LE plaintext unless
+    /// [`Self::is_password_pk_encrypted`] is set, in which case it is an opaque
+    /// blob encrypted with the target server's public key.
+    pub password: Option<Vec<u8>>,
 }
 
 fn read_len_prefixed_field(src: &mut ReadCursor<'_>) -> DecodeResult<Vec<u8>> {
@@ -308,16 +313,13 @@ impl ServerRedirectionPdu {
         let domain = (redir_flags & LB_DOMAIN != 0)
             .then(|| read_len_prefixed_field(src))
             .transpose()?;
-        // Remaining optional fields (LB_PASSWORD, LB_TARGET_FQDN,
-        // LB_TARGET_NETBIOS_NAME, LB_REDIRECTION_GUID, LB_TARGET_CERTIFICATE,
-        // ...) are not needed to follow the redirection and are left unparsed.
-        let _ = (
-            LB_PASSWORD,
-            LB_TARGET_FQDN,
-            LB_TARGET_NETBIOS_NAME,
-            LB_REDIRECTION_GUID,
-            LB_TARGET_CERTIFICATE,
-        );
+        let password = (redir_flags & LB_PASSWORD != 0)
+            .then(|| read_len_prefixed_field(src))
+            .transpose()?;
+        // Remaining optional fields (LB_TARGET_FQDN, LB_TARGET_NETBIOS_NAME,
+        // LB_REDIRECTION_GUID, LB_TARGET_CERTIFICATE, ...) are not needed to
+        // follow the redirection and are left unparsed.
+        let _ = (LB_TARGET_FQDN, LB_TARGET_NETBIOS_NAME, LB_REDIRECTION_GUID, LB_TARGET_CERTIFICATE);
 
         Ok(Self {
             session_id,
@@ -326,12 +328,35 @@ impl ServerRedirectionPdu {
             load_balance_info,
             username,
             domain,
+            password,
         })
     }
 
     /// Decodes UTF-16LE `target_net_address` into a `String`, if present.
     pub fn target_net_address_string(&self) -> Option<String> {
         self.target_net_address.as_deref().map(utf16le_to_string)
+    }
+
+    /// Decodes UTF-16LE `username` into a `String`, if present.
+    pub fn username_string(&self) -> Option<String> {
+        self.username.as_deref().map(utf16le_to_string)
+    }
+
+    /// Decodes UTF-16LE `domain` into a `String`, if present.
+    pub fn domain_string(&self) -> Option<String> {
+        self.domain.as_deref().map(utf16le_to_string)
+    }
+
+    /// Decodes UTF-16LE `password` into a `String`, if present. Only meaningful
+    /// when [`Self::is_password_pk_encrypted`] is `false`.
+    pub fn password_string(&self) -> Option<String> {
+        self.password.as_deref().map(utf16le_to_string)
+    }
+
+    /// Whether the `password` field is encrypted with the target server's public
+    /// key (LB_PASSWORD_IS_PK_ENCRYPTED) rather than a UTF-16LE plaintext cookie.
+    pub fn is_password_pk_encrypted(&self) -> bool {
+        self.redir_flags & LB_PASSWORD_IS_PK_ENCRYPTED != 0
     }
 }
 
