@@ -361,14 +361,29 @@ live GRD, so the import did not regress render.
   code, e.g. BadCapabilities, at warn) and keeps reading for ServerDemandActive
   instead of aborting — protocol-correct per [MS-RDPBCGR] 2.2.5.1. dtm-work
   baseline unaffected; 666 connector/testsuite tests pass.
-- UNVERIFIED: whether this restores GRD pixels end-to-end. GRD's handover
-  subsystem degraded mid-session (stopped issuing Server Redirection PDUs; only
-  the pre-handover system daemon answered) and would not reproduce the
-  BadCapabilities path again this session. Next step: on a freshly-booted GRD,
-  confirm whether a valid ServerDemandActive follows the BadCapabilities (=> real
-  render fix) or GRD tears the transport down (=> the BadCapabilities rejection
-  itself is the server-side blocker; investigate which capability GRD's handover
-  instance rejects in ClientConfirmActive).
+- VERIFIED (after full system+user GRD restart): the fix fires and now logs the
+  real reason — `error_info=[RDP specific code]: The capabilities received from
+  the client in the Confirm Active PDU were not accepted by the server` — then,
+  instead of sending a Server Demand Active, GRD's handover instance issues an
+  MCS Disconnect Provider Ultimatum (UserRequested) and tears the connection
+  down. So **render is NOT restorable client-side by this change**: GRD's
+  handover/user-session instance genuinely rejects our Confirm Active
+  capabilities (BadCapabilities). The fix's value is truthful diagnostics +
+  protocol-correct continuation, not render restoration.
+- Why the caps are now rejected (best current hypothesis, server-side): the
+  headless GNOME rendering backend is degraded — the daemon logs `Cannot load
+  libcuda.so.1` / `libnvidia-encode.so.1` and (per earlier sessions) ZINK/EGL
+  "failed to choose pdev". A handover instance that cannot bring up its
+  encode/render pipeline will reject the client's graphics capabilities. The
+  client Confirm Active capability set is byte-identical between 5b849c64 and
+  HEAD, so this is not a client regression.
+- Concrete next step to close the render gap: on a freshly-booted asuspro13 with
+  a healthy GRD graphics backend (verify no ZINK "failed to choose pdev" and a
+  working render node), retry and capture a framebuffer dump. If it still
+  BadCapabilities-rejects, enable FreeRDP verbose capability logging server-side
+  (`WLOG_LEVEL=TRACE` on the handover instance) to identify exactly which
+  capability set GRD refuses, then adjust the client Confirm Active caps to match
+  what GRD's handover instance supports.
 - Second, independent handover failure mode: CredSSP `InvalidToken`
   (nstatus 0xc00700ea) in the pub_key_auth step = handover NTLM SAM auth mismatch
   (LB_PASSWORD decode vs stored NTOWFv1, or SAM-not-ready race). Flaky, present at
