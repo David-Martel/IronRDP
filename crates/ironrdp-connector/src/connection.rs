@@ -709,6 +709,10 @@ fn create_gcc_blocks<'a>(
                         | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
 
                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU
+                    // TODO(audio): advertising SUPPORT_NET_CHAR_AUTODETECT would let FreeRDP
+                    // servers (gnome-remote-desktop) enable audio-output redirection, but the
+                    // connector's ConnectTimeAutoDetection state does not consume the resulting
+                    // server Auto-Detect Request, desyncing LicensingExchange. See codex.TODO.md.
 
                     if max_color_depth == 32 {
                         early_capability_flags |= ClientEarlyCapabilityFlags::WANT_32_BPP_SESSION;

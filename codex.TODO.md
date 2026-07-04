@@ -334,6 +334,76 @@ separately):
   DVC accessors (#1368/#1358, breaking dvc changes), agent resize (#1401, ironrdp-agent
   crate not present in fork).
 
+## Live smoke-test findings (2026-07-04, Windows -> asuspro13 GRD 46.3 + dtm-work)
+
+Evidence-based QA pass against both live targets with a fresh `-p ironrdp-client`
+release build. Binaries compared: `5b849c64` (last "render worked" commit) vs
+current `HEAD` (0cf7a36a, post 16-commit upstream import).
+
+1. GRD render regression: NOT caused by the import (root-caused).
+Claim under test: "W->L render rendered a full Ubuntu desktop at 5b849c64, broke
+after the import." Result: **both commits fail identically** against the same
+live GRD, so the import did not regress render.
+- 4 trials each (GRD restarted between): 5b849c64 = 4/4 DEACTIVATE_FAIL; HEAD =
+  3/4 DEACTIVATE_FAIL + 1/4 CREDSSP_FAIL. Same error string, same flow.
+- Confirmed root cause (HEAD, `ironrdp_connector=trace`): the session-handover
+  reconnect passes CredSSP, confirms active, then GRD's handover instance runs a
+  Deactivation-Reactivation and sends `ServerSetErrorInfo(RdpSpecificCode(
+  BadCapabilities))`. The session-layer reactivation loop
+  (`ConnectionActivationSequence`, `connection_activation.rs` CapabilitiesExchange)
+  only expected ServerDeactivateAll / ServerDemandActive, so it aborted with the
+  misleading `unexpected Share Control Pdu (expected ServerDemandActive)`.
+- #1254/#1371 do NOT cause this: they fixed the *connector-initial* DeactivateAll
+  handling; 5b849c64 lacks them and fails the same way. **Do not revert them** —
+  reverting cannot restore render and loses the DeactivateAll robustness.
+- Fix applied (this pass): the reactivation CapabilitiesExchange now treats an
+  interleaved Set Error Info PDU as a diagnostic notification (logs the actual
+  code, e.g. BadCapabilities, at warn) and keeps reading for ServerDemandActive
+  instead of aborting — protocol-correct per [MS-RDPBCGR] 2.2.5.1. dtm-work
+  baseline unaffected; 666 connector/testsuite tests pass.
+- UNVERIFIED: whether this restores GRD pixels end-to-end. GRD's handover
+  subsystem degraded mid-session (stopped issuing Server Redirection PDUs; only
+  the pre-handover system daemon answered) and would not reproduce the
+  BadCapabilities path again this session. Next step: on a freshly-booted GRD,
+  confirm whether a valid ServerDemandActive follows the BadCapabilities (=> real
+  render fix) or GRD tears the transport down (=> the BadCapabilities rejection
+  itself is the server-side blocker; investigate which capability GRD's handover
+  instance rejects in ClientConfirmActive).
+- Second, independent handover failure mode: CredSSP `InvalidToken`
+  (nstatus 0xc00700ea) in the pub_key_auth step = handover NTLM SAM auth mismatch
+  (LB_PASSWORD decode vs stored NTOWFv1, or SAM-not-ready race). Flaky, present at
+  both commits. Server-side / environment; not an import regression.
+
+2. Audio output disabled by GRD due to missing network-autodetect advertisement.
+GRD logs, every connection: `[RDP] Client does not support autodetecting network
+characteristics. Disabling audio output redirection`. FreeRDP-based servers gate
+rdpsnd on the client's `RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT` (0x0080) early-cap
+flag, which the connector does not advertise (`connection.rs`
+`create_gcc_blocks`). So the rdpsnd panic/underrun fixes (#1256/#1276, cpal
+`play()`) cannot matter on GRD — audio is never enabled server-side.
+- Naive fix (advertise the flag) BREAKS connections: with the flag set, GRD sends
+  a connect-time Auto-Detect Request PDU that the connector's
+  `ConnectTimeAutoDetection` state discards without consuming, desyncing
+  LicensingExchange -> `decode during LicenseExchangeState::NewLicenseRequest ...
+  invalid security header flags`. Reproduced live against GRD; reverted.
+  (dtm-work happened to survive because Windows did not send connect-time
+  auto-detect in that idle window — so whether the desync fires is
+  server-dependent, making the flag unsafe to advertise without the handler.)
+- Real fix (feature-sized, TODO not done): implement a content-dispatching
+  `ConnectTimeAutoDetection` state that consumes the server Auto-Detect Request
+  (respond to RTT; handle the optional BandwidthMeasure Start/Payload/Stop/Results
+  + NetworkCharacteristics sub-sequence) then advances to LicensingExchange, and
+  validate against BOTH Windows and GRD before enabling the flag. The in-session
+  auto-detect handler already exists (`ironrdp-session` x224 RttResponse).
+- Audio playback itself remains unconfirmable headlessly (no output device to
+  hear); honest status = "gated off by missing flag; real enablement blocked on
+  the connector auto-detect work."
+
+3. dtm-work (standard Windows RDP) baseline: WORKS. NLA/HYBRID_EX via Credential
+Manager, connect + first frame presented 1920x1080, session held. The `-d
+<machine>` "trips IronRDP" claim did NOT reproduce on the fresh binary (`-u david
+-d dtm-work` connected and held) — workaround appears no longer needed.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
