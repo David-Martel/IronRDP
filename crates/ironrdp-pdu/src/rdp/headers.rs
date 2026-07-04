@@ -827,7 +827,8 @@ mod redirection_tests {
     #[test]
     fn decodes_server_redirection_with_load_balance_info() {
         let token = b"tsv://hello-token";
-        let redir_len: u16 = 8 + 4 + 4 + 4 + token.len() as u16; // pad+flags(4) + len(2) + sid(4) + flags(4) + (len(4)+token)
+        let token_len = u16::try_from(token.len()).expect("token fits in u16");
+        let redir_len: u16 = 8 + 4 + 4 + 4 + token_len; // pad+flags(4) + len(2) + sid(4) + flags(4) + (len(4)+token)
         let total_len: u16 = 6 + 2 + 2 + redir_len; // control hdr(6) + pad(2) + flags(2) + rest
 
         let mut buf = Vec::new();
@@ -839,7 +840,7 @@ mod redirection_tests {
         buf.extend_from_slice(&redir_len.to_le_bytes()); // Length
         buf.extend_from_slice(&0u32.to_le_bytes()); // SessionID
         buf.extend_from_slice(&0x0000_0002u32.to_le_bytes()); // RedirFlags = LB_LOAD_BALANCE_INFO
-        buf.extend_from_slice(&(token.len() as u32).to_le_bytes()); // LoadBalanceInfoLength
+        buf.extend_from_slice(&u32::from(token_len).to_le_bytes()); // LoadBalanceInfoLength
         buf.extend_from_slice(token); // LoadBalanceInfo
 
         let header = ShareControlHeader::decode(&mut ReadCursor::new(&buf)).expect("decode redirection");

@@ -57,6 +57,7 @@ use std::collections::BTreeMap;
 
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
+use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::zgfx;
 use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
@@ -393,6 +394,19 @@ pub struct GraphicsPipelineClient {
     current_frame_id: Option<u32>,
     frames_queued: u32,
     total_frames_decoded: u32,
+
+    /// RemoteFX Progressive decoder (EGFX `WireToSurface2` / codec 0x0009).
+    ///
+    /// Maintains per-`codec_context_id` tile state across frames.
+    progressive: ProgressiveDecoder,
+    /// Persistent per-surface RGBA framebuffers for progressive compositing.
+    ///
+    /// Progressive frames update only changed 64x64 tiles, so the client must
+    /// retain the full surface image between frames and blit tiles into it.
+    progressive_framebuffers: BTreeMap<u16, Vec<u8>>,
+    /// One-shot diagnostic: dump the first composited progressive framebuffer
+    /// to the path in `IRONRDP_EGFX_DUMP` (raw RGBA) for visual verification.
+    progressive_dump_done: bool,
 }
 
 impl GraphicsPipelineClient {
@@ -412,6 +426,9 @@ impl GraphicsPipelineClient {
             current_frame_id: None,
             frames_queued: 0,
             total_frames_decoded: 0,
+            progressive: ProgressiveDecoder::new(),
+            progressive_framebuffers: BTreeMap::new(),
+            progressive_dump_done: false,
         }
     }
 
@@ -487,8 +504,7 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::WireToSurface2(pdu) => {
-                trace!("WireToSurface2 (progressive codec)");
-                self.handler.on_wire_to_surface2(&pdu);
+                self.handle_wire_to_surface2(&pdu);
                 Ok(vec![])
             }
             GfxPdu::EndFrame(end) => self.handle_end_frame(end.frame_id),
@@ -567,6 +583,7 @@ impl GraphicsPipelineClient {
                     codec_context_id = pdu.codec_context_id,
                     "DeleteEncodingContext"
                 );
+                self.progressive.delete_context(pdu.codec_context_id);
                 self.handler.on_delete_encoding_context(&pdu);
                 Ok(vec![])
             }
@@ -596,6 +613,11 @@ impl GraphicsPipelineClient {
     fn handle_reset_graphics(&mut self, width: u32, height: u32) {
         // Per spec, ResetGraphics implicitly destroys all surfaces
         self.surfaces.clear();
+
+        // Progressive tile state and per-surface framebuffers are tied to the
+        // surfaces that a ResetGraphics implicitly destroys, so drop them too.
+        self.progressive.reset();
+        self.progressive_framebuffers.clear();
 
         // Reset frame tracking state so subsequent FrameAcknowledge PDUs
         // don't report stale queue depth from a previous stream.
@@ -774,6 +796,112 @@ impl GraphicsPipelineClient {
         self.handler.on_bitmap_updated(&update);
     }
 
+    /// Handle a `WireToSurface2` PDU carrying RemoteFX Progressive bitmap data.
+    ///
+    /// GNOME Remote Desktop (and other RFX-progressive servers) deliver each
+    /// frame as a progressive block stream that updates only the 64x64 tiles
+    /// that changed. We decode those tiles, composite them into a persistent
+    /// per-surface RGBA framebuffer, and deliver the whole framebuffer as one
+    /// [`BitmapUpdate`] so the renderer (which treats an update as a full-frame
+    /// image) shows the accumulated surface.
+    fn handle_wire_to_surface2(&mut self, pdu: &WireToSurface2Pdu) {
+        let Some(surface) = self.surfaces.get(&pdu.surface_id) else {
+            warn!(surface_id = pdu.surface_id, "WireToSurface2 for unknown surface");
+            return;
+        };
+        let width = usize::from(surface.width);
+        let height = usize::from(surface.height);
+        let (surface_width, surface_height) = (surface.width, surface.height);
+
+        // Decode the progressive stream into 64x64 RGBA tiles, then composite
+        // into the persistent framebuffer. Both `progressive` and
+        // `progressive_framebuffers` are distinct fields, so the borrows are
+        // disjoint.
+        let rendered = {
+            let tiles = match self.progressive.decode_bitmap(
+                pdu.codec_context_id,
+                surface_width,
+                surface_height,
+                &pdu.bitmap_data,
+            ) {
+                Ok(tiles) => tiles,
+                Err(e) => {
+                    warn!(surface_id = pdu.surface_id, error = %e, "progressive decode failed");
+                    return;
+                }
+            };
+
+            if tiles.is_empty() {
+                trace!(surface_id = pdu.surface_id, "progressive frame produced no tiles");
+                return;
+            }
+
+            let fb = self
+                .progressive_framebuffers
+                .entry(pdu.surface_id)
+                .or_insert_with(|| {
+                    let mut v = vec![0u8; width.saturating_mul(height).saturating_mul(4)];
+                    // Initialize to opaque black.
+                    for px in v.chunks_exact_mut(4) {
+                        px[3] = 0xFF;
+                    }
+                    v
+                });
+
+            let tile_count = tiles.len();
+            for tile in &tiles {
+                blit_tile(
+                    &tile.pixels,
+                    fb,
+                    width,
+                    height,
+                    usize::from(tile.x_idx) * 64,
+                    usize::from(tile.y_idx) * 64,
+                );
+            }
+            trace!(surface_id = pdu.surface_id, tile_count, "progressive tiles composited");
+            true
+        };
+
+        if !rendered {
+            return;
+        }
+
+        // Clone the composited framebuffer for delivery (Image path is full-frame).
+        let data = self.progressive_framebuffers[&pdu.surface_id].clone();
+
+        // One-shot diagnostic dump for visual verification of the decode.
+        if !self.progressive_dump_done
+            && let Some(path) = std::env::var_os("IRONRDP_EGFX_DUMP")
+        {
+            if std::fs::write(&path, &data).is_ok() {
+                let mut dims = std::path::PathBuf::from(&path);
+                dims.set_extension("dims");
+                let _ = std::fs::write(dims, format!("{width}x{height}"));
+                debug!(width, height, "dumped progressive framebuffer for verification");
+            }
+            self.progressive_dump_done = true;
+        }
+
+        let update = BitmapUpdate {
+            surface_id: pdu.surface_id,
+            destination_rectangle: InclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: surface_width.saturating_sub(1),
+                bottom: surface_height.saturating_sub(1),
+            },
+            // Placeholder: BitmapUpdate.codec_id is a Codec1Type; the renderer
+            // ignores it and always treats `data` as RGBA8888.
+            codec_id: Codec1Type::Uncompressed,
+            data,
+            width: surface_width,
+            height: surface_height,
+        };
+
+        self.handler.on_bitmap_updated(&update);
+    }
+
     #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
     fn handle_end_frame(&mut self, frame_id: u32) -> PduResult<Vec<DvcMessage>> {
         self.total_frames_decoded = self.total_frames_decoded.wrapping_add(1);
@@ -940,6 +1068,32 @@ fn crop_decoded_frame(
     }
 
     cropped
+}
+
+/// Blit a decoded 64x64 RGBA tile into a surface framebuffer at pixel
+/// origin `(dst_x, dst_y)`, clipping to the framebuffer bounds.
+///
+/// `tile` is 64*64*4 bytes (RGBA, row-major); `fb` is `fb_w * fb_h * 4` bytes.
+/// Tiles on the right/bottom edge of a surface whose dimensions are not a
+/// multiple of 64 are clipped rather than overrunning the framebuffer.
+fn blit_tile(tile: &[u8], fb: &mut [u8], fb_w: usize, fb_h: usize, dst_x: usize, dst_y: usize) {
+    const TILE: usize = 64;
+    if dst_x >= fb_w || dst_y >= fb_h {
+        return;
+    }
+    let cols = TILE.min(fb_w - dst_x);
+    for row in 0..TILE {
+        let y = dst_y + row;
+        if y >= fb_h {
+            break;
+        }
+        let src_start = row * TILE * 4;
+        let dst_start = (y * fb_w + dst_x) * 4;
+        let (src_end, dst_end) = (src_start + cols * 4, dst_start + cols * 4);
+        if src_end <= tile.len() && dst_end <= fb.len() {
+            fb[dst_start..dst_end].copy_from_slice(&tile[src_start..src_end]);
+        }
+    }
 }
 
 /// Unit tests that require access to private fields (state, surfaces, frame tracking).

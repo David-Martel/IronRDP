@@ -564,22 +564,42 @@ start / stops sending redirections until `systemctl [--user] restart
 gnome-remote-desktop.service`). This is an asuspro13 environment issue, not a
 client bug.
 
-REMAINING GAP TO VISIBLE PIXELS (the only thing left): GRD sends graphics via
-the RemoteFX **Progressive** codec inside RDPGFX_WIRE_TO_SURFACE_PDU_2, and
-`ironrdp_egfx::client::GraphicsPipelineClient::on_wire_to_surface2` is a no-op,
-so decoded pixels never reach the framebuffer (`on_bitmap_updated` never
-fires; 0 images presented). To finish rendering:
-- Implement RemoteFX Progressive decode for WireToSurface2 and call
-  `handler.on_bitmap_updated(...)` with the RGBA result.
-- Reuse existing primitives: `ironrdp_graphics::rlgr::decode`,
-  `dwt`, `quantization`, `subband_reconstruction`, `color_conversion`, and
-  adapt the legacy RemoteFX tile decoder in `ironrdp-session/src/rfx.rs`.
-  Start with PROGRESSIVE_BLOCK TILE_SIMPLE (RLGR); TILE_FIRST/TILE_UPGRADE
-  (SRL progressive refinement) can follow.
-- (Separate, smaller) AVC444 dual-stream decode for WireToSurface1 so the
-  V10.7 cap can be re-enabled against Windows hosts.
-Upstream EGFX caps-tolerance (#1298/#1305) and frame-decode (#1341/#1395)
-fixes are only relevant to the H.264 path, not the progressive path GRD uses.
+VISIBLE PIXELS — DONE (2026-07-04). GRD sends graphics via the RemoteFX
+**Progressive** codec inside RDPGFX_WIRE_TO_SURFACE_PDU_2. `WireToSurface2` is
+now decoded and composited, and a full 1920x1080 desktop renders from live
+GRD 46.3 (100.64.0.3).
+
+PORTED (not reimplemented) from upstream — the fork was 139 commits behind and
+upstream already had this exact capability. Straight file adds + module
+registration (the fork reworked egfx/rfx, so a whole-commit cherry-pick would
+conflict on server.rs, which is server-side and not needed for client decode):
+- `crates/ironrdp-pdu/src/codecs/rfx/progressive.rs` — progressive block-stream
+  parser (SYNC/CONTEXT/FRAME/REGION/TILE_SIMPLE|FIRST|UPGRADE). From #1196
+  (49099f0c), final form from #1197 (a142799d). Registered `pub mod progressive`.
+- `crates/ironrdp-graphics/src/{dwt_extrapolate,srl}.rs` — reduce-extrapolate DWT
+  + SRL primitives for progressive refinement. From #1196.
+- `crates/ironrdp-graphics/src/progressive.rs` — `ProgressiveDecoder` with
+  per-`codec_context_id` tile state; SIMPLE full-quality **and** FIRST/UPGRADE
+  refinement. From #1197. Adapted `alloc::collections` -> `std::collections`
+  (fork's ironrdp-graphics is std, not no_std+alloc like upstream).
+- Applied the #1395 (368fe8e6) fix: GNOME Remote Desktop omits the CONTEXT
+  block on every frame after the first; cache `use_reduce_extrapolate` per
+  context so later frames don't fail with `MissingBlock("CONTEXT")` (this fix
+  is load-bearing — without it only the coarse first frame renders).
+- Wired into `GraphicsPipelineClient::handle_wire_to_surface2`: decode tiles ->
+  blit into a persistent per-surface RGBA framebuffer -> deliver the full
+  framebuffer via `on_bitmap_updated` (renderer Image path is full-frame).
+  Progressive state reset on ResetGraphics; context freed on
+  DeleteEncodingContext. Skipped the upstream server.rs encode changes.
+Evidence: first frame composited **510 tiles** (full 1920x1080), dumped and
+visually verified as the Ubuntu GDM login screen (clock, user field, Ubuntu
+logo; all RGB channels correct). Subsequent 1-tile incremental frames decoded
+with no CONTEXT block and no errors; session stayed up. Diagnostic dump gated
+behind `IRONRDP_EGFX_DUMP=<path>` (writes raw RGBA + a `.dims` sidecar).
+Remaining refinement:
+- AVC444 dual-stream decode for WireToSurface1 (re-enable V10.7 vs Windows).
+- FIRST/UPGRADE tiles are ported and available but not yet exercised against a
+  server that sends them (GRD used SIMPLE only in these runs).
 
 4. ~~Enable H.264 decode in the native client EGFX pipeline.~~ Done.
 `EgfxRenderHandler` replaces `LoggingEgfxHandler`, `openh264` feature gates decoder.

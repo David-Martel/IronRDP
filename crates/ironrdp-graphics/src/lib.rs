@@ -5,6 +5,9 @@
 pub mod color_conversion;
 pub mod diff;
 pub mod dwt;
+pub mod dwt_extrapolate;
+pub mod progressive;
+pub mod srl;
 pub mod image_processing;
 pub mod pointer;
 pub mod quantization;
