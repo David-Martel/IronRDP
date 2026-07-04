@@ -700,17 +700,16 @@ impl RdpServer {
             // Validate credentials for TLS-mode connections on the initial handshake.
             // Deactivation-reactivation cycles re-use an already-authenticated session
             // and are not subject to re-validation.
-            if !result.reactivation {
-                if let Some(validator) = self.credential_validator.as_deref() {
-                    if let Some(creds) = result.credentials.as_ref() {
-                        let accepted = validator
-                            .validate(creds)
-                            .context("credential validator returned an error")?;
-                        if !accepted {
-                            warn!("credential validation rejected the connection");
-                            return Err(anyhow!("credential validation failed"));
-                        }
-                    }
+            if !result.reactivation
+                && let Some(validator) = self.credential_validator.as_deref()
+                && let Some(creds) = result.credentials.as_ref()
+            {
+                let accepted = validator
+                    .validate(creds)
+                    .context("credential validator returned an error")?;
+                if !accepted {
+                    warn!("credential validation rejected the connection");
+                    return Err(anyhow!("credential validation failed"));
                 }
             }
 
