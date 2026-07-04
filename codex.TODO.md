@@ -514,6 +514,35 @@ Effort: small (once unblocked).
 
 ### Track B: Graphics acceleration pipeline
 
+0. gnome-remote-desktop 46 session-handover redirection (PRIMARY BLOCKER to
+pixels against GRD; supersedes the earlier "EGFX version=0" framing, which was
+a benign warning — GRD/FreeRDP advertises General capset protocolVersion=0).
+Status: partially done (commit "feat(session): handle RDP Server Redirection
+PDU (GRD 46 handover)").
+What was found: GRD 46's *system* daemon authenticates the initial connection
+(NLA/CredSSP, damartel PAM password, from Windows Credential Manager
+`TERMSRV/100.64.0.3`), reaches finalization, then sends a Standard RDP Server
+Redirection PDU (`PDUTYPE_SERVER_REDIR_PKT`=0xA, [MS-RDPBCGR] 2.2.13.1.1) to
+hand the client over to the spawned user session. Journal: `[RDP] Sending
+server redirection` / `[DaemonSystem] ... handover`. GRD's RedirFlags =
+`0x0001C016` = LB_LOAD_BALANCE_INFO | LB_USERNAME | LB_PASSWORD |
+LB_PASSWORD_IS_PK_ENCRYPTED | LB_REDIRECTION_GUID | LB_TARGET_CERTIFICATE, with
+NO target net address (reconnect to same host:port). The routing token
+(LoadBalanceInfo) is 25 bytes.
+Done: parse the redirection PDU, thread it up (ProcessorOutput/ActiveStageOutput
+::Redirect), and reconnect carrying the LoadBalanceInfo verbatim as an X.224
+routing token (NegoRequestData::Raw). The reconnect's negotiation IS accepted
+by GRD (HYBRID confirmed, TLS upgrades).
+Remaining blocker (bounded): the handover connection's CredSSP is rejected
+(`InvalidToken`, nstatus 0xc00700ea) because GRD expects the redirection
+password cookie (LB_PASSWORD, PK-encrypted with LB_TARGET_CERTIFICATE), not the
+reused damartel credentials. To finish: parse LB_USERNAME/LB_PASSWORD/
+LB_TARGET_CERTIFICATE, and drive CredSSP with the redirection cookie (the
+PASSWORD_IS_PK_ENCRYPTED path — encrypt/pass the cookie per the target cert).
+This is the multi-day sspi-integration piece. Only after this completes will
+EGFX/bitmap graphics start, at which point the upstream EGFX caps-tolerance
+fixes (#1298/#1305) and frame-decode fixes (#1341/#1395) become relevant.
+
 4. ~~Enable H.264 decode in the native client EGFX pipeline.~~ Done.
 `EgfxRenderHandler` replaces `LoggingEgfxHandler`, `openh264` feature gates decoder.
 
