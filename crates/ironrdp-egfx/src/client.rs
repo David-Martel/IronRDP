@@ -454,6 +454,7 @@ impl GraphicsPipelineClient {
     // ========================================================================
 
     fn handle_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
+        trace!(pdu = ironrdp_core::name(&pdu), "EGFX PDU received");
         match pdu {
             GfxPdu::CapabilitiesConfirm(confirm) => {
                 self.handle_capabilities_confirm(confirm.0);

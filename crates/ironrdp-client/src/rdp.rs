@@ -64,6 +64,26 @@ impl EgfxRenderHandler {
 
 #[cfg(feature = "egfx")]
 impl ironrdp_egfx::client::GraphicsPipelineHandler for EgfxRenderHandler {
+    fn capabilities(&self) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
+        use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet};
+
+        // Cap the advertised EGFX capability at V8.1 / AVC420. The default
+        // advertisement includes V10.7, which lets servers (Windows and
+        // gnome-remote-desktop alike) select AVC444 dual-stream H.264 — a format
+        // the client's decode path does not yet reconstruct, so those frames are
+        // dropped and nothing is presented. Advertising AVC420 as the highest
+        // capability makes the server send single-stream AVC420, which decodes via
+        // OpenH264 and reaches the framebuffer. V8 (no AVC) is kept as a fallback.
+        vec![
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            },
+        ]
+    }
+
     fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
         debug!(?caps, "EGFX capabilities confirmed");
     }
