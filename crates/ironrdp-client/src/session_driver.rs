@@ -65,6 +65,17 @@ enum SessionDriverFlow {
     ReconnectWithNewSize { width: u16, height: u16 },
 }
 
+/// Renders bytes as a bounded hex string for diagnostic logging (never used for
+/// secret material — only routing tokens / usernames).
+fn hex_preview(bytes: &[u8]) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes.iter().take(64) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Result of handling a single (or batch of) [`ActiveStageOutput`], signalling
 /// whether the active session should continue, terminate, or reconnect.
 enum StageFlow {
@@ -373,15 +384,21 @@ impl SessionDriver {
                 // GRD's handover instance authenticates the redirected connection
                 // against a winpr NTLM SAM populated with the redirection
                 // credentials, so reuse them rather than the original login.
+                //
+                // GRD sets LB_PASSWORD_IS_PK_ENCRYPTED but does NOT actually encrypt
+                // the password: it sends the plaintext UTF-16LE password and stores
+                // NTOWFv1(password) in the SAM (see gnome-remote-desktop
+                // grd-session-rdp.c `grd_session_rdp_send_server_redirection` and
+                // grd-rdp-sam.c `create_sam_string`). So decode LB_PASSWORD as
+                // UTF-16LE and use it directly, regardless of the PK flag.
                 let pk_encrypted = redirection.is_password_pk_encrypted();
-                let password = if pk_encrypted {
-                    None
-                } else {
-                    redirection.password_string()
-                };
-                if pk_encrypted {
-                    warn!("Redirection password is public-key encrypted; cannot reuse it as an NLA credential");
-                }
+                let password = redirection.password_string().filter(|s| !s.is_empty());
+                debug!(
+                    load_balance_info_hex = ?routing_token.as_deref().map(hex_preview),
+                    username_hex = ?redirection.username.as_deref().map(hex_preview),
+                    password_len = redirection.password.as_ref().map_or(0, Vec::len),
+                    "Server Redirection raw fields"
+                );
                 info!(
                     has_routing_token = routing_token.is_some(),
                     routing_token_len = routing_token.as_ref().map_or(0, Vec::len),
