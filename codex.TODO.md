@@ -542,24 +542,44 @@ database` when the original `damartel` username was sent. The redirection
 LB_USERNAME is a random per-handover cookie (e.g. "`@%PG..."), and LB_PASSWORD
 has PASSWORD_IS_PK_ENCRYPTED set.
 
-Remaining blocker (bounded, two parts):
-1. LB_PASSWORD is public-key encrypted with LB_TARGET_CERTIFICATE, so it cannot
-   be reused as a plaintext NTLMv2 credential. Completing the handover requires
-   the RDP "redirection with PK-encrypted password" CredSSP path (FreeRDP's
-   RedirectionPassword + RedirectionPasswordIsPkEncrypted), which IronRDP's
-   sspi/CredSSP stack does not support. Multi-day sspi-integration piece.
-2. Suspected confound: the client's DisplayControl-triggered resize-reconnect
-   fires during phase 1, and each connection to the system daemon spawns a fresh
-   handover instance with its own SAM, so the routing token may not land on the
-   instance that minted the cookie ("RDP client disconnected during the
-   handover" in the system-daemon journal). Investigate suppressing the early
-   resize-reconnect during/around handover. Also verify LB_USERNAME byte-exact
-   handling (current UTF-16LE lossy decode + NUL-trim may not match GRD's SAM
-   entry exactly).
+HANDOVER NOW COMPLETES (resolved). The earlier "PK-encrypted password"
+theory was WRONG — confirmed by reading the GRD 46.3 source:
+- grd-session-rdp.c `grd_session_rdp_send_server_redirection` sets
+  LB_PASSWORD_IS_PK_ENCRYPTED but sends the password as *plaintext UTF-16LE*
+  (`get_utf16_string(password)`); it never encrypts. The flag is cosmetic.
+- grd-rdp-sam.c `create_sam_string` stores NTOWFv1(password) for `username`
+  in the handover instance's winpr NTLM SAM.
+So the client must reconnect with username=LB_USERNAME and password=LB_PASSWORD
+decoded as UTF-16LE (regardless of the PK flag), plus the LoadBalanceInfo as an
+X.224 routing token. The routing token is literally `Cookie: msts=<n>\r\n`
+(CRLF-terminated; GRD peeks for 0x0D0A in grd-rdp-routing-token.c), sent
+verbatim via NegoRequestData::Raw.
+Verified end-to-end against GRD 46.3 on asuspro13: no more "Could not find
+user in SAM"; the handover connection authenticates, and the EGFX pipeline
+establishes — caps confirmed (AVC420), surface created 1920x1080 + mapped,
+StartFrame/EndFrame frames flowing. Reproduced across multiple runs.
+NOTE: GRD's handover subsystem is flaky server-side (ZINK/EGL "failed to
+choose pdev" on the headless GNOME; the handover instance sometimes fails to
+start / stops sending redirections until `systemctl [--user] restart
+gnome-remote-desktop.service`). This is an asuspro13 environment issue, not a
+client bug.
 
-Only after handover NLA completes will EGFX/bitmap graphics start, at which
-point the upstream EGFX caps-tolerance fixes (#1298/#1305) and frame-decode
-fixes (#1341/#1395) become relevant.
+REMAINING GAP TO VISIBLE PIXELS (the only thing left): GRD sends graphics via
+the RemoteFX **Progressive** codec inside RDPGFX_WIRE_TO_SURFACE_PDU_2, and
+`ironrdp_egfx::client::GraphicsPipelineClient::on_wire_to_surface2` is a no-op,
+so decoded pixels never reach the framebuffer (`on_bitmap_updated` never
+fires; 0 images presented). To finish rendering:
+- Implement RemoteFX Progressive decode for WireToSurface2 and call
+  `handler.on_bitmap_updated(...)` with the RGBA result.
+- Reuse existing primitives: `ironrdp_graphics::rlgr::decode`,
+  `dwt`, `quantization`, `subband_reconstruction`, `color_conversion`, and
+  adapt the legacy RemoteFX tile decoder in `ironrdp-session/src/rfx.rs`.
+  Start with PROGRESSIVE_BLOCK TILE_SIMPLE (RLGR); TILE_FIRST/TILE_UPGRADE
+  (SRL progressive refinement) can follow.
+- (Separate, smaller) AVC444 dual-stream decode for WireToSurface1 so the
+  V10.7 cap can be re-enabled against Windows hosts.
+Upstream EGFX caps-tolerance (#1298/#1305) and frame-decode (#1341/#1395)
+fixes are only relevant to the H.264 path, not the progressive path GRD uses.
 
 4. ~~Enable H.264 decode in the native client EGFX pipeline.~~ Done.
 `EgfxRenderHandler` replaces `LoggingEgfxHandler`, `openh264` feature gates decoder.
