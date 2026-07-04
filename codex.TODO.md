@@ -286,6 +286,48 @@ Status: done.
 Refs: `crates/ironrdp-gateway/`.
 Status: done (scaffold only — no listener, RADIUS, or TLS implementation yet).
 
+46. Piecemeal upstream import pass (Devolutions/IronRDP master, fork was 139
+behind). Cherry-picked with `-x` where clean, file-level-adapted where the fork
+had reworked the area. All ported into `feat/gfx-early-capability-flag`. Full
+`cargo test --workspace` passes; `cargo build --release -p ironrdp-client`
+passes; none of the changed files produce any clippy finding (the fork's
+workspace `-D warnings` gate is pre-existingly red on unrelated crates —
+`ironrdp-client`, `ironrdp-gateway`, `ironrdp-rdpeusb`, `ffi`,
+`ironrdp-session/active_stage.rs`, `ironrdp-testsuite-extra` — base commit
+5b849c64 also fails clippy, independent of this work).
+Panic / correctness fixes:
+- #1293 (0dd7c94b) xcrush off-by-one forward-match panic — clean cherry-pick.
+- #1392 (d6990d81) propagate `#[track_caller]` through error constructors — clean.
+- #1256 (905a1486) rdpsnd Opus PCM alignment panic — adapted (fork reworked cpal;
+  kept the fork's decode-error counter + silent-teardown, adopted `Vec<i16>` alloc).
+- #1276 (6e847976) rdpsnd keep-newest-waves on overflow — adapted (fork moved the
+  dispatch into `session_driver.rs`; ported the drop-oldest semantics there).
+Connector / protocol correctness:
+- #1371 (a4fde9fc) stay in CapabilitiesExchange on activation DeactivateAll — core
+  cherry-pick; fork-deleted test module dropped.
+- #1254 (9cb5439b) skip ServerDeactivateAll during CapabilitiesExchange — the inner
+  half of the same fix, which the fork lacked; directly serves the GRD 46 handover
+  (GRD sends ServerDeactivateAll before DemandActive). Core ported; test dropped.
+- #1382 (3f96d002) set COMPRESSION_USED on FastPath update header — clean.
+- #1313 (a71567e3) cover BitmapCacheV3 in CapabilitySet encoder (fixes a reachable
+  `unreachable!()` panic) — core + testsuite-core test; fork's richer fuzz oracle kept.
+Graphics robustness:
+- #1298 (67f3c635) tolerate unknown EGFX capability versions — adapted (fork's
+  `try_from` only mapped one sentinel; broadened to any unrecognized version →
+  `CapabilitySet::Unknown`).
+- #1341 (ef20ea4e) decode RGBA QOI bitmaps instead of dropping the frame — clean.
+- #1344 (4e11a176) bound ZGFX compressor hash table — clean.
+Also: collapsed a pre-existing `collapsible_if` in the server credential-validator
+path (touched while porting #1276) into a let-chain.
+Deferred (too entangled with the fork's egfx/rfx/rdpeusb/dvc rework, or tracked
+separately):
+- #1305 (91ea46bd) RawCapabilitySet vs typed CapabilitySet split — 392-line breaking
+  rework of the fork's most-diverged file; its client benefit (tolerate unknown caps)
+  is already delivered by the #1298 adaptation.
+- Tier-4 features: clipboard file-copy (#1388/#1375/#1372, tracked as Track C item 9),
+  DVC accessors (#1368/#1358, breaking dvc changes), agent resize (#1401, ironrdp-agent
+  crate not present in fork).
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
