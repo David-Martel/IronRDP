@@ -1,3 +1,4 @@
+mod connection_activation;
 mod rfx;
 
 #[cfg(test)]
