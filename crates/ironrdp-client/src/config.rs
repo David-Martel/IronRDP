@@ -608,6 +608,33 @@ impl Config {
             }
         };
 
+        // Only enable EGFX when it is both requested (`--egfx`) and compiled in.
+        // Advertising Graphics Pipeline support without the `egfx` feature is a
+        // footgun: the server (e.g. gnome-remote-desktop 46) then opens the
+        // `Microsoft::Windows::RDS::Graphics` DVC, but the client has no listener
+        // registered for it and answers the Create Request with NO_LISTENER
+        // (0xC0000001). GRD's handover instance treats that as fatal and tears the
+        // session down (surfacing as ERRINFO_BAD_CAPABILITIES), so a build without
+        // the feature would dead-end the handover instead of falling back to the
+        // classic bitmap path.
+        let egfx_enabled = {
+            #[cfg(feature = "egfx")]
+            {
+                args.egfx
+            }
+            #[cfg(not(feature = "egfx"))]
+            {
+                if args.egfx {
+                    tracing::warn!(
+                        "--egfx was requested but this binary was built without the `egfx` \
+                         feature; ignoring it and not advertising Graphics Pipeline support. \
+                         Rebuild with `--features openh264` (or `egfx`) to enable EGFX."
+                    );
+                }
+                false
+            }
+        };
+
         let connector = connector::Config {
             credentials: Credentials::UsernamePassword { username, password },
             domain: args.domain,
@@ -624,7 +651,7 @@ impl Config {
             bitmap: Some(bitmap),
             // Advertise Graphics Pipeline support when EGFX is requested, so EGFX-only
             // servers (e.g. gnome-remote-desktop 46+) accept the connection.
-            enable_graphics_pipeline: args.egfx,
+            enable_graphics_pipeline: egfx_enabled,
             client_build: semver::Version::parse(crate::version::VERSION)
                 .map_or(0, |v| v.major * 100 + v.minor * 10 + v.patch)
                 .pipe(u32::try_from)
@@ -671,7 +698,7 @@ impl Config {
             dvc_pipe_proxies: args.dvc_proxy,
             #[cfg(windows)]
             dvc_plugins: args.dvc_plugin,
-            egfx: args.egfx,
+            egfx: egfx_enabled,
         })
     }
 }
