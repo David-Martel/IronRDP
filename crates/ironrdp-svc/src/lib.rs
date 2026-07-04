@@ -7,7 +7,9 @@
 extern crate alloc;
 
 use alloc::borrow::Cow;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::any::TypeId;
 use core::fmt;
 use core::marker::PhantomData;
