@@ -697,6 +697,14 @@ fn create_gcc_blocks<'a>(
                         early_capability_flags |= ClientEarlyCapabilityFlags::WANT_32_BPP_SESSION;
                     }
 
+                    // Advertise Graphics Pipeline (MS-RDPEGFX) support so EGFX-only servers
+                    // such as gnome-remote-desktop 46+ do not reject the connection at the
+                    // Demand Active phase ("Client did not advertise support for the Graphics
+                    // Pipeline"). See `Config::enable_graphics_pipeline`.
+                    if config.enable_graphics_pipeline {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+                    }
+
                     Some(early_capability_flags)
                 },
                 dig_product_id: Some(config.dig_product_id.clone()),

@@ -207,6 +207,19 @@ pub struct Config {
     pub keyboard_layout: u32,
     pub ime_file_name: String,
     pub bitmap: Option<BitmapConfig>,
+    /// Advertise support for the Graphics Pipeline Extension (MS-RDPEGFX).
+    ///
+    /// When `true`, the `RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL` (0x0100) flag is set in the
+    /// [`earlyCapabilityFlags`](gcc::ClientEarlyCapabilityFlags) of the Client Core Data
+    /// (`TS_UD_CS_CORE`). Some servers — notably gnome-remote-desktop (GRD) 46+, which is
+    /// EGFX-only and does not fall back to legacy bitmap updates — reject the connection at
+    /// the Demand Active / capabilities-exchange phase unless this flag is advertised.
+    ///
+    /// This should only be enabled when the client is actually prepared to service the
+    /// RDPEGFX dynamic virtual channel (i.e. built with the `egfx` feature and run with the
+    /// corresponding option); otherwise such servers may send EGFX traffic the client cannot
+    /// render, resulting in a blank session.
+    pub enable_graphics_pipeline: bool,
     pub dig_product_id: String,
     pub client_dir: String,
     /// Alternate shell to execute on the remote server (e.g., specific application instead of desktop)

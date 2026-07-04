@@ -622,6 +622,9 @@ impl Config {
             desktop_size,
             desktop_scale_factor: 0, // Default to 0 per FreeRDP
             bitmap: Some(bitmap),
+            // Advertise Graphics Pipeline support when EGFX is requested, so EGFX-only
+            // servers (e.g. gnome-remote-desktop 46+) accept the connection.
+            enable_graphics_pipeline: args.egfx,
             client_build: semver::Version::parse(crate::version::VERSION)
                 .map_or(0, |v| v.major * 100 + v.minor * 10 + v.patch)
                 .pipe(u32::try_from)
