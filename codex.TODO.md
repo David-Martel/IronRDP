@@ -463,9 +463,11 @@ dtm-work classic RDP and asuspro13 GRD AVC420 render):
     * `ironrdp-client`: `--avc444` CLI flag + `Config::avc444`; when set,
       `EgfxRenderHandler::capabilities` prepends V10.7 and a dedicated OpenH264
       chroma decoder is attached. Default is unchanged (V8.1/AVC420 only).
-  Validation: 10 unit tests assert reconstruction placement against the spec
-  geometry directly (not via a round-trip that a mis-transcribed split could
-  mask) + RGBA conversion + panic-free on truncated aux. v2 (`Avc444v2`) is
+  Validation: 15 unit tests — 10 assert reconstruction placement against the
+  spec geometry directly (not via a round-trip that a mis-transcribed split
+  could mask) + RGBA conversion + panic-free on truncated aux; 5 cover the
+  `Avc444BitmapStream` parse (LC round-trips for LUMA_AND_CHROMA / LUMA / CHROMA
+  and rejection of reserved-encoding and zero-length-LUMA_AND_CHROMA inputs). v2 (`Avc444v2`) is
   implemented to spec geometry but has NO round-trip/peer validation (FreeRDP
   ships no v2 split reference). Live-validate by flipping `--avc444` against a
   Windows RDS host (more reliable AVC444 peer than GRD) and visually confirming.
