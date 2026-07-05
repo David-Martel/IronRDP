@@ -334,6 +334,74 @@ separately):
   DVC accessors (#1368/#1358, breaking dvc changes), agent resize (#1401, ironrdp-agent
   crate not present in fork).
 
+## GRD render RESOLVED — root cause was a build-feature footgun, NOT a capability rejection (2026-07-04, later pass)
+
+**The "ERRINFO_BAD_CAPABILITIES / Confirm Active capability rejection" framing was
+a red herring.** There is no rejected capability. The handover failed because the
+test binaries were built WITHOUT the `egfx` feature.
+
+Root cause (proven with `ironrdp_dvc=trace`, live GRD 46.3 handover):
+- `cargo build --release -p ironrdp-client` does NOT enable `egfx` (client
+  `default = ["rustls"]`; `egfx = ["ironrdp-egfx"]`, `openh264 = ["egfx", ...]`).
+  The prebuilt "stable reference" and a plain release build are byte-identical
+  (10,224,640 bytes) — both featureless.
+- A featureless build still accepted `--egfx` and set the connector's
+  `enable_graphics_pipeline`, so the client advertised
+  `Microsoft::Windows::RDS::Graphics`. GRD's handover instance opened the RDPGFX
+  DVC; the client had NO registered listener (feature compiled out) and answered
+  the Create Request with `CreationStatus(0xC0000001)` = NO_LISTENER. GRD logged
+  `[RDP.RDPGFX] Failed to open channel (CreationStatus -1073741823). Terminating
+  session` and set ERRINFO_BAD_CAPABILITIES during teardown — which the client
+  saw as `read deactivation-reactivation sequence step / disconnect provider
+  ultimatum: UserRequested`. So the "cap rejection" was DVC teardown fallout.
+- The DVC trace shows it plainly: on the handover reconnect, `Graphics` →
+  `CreationStatus(3221225473)` (NO_LISTENER); `DisplayControl` →
+  `CreationStatus(0)` (OK). DisplayControl is registered unconditionally; EGFX is
+  gated behind `#[cfg(feature = "egfx")]`.
+
+Fix (committed):
+1. `fix(client): do not advertise Graphics Pipeline without the egfx feature`
+   (config.rs) — `enable_graphics_pipeline` / client `egfx` now derive from an
+   `egfx_enabled` value that is true only when EGFX is requested AND compiled in;
+   a featureless build warns and falls back to the classic bitmap path instead of
+   dead-ending the handover.
+
+RENDER VERIFIED (built with `--features openh264`): connecting
+`100.64.0.3:3389 -u damartel --egfx` completes the GRD 46.3 handover and renders
+a full 1920x1080 desktop on the first try. `IRONRDP_EGFX_DUMP` produced an
+8,294,400-byte (1920x1080x4) frame; converted to PNG and visually confirmed as
+the Ubuntu GDM greeter (clock "Jul 4 19:49", "David Martel" login field, "Not
+listed?", Ubuntu logo with correct orange/red RGB, top-right status icons). Note:
+this is the GDM greeter, not a post-login desktop, but it fully exercises the
+EGFX handover + progressive-decode pipeline. Server render node is healthy after
+the gdm→render/video group fix (no more ZINK "failed to choose pdev").
+
+dtm-work regression: PASS — classic Windows RDP path unaffected, first frame
+presented 1920x1080 (`-u david` and `-u davidmartel07@gmail.com` both connect).
+
+OPEN DECISION for the coordinator: should `egfx` (or `openh264`) become a DEFAULT
+client feature so `cargo build --release -p ironrdp-client` renders GRD
+out-of-the-box? Tradeoffs: `openh264` default pulls in Cisco's bundled OpenH264
+(binary-license + build-weight decision) and ripples into `build.ps1`,
+`windows-release.yml`, and the portable-vs-host artifact contract. `egfx`-only
+(no H.264) likely renders GRD via progressive RFX but is UNVERIFIED without
+openh264. Left as a packaging decision, out of scope for the code fix.
+
+Two remaining EGFX-quality follow-ups, now LIVE-VALIDATABLE (render works again):
+- AVC444 dual-stream decode (Track B refinement / prior gap 3): currently the
+  `Avc444|Avc444v2` arm in `egfx/client.rs` forwards to `on_unhandled_pdu`. The
+  client caps this at V8.1/AVC420 so servers avoid AVC444; implementing dual-stream
+  re-enables V10.7 quality vs Windows.
+- EGFX bounding-box (dirty-rect) delivery: `handle_wire_to_surface2` still clones
+  the full per-surface framebuffer once per frame. A `perf(egfx)` commit already
+  removed the redundant SECOND clone (handler now moves the buffer). True
+  bbox-only delivery (composite changed tiles into an app-recycled buffer, like
+  the classic `session_driver` dirty_region + copy_rgba_frame path) is deferred:
+  it needs the RecycleFrameBuffer channel wired to the EGFX handler, and its
+  acceptance gate ("no visual corruption") is only performable now that GRD
+  renders. Do NOT move the accumulator to app.rs — `progressive_framebuffers` has
+  correct reset/delete lifecycle in egfx that app.rs cannot see.
+
 ## Live smoke-test findings (2026-07-04, Windows -> asuspro13 GRD 46.3 + dtm-work)
 
 Evidence-based QA pass against both live targets with a fresh `-p ironrdp-client`
