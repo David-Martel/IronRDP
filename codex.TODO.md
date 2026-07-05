@@ -520,24 +520,52 @@ flag, which the connector does not advertise (`connection.rs`
     that line is GONE from the GRD journal — the connect-time handshake flips GRD's
     server-side gate and it no longer disables audio output redirection. This is the
     exact behaviour gap 4 targeted; the negotiation half is done and verified.
-  - REMAINING BLOCKER (flag NOT flipped to default; needs `ironrdp-session` work):
-    with the flag on, GRD's session fails LATER with
-    `[X224] unexpected channel received: ID 0`. The connection fully establishes
-    (io_channel_id=1003, user_channel_id=1008, 1920x1080), then an active-session
-    SendDataIndication routes to MCS channel_id 0. Captured PDU (ironrdp_session=debug):
-    `x224 process: routing SendDataIndication channel_id=0 io_channel_id=1003
-    user_data_len=10 head=[0, 16, 0, 0, 6, 0, 11, 0, 1, 0]`. channel_id 0 is not the
-    I/O channel and not a registered static channel, so `x224/mod.rs` rejects it. This
-    is surfaced ONLY when auto-detect is negotiated (a post-connect PDU the `x224`
-    router does not expect on channel 0 — possibly an MCS PDU mis-decoded as
-    SendDataIndication, or a server PDU addressed to channel 0). It is beyond the
-    connector auto-detect handler and NOT attempted here (risks the dtm-work baseline).
-    Next step: decode those 10 head bytes as a Share Control Header / MCS PDU and
-    route or tolerate channel 0 in `crates/ironrdp-session/src/x224/mod.rs`.
-  - NET: negotiation + server-side audio-enable are DONE and safe (flag off by
-    default, dtm-work byte-identical). Audible playback is unverifiable headlessly
-    (no output device). Do NOT make `network_autodetect` default until the channel-0
-    issue is resolved and a full GRD session survives with the flag on.
+  - CHANNEL-0 PDU DECODED + ROUTED (gap 3, RESOLVED 2026-07-04): the 10 head bytes
+    `[0, 16, 0, 0, 6, 0, 11, 0, 1, 0]` are NOT a Share Control / MCS PDU. bytes[0..2]
+    = `0x1000` LE = the `flags` field of a `BasicSecurityHeader` = `AUTODETECT_REQ`
+    (RSP is `0x2000`); the remaining `[06 00 0B 00 01 00]` is the auto-detect request
+    header (headerLength=6, seq=0x000B, RTT request). So GRD sends *continuous
+    (in-session)* network auto-detect requests on the MCS **message channel** (which
+    the IronRDP client never joins — GCC `message_channel: None`), so they surface in
+    `x224/mod.rs` on an unrecognized channel decoded as `0`, framed with a
+    `BasicSecurityHeader` (NOT a Share Data PDU, so the existing in-session
+    `ShareDataPdu::AutoDetectReq` handler never sees them).
+    Fix (committed): `x224::Processor::process` now routes unrecognized channels to
+    `process_unrouted_channel`, which reuses the connector's connect-time responder
+    (`connect_time_autodetect::in_session_autodetect_response`) to answer the
+    security-header-framed auto-detect request, and TOLERATES (logs + drops) any other
+    channel-`0` traffic instead of fatally aborting. Non-zero unknown channels keep
+    the hard error. Exposed `pub mod connect_time_autodetect` +
+    `pub struct ConnectTimeAutoDetectRsp` + `pub fn in_session_autodetect_response`.
+    VALIDATED live: the `[X224] unexpected channel received: ID 0` fatal error is GONE
+    (client log: "Answering in-session (message-channel) Auto-Detect Request
+    channel_id=0"; unexpectedChannel count 2 -> 0). dtm-work regression PASS with the
+    flag on (session-rendering, 76 frames) and off (67 frames).
+  - DEEPER BLOCKER remains (why `network_autodetect` STILL stays OFF by default):
+    even with channel 0 handled, `--network-autodetect` against GRD now fails on the
+    HANDOVER reconnect — GRD's handover (FreeRDP) instance runs a
+    deactivation-reactivation and sends an MCS Disconnect Provider Ultimatum
+    (UserRequested) ~20 ms after the connection re-establishes, so no frame renders
+    (client error: `[read deactivation-reactivation sequence step] ... received
+    disconnect provider ultimatum: UserRequested`). Proven NOT to be the channel-0
+    handling: a controlled A/B on a freshly-restarted GRD shows `--egfx` WITHOUT
+    autodetect renders (26 frames) while `--egfx --network-autodetect` tears down, and
+    a tolerate-only build (channel-0 request acknowledged but NOT answered) tears down
+    identically. So the trigger is **advertising `SUPPORT_NET_CHAR_AUTODETECT` on the
+    handover reconnect itself** (the handover FreeRDP instance's connect-time
+    auto-detect / reactivation flow), not the message-channel response. This is a
+    GRD-handover-specific incompatibility that needs its own investigation (likely: do
+    NOT re-advertise autodetect on the redirected reconnect, or make the reactivation
+    sequence tolerate the handover instance's post-autodetect PDU ordering). Note the
+    channel-0 response is currently sent on the I/O channel (the client never joined a
+    message channel to reply on); harmless for dtm-work and neutral for the GRD
+    teardown, but revisit if a message-channel reply is ever required.
+  - NET (gap 3): the literal ask — decode + route/tolerate MCS channel 0 — is DONE,
+    tested, and safe (all changes gated behind the opt-in `--network-autodetect`;
+    default path byte-identical, dtm-work + GRD render unaffected). Server-side audio
+    ENABLE is proven (audio-disable journal line gone with the flag). `network_autodetect`
+    stays OFF by default per the "else leave off + document" fallback, because full
+    GRD audio needs the deeper handover-reactivation blocker above resolved first.
 - Audio playback itself remains unconfirmable headlessly (no output device to
   hear).
 

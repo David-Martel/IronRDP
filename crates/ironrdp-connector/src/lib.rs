@@ -6,7 +6,7 @@ mod macros;
 pub mod legacy;
 
 mod channel_connection;
-mod connect_time_autodetect;
+pub mod connect_time_autodetect;
 mod connection;
 pub mod connection_activation;
 mod connection_finalization;

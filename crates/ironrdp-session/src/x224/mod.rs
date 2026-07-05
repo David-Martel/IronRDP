@@ -141,7 +141,49 @@ impl Processor {
             process_svc_messages(response_pdus, channel_id, data_ctx.initiator_id)
                 .map(|data| vec![ProcessorOutput::ResponseFrame(data)])
         } else {
-            Err(reason_err!("X224", "unexpected channel received: ID {channel_id}"))
+            self.process_unrouted_channel(channel_id, data_ctx.user_data)
+        }
+    }
+
+    /// Handle a Send Data Indication that targets neither the I/O channel nor a
+    /// registered static virtual channel.
+    ///
+    /// gnome-remote-desktop / FreeRDP run *continuous* network auto-detection
+    /// after the connection is active (when the client advertised
+    /// `RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT`, i.e. `--network-autodetect`).
+    /// Those Server Auto-Detect Request PDUs are sent on the MCS message channel,
+    /// which the IronRDP client never joins, so they surface here on an
+    /// unrecognized channel (observed as channel `0`) framed with a
+    /// [`BasicSecurityHeader`] carrying `AUTODETECT_REQ` — *not* as a Share Data
+    /// PDU. Answer them with a security-header-framed Auto-Detect Response, reusing
+    /// the connector's connect-time responder so the framing stays identical.
+    ///
+    /// Any other traffic on the message channel (`0`) is tolerated (logged and
+    /// dropped) rather than fatally aborting an otherwise-healthy session; a
+    /// genuinely unexpected *non-zero* channel keeps the hard error so real
+    /// routing bugs still surface.
+    ///
+    /// [`BasicSecurityHeader`]: ironrdp_pdu::rdp::headers::BasicSecurityHeader
+    fn process_unrouted_channel(&self, channel_id: u16, user_data: &[u8]) -> SessionResult<Vec<ProcessorOutput>> {
+        match ironrdp_connector::connect_time_autodetect::in_session_autodetect_response(user_data) {
+            Ok(Some(rsp)) => {
+                debug!(
+                    channel_id,
+                    "Answering in-session (message-channel) Auto-Detect Request"
+                );
+                let mut buf = WriteBuf::new();
+                self.encode_io_channel(&mut buf, &rsp)?;
+                Ok(vec![ProcessorOutput::ResponseFrame(buf.filled().to_vec())])
+            }
+            Ok(None) if channel_id == 0 => {
+                warn!(channel_id, "Ignoring non-auto-detect PDU on MCS message channel");
+                Ok(Vec::new())
+            }
+            Err(_) if channel_id == 0 => {
+                warn!(channel_id, "Ignoring undecodable PDU on MCS message channel");
+                Ok(Vec::new())
+            }
+            Ok(None) | Err(_) => Err(reason_err!("X224", "unexpected channel received: ID {channel_id}")),
         }
     }
 

@@ -24,7 +24,7 @@ use ironrdp_pdu::rdp::headers::{BASIC_SECURITY_HEADER_SIZE, BasicSecurityHeader,
 /// This is the security-header framing used during the connect sequence (before
 /// Licensing), as opposed to the Share-Data framing used in-session.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ConnectTimeAutoDetectRsp {
+pub struct ConnectTimeAutoDetectRsp {
     pub(crate) response: AutoDetectResponse,
 }
 
@@ -109,6 +109,31 @@ pub(crate) fn classify_connect_time_pdu(user_data: &[u8]) -> DecodeResult<Connec
 /// but the value only informs the server's codec sizing; what matters for gating
 /// (e.g. audio redirection) is that the client answered, marking itself
 /// auto-detect-capable.
+/// Build the response for an in-session (continuous) auto-detect request that
+/// arrived framed with a [`BasicSecurityHeader`] on the MCS message channel.
+///
+/// gnome-remote-desktop / FreeRDP keep running network auto-detection *after* the
+/// connection is active, sending Server Auto-Detect Request PDUs on the MCS
+/// message channel (which the IronRDP client does not join, so they surface in
+/// the session layer on an unrecognized channel — commonly decoded as channel 0).
+/// Unlike the in-session auto-detect PDUs carried inside a Share Data Header
+/// ([MS-RDPBCGR] §2.2.14 over the I/O channel), these use the *same*
+/// security-header framing as the connect-time exchange, so the same classifier
+/// and responder apply.
+///
+/// Returns `Ok(Some(rsp))` with an encodable response for requests that require a
+/// reply (RTT Measure, Bandwidth Measure Stop), `Ok(None)` for requests that need
+/// no reply or payloads that are not auto-detect requests, and `Err` only if the
+/// leading [`BasicSecurityHeader`] / request body cannot be decoded.
+pub fn in_session_autodetect_response(user_data: &[u8]) -> DecodeResult<Option<ConnectTimeAutoDetectRsp>> {
+    match classify_connect_time_pdu(user_data)? {
+        ConnectTimePdu::AutoDetectRequest(request) => {
+            Ok(response_for_request(&request).map(ConnectTimeAutoDetectRsp::new))
+        }
+        ConnectTimePdu::Other => Ok(None),
+    }
+}
+
 pub(crate) fn response_for_request(request: &AutoDetectRequest) -> Option<AutoDetectResponse> {
     match request {
         AutoDetectRequest::RttRequest { sequence_number, .. } => Some(AutoDetectResponse::RttResponse {
@@ -205,6 +230,35 @@ mod tests {
                 byte_count: 1600,
             }
         );
+    }
+
+    #[test]
+    fn in_session_rtt_request_is_answered() {
+        // Same security-header framing as connect-time, but exercised through the
+        // public in-session entry point used by the session layer for
+        // message-channel auto-detect requests.
+        let request = AutoDetectRequest::rtt_connect_time(11);
+        let bytes = encode_server_autodetect_request(&request);
+
+        let rsp = in_session_autodetect_response(&bytes)
+            .expect("classify")
+            .expect("rtt requires a response");
+        assert_eq!(rsp.response, AutoDetectResponse::RttResponse { sequence_number: 11 });
+    }
+
+    #[test]
+    fn in_session_non_autodetect_is_none() {
+        // A licensing PDU (LICENSE_PKT) must not be treated as an auto-detect
+        // request, so the session layer falls through to its tolerate/error path.
+        let header = BasicSecurityHeader {
+            flags: BasicSecurityHeaderFlags::LICENSE_PKT,
+        };
+        let mut bytes = vec![0u8; header.size()];
+        let mut cursor = WriteCursor::new(&mut bytes);
+        header.encode(&mut cursor).unwrap();
+        bytes.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+
+        assert!(in_session_autodetect_response(&bytes).expect("classify").is_none());
     }
 
     #[test]
