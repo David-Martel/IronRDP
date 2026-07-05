@@ -409,6 +409,46 @@ concrete, containment-first designs so neither can threaten the two banked wins,
 dtm-work classic RDP and asuspro13 GRD AVC420 render):
 
 - EGFX bounding-box (dirty-rect) delivery [prior gap 2 / Priority 2.1]. Status:
+  **IMPLEMENTED 2026-07-04 on branch `gap/egfx-dirtyrect` (off 60bee85a).** The
+  design below was followed. Summary of what shipped:
+    * `BitmapUpdate` (ironrdp-egfx `client.rs`) gained `surface_width` /
+      `surface_height` so the presenting handler can distinguish a full-surface
+      update from a sub-rect and size its own persistent framebuffer. All three
+      construction sites (`decode_avc420`, `handle_uncompressed`,
+      `handle_wire_to_surface2`) populate them.
+    * `handle_wire_to_surface2` now tracks the changed-tile bounding box while
+      compositing (min/max of `tile.x_idx/y_idx*64`, clipped to the surface),
+      then `crop_region()` crops just that bbox out of the persistent
+      `progressive_framebuffers[surface_id]` accumulator and delivers it as a
+      sub-rect `BitmapUpdate` (dest_rect = bbox, width/height = bbox size). The
+      accumulator STAYS in egfx (lifecycle tied to ResetGraphics/DeleteSurface);
+      the full clone-every-frame is gone.
+    * New parallel render event `RdpOutputEvent::ImageRegion { buffer, x, y, w, h,
+      surface_w, surface_h }` (rdp.rs). `EgfxRenderHandler::on_bitmap_updated`
+      routes full-surface updates (origin + surface-sized) to the UNCHANGED
+      `Image` path (buffer moved, byte-identical — dtm-work/AVC420 banked wins
+      untouched) and everything else to `ImageRegion`.
+    * `app.rs` keeps a persistent surface-sized `self.buffer`; `blit_image_region`
+      (re)allocates it to `surface_w*surface_h` opaque-black on size change, then
+      blits the region at (x,y) with hard clipping to surface bounds (a malformed
+      server rect cannot panic or OOB-write). The small region buffer is recycled
+      via the existing `RecycleFrameBuffer` channel.
+    * `destination_rectangle` is now HONORED for placement on both codecs: a
+      future AVC420 sub-rect update (GRD currently sends full-surface AVC420, so
+      it stays on the `Image` path) would also route to `ImageRegion` and be
+      placed at its offset instead of corrupting the frame to the top-left.
+  Validation: `cargo test --workspace` green; unit tests are the acceptance gate
+  (`crop_region_offset_subrect_is_byte_exact`,
+  `crop_region_then_blit_back_matches_full_frame_delivery` in egfx — offset region
+  x>0,y>0,w<W,h<H so source/dest strides differ; `blit_image_region_*` in
+  ironrdp-client covering placement, out-of-bounds clipping, and unchanged-pixel
+  preservation). Clippy clean on touched files. Release build (default openh264)
+  and the `--no-default-features --features rustls,egfx` (no-H264) build both
+  compile. DEFERRED live validation: a running GRD session on the no-H264 build
+  (progressive path) and a Windows AVC420-sub-rect host were NOT exercised (no
+  live GRD access this phase — comprehensive live validation is the dedicated
+  later phase). Original finding/design retained below for reference:
+
   DEFERRED — not cleanly validatable under the new openh264 default. Key finding:
   `handle_wire_to_surface2` (RemoteFX **Progressive**) is the code path that marks
   the whole surface dirty and clones the full framebuffer each frame — but with
@@ -542,9 +582,12 @@ so there is nothing to cherry-pick for them.** Primary-source evidence:
   (#1238/#1246 exclusive-bounds rects, #1197 progressive decode/integration) are
   egfx-crate *correctness*, not the fork's deficit. The fork's deficit — renderer
   ignores `destination_rectangle` and full-clones the surface — lives in the fork's
-  own rewritten `app.rs`/`rdp.rs`, so it is from-scratch (design in the dirty-rect
-  bullet above) and verify-gated (needs a `--no-default-features rustls,egfx`
-  build to exercise the progressive path). DEFERRED, unchanged.
+  own rewritten `app.rs`/`rdp.rs`, so it was from-scratch (design in the dirty-rect
+  bullet above). **RESOLVED 2026-07-04 on `gap/egfx-dirtyrect`** — implemented
+  from scratch per that design (parallel `ImageRegion` event + persistent app-side
+  framebuffer + egfx bbox crop; `destination_rectangle` honored on both codecs).
+  Unit-tested; live progressive validation on a no-H264 GRD build deferred to the
+  dedicated live-validation phase.
 
 - Connect-time / in-session network auto-detect (gap "4"): upstream #1178
   (4dcad099) handles the *share-data-framed* `ShareDataPdu::AutoDetectReq`. The

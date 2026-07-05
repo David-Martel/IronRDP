@@ -109,11 +109,34 @@ impl ironrdp_egfx::client::GraphicsPipelineHandler for EgfxRenderHandler {
         // buffer travels egfx accumulator -> handler -> event loop with a single
         // copy at the egfx boundary rather than two.
         let buffer = update.data;
+        let rect = &update.destination_rectangle;
 
-        if let Err(e) = self
-            .event_loop_proxy
-            .send_event(RdpOutputEvent::Image { buffer, width, height })
-        {
+        // Route full-surface updates (origin, surface-sized) through the shared
+        // full-frame `Image` path so the AVC420/dtm-work banked wins stay
+        // byte-identical. Sub-rectangle updates (progressive dirty-rects, or any
+        // future AVC420 partial update) take the `ImageRegion` path, which blits
+        // the region at its offset into a persistent surface-sized framebuffer
+        // without shrinking the frame to the top-left corner.
+        let is_full_surface = rect.left == 0
+            && rect.top == 0
+            && width.get() == update.surface_width
+            && height.get() == update.surface_height;
+
+        let event = if is_full_surface {
+            RdpOutputEvent::Image { buffer, width, height }
+        } else {
+            RdpOutputEvent::ImageRegion {
+                buffer,
+                x: rect.left,
+                y: rect.top,
+                w: width,
+                h: height,
+                surface_w: update.surface_width,
+                surface_h: update.surface_height,
+            }
+        };
+
+        if let Err(e) = self.event_loop_proxy.send_event(event) {
             debug!(error = %e, "Failed to forward EGFX bitmap update to event loop");
         }
     }
@@ -129,6 +152,21 @@ pub enum RdpOutputEvent {
         buffer: Vec<u8>,
         width: NonZeroU16,
         height: NonZeroU16,
+    },
+    /// A sub-rectangle of the surface that must be blitted at (`x`, `y`) into a
+    /// persistent surface-sized (`surface_w` x `surface_h`) framebuffer.
+    ///
+    /// `buffer` is a tightly-packed `w` x `h` RGBA image (stride `w*4`). This is
+    /// the dirty-rect delivery path; it never replaces the whole framebuffer, so
+    /// unchanged regions of the surface are preserved between frames.
+    ImageRegion {
+        buffer: Vec<u8>,
+        x: u16,
+        y: u16,
+        w: NonZeroU16,
+        h: NonZeroU16,
+        surface_w: u16,
+        surface_h: u16,
     },
     ConnectionFailure(connector::ConnectorError),
     PointerDefault,
