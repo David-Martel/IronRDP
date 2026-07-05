@@ -24,7 +24,22 @@ name = "ironrdp-client"
 test = false
 
 [features]
-default = ["rustls"]
+# `openh264` (which enables `egfx`) is on by default so a plain
+# `cargo build --release -p ironrdp-client` renders EGFX/H.264 servers
+# (e.g. gnome-remote-desktop) out of the box. The classic bitmap/RemoteFX
+# path is unaffected: the connector only advertises the Graphics Pipeline
+# when `--egfx` is passed AND the feature is compiled in (see config.rs
+# `egfx_enabled`). Building without H.264 is still supported via
+# `--no-default-features --features rustls`.
+#
+# Licensing note: `openh264 -> ironrdp-egfx/openh264-bundled` compiles Cisco's
+# OpenH264 from source (`openh264/source`). Cisco's royalty-free H.264 patent
+# grant only covers Cisco's own *binary* OpenH264 distribution; a from-source
+# build falls outside that umbrella, so shipping this default build assumes the
+# distributor either holds an H.264/AVC patent license or accepts that risk.
+# A patent-clean portable artifact should build `--no-default-features
+# --features rustls` (classic bitmap/RFX only, no H.264).
+default = ["rustls", "openh264"]
 rustls = ["ironrdp-tls/rustls", "tokio-tungstenite/rustls-tls-native-roots", "ironrdp-mstsgu/rustls"]
 native-tls = ["ironrdp-tls/native-tls", "tokio-tungstenite/native-tls", "ironrdp-mstsgu/native-tls"]
 qoi = ["ironrdp/qoi"]

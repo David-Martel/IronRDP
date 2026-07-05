@@ -379,13 +379,30 @@ the gdm→render/video group fix (no more ZINK "failed to choose pdev").
 dtm-work regression: PASS — classic Windows RDP path unaffected, first frame
 presented 1920x1080 (`-u david` and `-u davidmartel07@gmail.com` both connect).
 
-OPEN DECISION for the coordinator: should `egfx` (or `openh264`) become a DEFAULT
-client feature so `cargo build --release -p ironrdp-client` renders GRD
-out-of-the-box? Tradeoffs: `openh264` default pulls in Cisco's bundled OpenH264
-(binary-license + build-weight decision) and ripples into `build.ps1`,
-`windows-release.yml`, and the portable-vs-host artifact contract. `egfx`-only
-(no H.264) likely renders GRD via progressive RFX but is UNVERIFIED without
-openh264. Left as a packaging decision, out of scope for the code fix.
+DECISION MADE (2026-07-04, gap 1): `openh264` is now a DEFAULT client feature.
+`crates/ironrdp-client/Cargo.toml` `default = ["rustls", "openh264"]` (openh264
+enables egfx transitively), so `cargo build --release -p ironrdp-client` renders
+GRD/H.264 servers out of the box. The classic bitmap/RFX path is unchanged: the
+connector only advertises the Graphics Pipeline when `--egfx` is passed AND the
+feature is compiled in (config.rs `egfx_enabled`), so a default build that is NOT
+given `--egfx` behaves exactly as before (dtm-work baseline unaffected). A
+patent/H.264-clean build is still available via
+`--no-default-features --features rustls`.
+
+H.264 (bundled-OpenH264) licensing consideration — DOCUMENTED, not resolved:
+`openh264 -> ironrdp-egfx/openh264-bundled` selects `openh264/source`, which
+COMPILES Cisco's OpenH264 from source rather than downloading Cisco's signed
+binary. Cisco's royalty-free H.264/AVC patent grant only covers *Cisco's own
+binary distribution* of OpenH264; a from-source build falls OUTSIDE that grant.
+Consequence: any party distributing this default-built artifact is responsible
+for its own H.264/AVC (MPEG-LA/Via LA pool) patent posture — either holding a
+license or accepting the risk. This is a distribution/legal decision, not a code
+bug. Packaging follow-ups that are now IMPLIED but deliberately NOT done in gap 1
+(left for the packaging owner): decide whether `build.ps1 -Mode package|publish`
+and `.github/workflows/windows-release.yml` ship the H.264 default or the
+`--no-default-features --features rustls` patent-clean portable class, and mark
+the class explicitly in artifact manifests. Scope of gap 1 was intentionally
+Cargo.toml default + this note + build/live validation only.
 
 Two remaining EGFX-quality follow-ups, now LIVE-VALIDATABLE (render works again):
 - AVC444 dual-stream decode (Track B refinement / prior gap 3): currently the
