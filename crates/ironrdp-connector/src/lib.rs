@@ -6,6 +6,7 @@ mod macros;
 pub mod legacy;
 
 mod channel_connection;
+mod connect_time_autodetect;
 mod connection;
 pub mod connection_activation;
 mod connection_finalization;
@@ -220,6 +221,17 @@ pub struct Config {
     /// corresponding option); otherwise such servers may send EGFX traffic the client cannot
     /// render, resulting in a blank session.
     pub enable_graphics_pipeline: bool,
+    /// Advertise support for connect-time network characteristics auto-detection
+    /// (`RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT`) and answer the server's
+    /// connect-time Auto-Detect Request sequence (RTT / bandwidth measurement,
+    /// [MS-RDPBCGR] §2.2.14) before the Licensing phase.
+    ///
+    /// FreeRDP-based servers (notably gnome-remote-desktop) gate audio-output
+    /// redirection on this flag. It is opt-in because advertising it without
+    /// consuming the resulting server Auto-Detect Request would desynchronise the
+    /// Licensing exchange; enabling it activates the handler that keeps the
+    /// sequence in sync.
+    pub network_autodetect: bool,
     pub dig_product_id: String,
     pub client_dir: String,
     /// Alternate shell to execute on the remote server (e.g., specific application instead of desktop)

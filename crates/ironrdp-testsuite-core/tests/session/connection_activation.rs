@@ -38,6 +38,7 @@ fn test_config() -> ironrdp_connector::Config {
         ime_file_name: String::new(),
         bitmap: None,
         enable_graphics_pipeline: false,
+        network_autodetect: false,
         dig_product_id: String::new(),
         client_dir: String::new(),
         platform: MajorPlatformType::UNIX,

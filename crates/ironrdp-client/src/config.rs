@@ -453,6 +453,16 @@ struct Args {
     #[clap(long, default_value_t = false)]
     egfx: bool,
 
+    /// Advertise connect-time network auto-detection (RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT)
+    /// and answer the server's RTT/bandwidth measurement requests.
+    ///
+    /// FreeRDP-based servers (e.g. gnome-remote-desktop) gate audio-output redirection on
+    /// this flag. Opt-in because it changes the connect-time handshake; the connector
+    /// consumes and answers the server's Auto-Detect Request sequence so Licensing stays
+    /// in sync.
+    #[clap(long, default_value_t = false)]
+    network_autodetect: bool,
+
     /// Keyboard layout code sent to the server (e.g., 0x00000409 for US English).
     ///
     /// When omitted, the layout is auto-detected from the active input locale on Windows.
@@ -652,6 +662,7 @@ impl Config {
             // Advertise Graphics Pipeline support when EGFX is requested, so EGFX-only
             // servers (e.g. gnome-remote-desktop 46+) accept the connection.
             enable_graphics_pipeline: egfx_enabled,
+            network_autodetect: args.network_autodetect,
             client_build: semver::Version::parse(crate::version::VERSION)
                 .map_or(0, |v| v.major * 100 + v.minor * 10 + v.patch)
                 .pipe(u32::try_from)

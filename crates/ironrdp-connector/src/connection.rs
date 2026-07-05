@@ -14,7 +14,8 @@ use crate::connection_activation::{ConnectionActivationSequence, ConnectionActiv
 use crate::license_exchange::{LicenseExchangeSequence, NoopLicenseCache};
 use crate::{
     Config, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize,
-    NegotiationFailure, Sequence, State, Written, encode_x224_packet, general_err, reason_err,
+    NegotiationFailure, Sequence, State, Written, connect_time_autodetect, encode_x224_packet, general_err, legacy,
+    reason_err,
 };
 
 #[derive(Debug)]
@@ -215,7 +216,17 @@ impl Sequence for ClientConnector {
             ClientConnectorState::BasicSettingsExchangeWaitResponse { .. } => Some(&ironrdp_pdu::X224_HINT),
             ClientConnectorState::ChannelConnection { channel_connection, .. } => channel_connection.next_pdu_hint(),
             ClientConnectorState::SecureSettingsExchange { .. } => None,
-            ClientConnectorState::ConnectTimeAutoDetection { .. } => None,
+            ClientConnectorState::ConnectTimeAutoDetection { .. } => {
+                // When network auto-detection is advertised, the server sends one or
+                // more connect-time Auto-Detect Request PDUs before Licensing, so we
+                // must read them. Otherwise this state is an immediate passthrough and
+                // reads nothing (identical to the historical behaviour).
+                if self.config.network_autodetect {
+                    Some(&ironrdp_pdu::X224_HINT)
+                } else {
+                    None
+                }
+            }
             ClientConnectorState::LicensingExchange { license_exchange, .. } => license_exchange.next_pdu_hint(),
             ClientConnectorState::MultitransportBootstrapping { .. } => None,
             ClientConnectorState::CapabilitiesExchange {
@@ -484,16 +495,12 @@ impl Sequence for ClientConnector {
             }
 
             //== Optional Connect-Time Auto-Detection ==//
-            // NOTE: IronRDP is not expecting the Auto-Detect Request PDU from server.
             ClientConnectorState::ConnectTimeAutoDetection {
                 io_channel_id,
                 user_channel_id,
-            } => (
-                Written::Nothing,
-                ClientConnectorState::LicensingExchange {
-                    io_channel_id,
-                    user_channel_id,
-                    license_exchange: LicenseExchangeSequence::new(
+            } => {
+                let new_license_exchange = || {
+                    LicenseExchangeSequence::new(
                         io_channel_id,
                         self.config.credentials.username().unwrap_or("").to_owned(),
                         self.config.domain.clone(),
@@ -502,9 +509,77 @@ impl Sequence for ClientConnector {
                             .license_cache
                             .clone()
                             .unwrap_or_else(|| Arc::new(NoopLicenseCache)),
-                    ),
-                },
-            ),
+                    )
+                };
+
+                if !self.config.network_autodetect {
+                    // Auto-detection was not advertised: this state is an immediate
+                    // passthrough and does not read from the wire, so the next PDU
+                    // (the first Licensing PDU) is handled by LicensingExchange.
+                    (
+                        Written::Nothing,
+                        ClientConnectorState::LicensingExchange {
+                            io_channel_id,
+                            user_channel_id,
+                            license_exchange: new_license_exchange(),
+                        },
+                    )
+                } else {
+                    // We advertised RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT, so the server
+                    // may send connect-time Auto-Detect Request PDUs before Licensing.
+                    // Classify the PDU by its BasicSecurityHeader: answer RTT requests
+                    // and keep reading while auto-detect PDUs arrive; the first
+                    // non-auto-detect PDU (the Licensing request) is fed forward to the
+                    // LicensingExchange sequence unchanged.
+                    let ctx = legacy::decode_send_data_indication(input)?;
+
+                    match connect_time_autodetect::classify_connect_time_pdu(ctx.user_data)
+                        .map_err(ConnectorError::decode)?
+                    {
+                        connect_time_autodetect::ConnectTimePdu::AutoDetectRequest(request) => {
+                            debug!(?request, "Received connect-time Auto-Detect Request");
+
+                            let written = if let Some(response) =
+                                connect_time_autodetect::response_for_request(&request)
+                            {
+                                debug!(?response, "Answering connect-time Auto-Detect Request");
+                                let rsp = connect_time_autodetect::ConnectTimeAutoDetectRsp::new(response);
+                                Written::from_size(encode_send_data_request(
+                                    user_channel_id,
+                                    io_channel_id,
+                                    &rsp,
+                                    output,
+                                )?)?
+                            } else {
+                                Written::Nothing
+                            };
+
+                            (
+                                written,
+                                ClientConnectorState::ConnectTimeAutoDetection {
+                                    io_channel_id,
+                                    user_channel_id,
+                                },
+                            )
+                        }
+                        connect_time_autodetect::ConnectTimePdu::Other => {
+                            // Auto-detection is over; this PDU is the first Licensing PDU.
+                            // Feed it forward: LicenseExchangeSequence::step decodes the
+                            // Send Data Indication from `input` directly.
+                            let mut license_exchange = new_license_exchange();
+                            let written = license_exchange.step(input, output)?;
+                            (
+                                written,
+                                ClientConnectorState::LicensingExchange {
+                                    io_channel_id,
+                                    user_channel_id,
+                                    license_exchange,
+                                },
+                            )
+                        }
+                    }
+                }
+            }
 
             //== Licensing ==//
             // Server is sending information regarding licensing.
@@ -709,10 +784,15 @@ fn create_gcc_blocks<'a>(
                         | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
 
                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU
-                    // TODO(audio): advertising SUPPORT_NET_CHAR_AUTODETECT would let FreeRDP
-                    // servers (gnome-remote-desktop) enable audio-output redirection, but the
-                    // connector's ConnectTimeAutoDetection state does not consume the resulting
-                    // server Auto-Detect Request, desyncing LicensingExchange. See codex.TODO.md.
+
+                    // Advertise connect-time network auto-detection so FreeRDP servers
+                    // (gnome-remote-desktop) enable audio-output redirection. This is
+                    // safe only because the `ConnectTimeAutoDetection` connector state
+                    // now consumes and answers the resulting server Auto-Detect Request
+                    // sequence; see `connect_time_autodetect` and `Config::network_autodetect`.
+                    if config.network_autodetect {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT;
+                    }
 
                     if max_color_depth == 32 {
                         early_capability_flags |= ClientEarlyCapabilityFlags::WANT_32_BPP_SESSION;

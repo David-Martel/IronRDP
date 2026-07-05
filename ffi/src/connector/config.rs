@@ -214,6 +214,7 @@ pub mod ffi {
                 desktop_scale_factor: 0,
                 hardware_id: None,
                 license_cache: None,
+                network_autodetect: false,
                 timezone_info: self.timezone_info.clone().unwrap_or_default(),
                 alternate_shell: String::new(),
                 work_dir: String::new(),
