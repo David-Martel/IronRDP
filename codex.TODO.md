@@ -477,7 +477,12 @@ dtm-work classic RDP and asuspro13 GRD AVC420 render):
       -> ServerAutoReconnect), store it on the session/config, and populate
       `reconnect_cookie` in `ExtendedClientOptionalInfo` on the reconnect attempt in
       `RdpClient::run`'s reconnect loop. Regression-safe: default `None` preserves
-      today's behavior.
+      today's behavior. CORRECTION (2026-07-05, see "Upstream import re-scan"
+      section): "populate `reconnect_cookie`" is NOT a copy of `random_bits` — the
+      client cookie's SecurityVerifier = HMAC-MD5(ArcRandomBits, ClientRandom) per
+      [MS-RDPBCGR] 5.5 (crypto derivation). Upstream also only TODOs this
+      (`rdp.rs:774 TODO(#271)`), so there is no import; it is from-scratch and gate
+      it behind an opt-in `--auto-reconnect` flag rather than a bare default `None`.
   (b) CredSSP `InvalidToken` (nstatus 0xc00700ea) on the GRD handover reconnect is a
       FLAKY, server-side/environment auth race (winpr NTLM SAM not ready vs the
       client's NTLMSSP), present at both old and new commits and not an import/client
@@ -487,6 +492,103 @@ dtm-work classic RDP and asuspro13 GRD AVC420 render):
       CredSSP retry on `InvalidToken` during the handover reconnect ONLY (do not
       touch the initial-connect CredSSP path, which is the dtm-work banked win), and
       confirm against a freshly-restarted GRD where the handover SAM is warm.
+
+## Upstream import re-scan for the deferred gaps (2026-07-05)
+
+Targeted re-scan of `master..upstream/master` (139 commits, upstream HEAD
+069786c9) specifically to import commits that resolve the deferred gaps above.
+**Headline: only gap 5 (robustness) was closable by import. The premise that
+upstream already implements AVC444 decode (gap "1"/AVC444) and the ARC
+reconnect-cookie wiring (gap "5"/reconnect) is FALSE — upstream stubs/TODOs both,
+so there is nothing to cherry-pick for them.** Primary-source evidence:
+
+- AVC444 dual-stream decode: **no upstream source exists.**
+  `upstream/master crates/ironrdp-egfx/src/client.rs:720` is byte-for-intent
+  identical to the fork — `Codec1Type::Avc444 | Codec1Type::Avc444v2 => { debug!(
+  "AVC444 codec not yet implemented, forwarding to handler") }`. Upstream ships
+  the `Avc444BitmapStream` PDU parser (`pdu/avc.rs`) but NOT the luma+chroma-aux
+  → YUV444 decode. Remains DEFERRED and from-scratch; additionally UNVERIFIABLE in
+  this environment (GRD's handover instance advertised AVC420 acceptance only, so
+  there is no AVC444 peer to visually validate against). Keeping it deferred is
+  correct — a from-scratch dual-stream decoder reachable by default would threaten
+  the banked GRD render; it must stay behind the opt-in `--avc444` flag if ever
+  built. Design in the AVC444 bullet above still stands.
+
+- ARC auto-reconnect cookie: **no upstream source exists.**
+  `upstream/master crates/ironrdp-client/src/rdp.rs:774` is a bare
+  `// TODO(#271): use the "auto-reconnect cookie"`. Both fork and upstream have the
+  PDU infrastructure (`client_info.rs` `reconnect_cookie: Option<[u8;28]>` +
+  `ExtendedClientOptionalInfo` builder; `session_info/logon_extended.rs`
+  `ServerAutoReconnect { logon_id, random_bits:[u8;16] }`), but neither wires
+  capture→use. **Correction to the prior gap-5(a) note:** populating
+  `reconnect_cookie` is NOT a copy of `random_bits`. The client cookie's 16-byte
+  SecurityVerifier = HMAC-MD5(ArcRandomBits, ClientRandom) per [MS-RDPBCGR] 5.5 —
+  it is a crypto derivation, not a memcpy. So the "just store + populate" framing
+  understated it. DEFERRED (from-scratch, and cannot observe a single successful
+  reconnect round-trip here — no reproducible ARC-issuing unexpected drop; GRD's
+  redirect is a different, already-resolved mechanism). If picked up: (1) confirm
+  against [MS-RDPBCGR] 5.5 that under Enhanced (TLS/CredSSP) security ClientRandom
+  is 32 zero bytes so the verifier is deterministic and unit-testable against a
+  fixed vector; (2) gate behind an opt-in `--auto-reconnect` flag (mirror
+  `--avc444`/`--network-autodetect`) so the banked resize-reconnect path stays
+  byte-identical by default — safer than a bare `default None`. A capture-only
+  half was rejected: adding `ProcessorOutput`/`ActiveStageOutput` variants across
+  two crates for a value that is stored and never read is dead plumbing.
+
+- EGFX destination_rectangle / dirty-rect (gap "2"): the relevant upstream commits
+  (#1238/#1246 exclusive-bounds rects, #1197 progressive decode/integration) are
+  egfx-crate *correctness*, not the fork's deficit. The fork's deficit — renderer
+  ignores `destination_rectangle` and full-clones the surface — lives in the fork's
+  own rewritten `app.rs`/`rdp.rs`, so it is from-scratch (design in the dirty-rect
+  bullet above) and verify-gated (needs a `--no-default-features rustls,egfx`
+  build to exercise the progressive path). DEFERRED, unchanged.
+
+- Connect-time / in-session network auto-detect (gap "4"): upstream #1178
+  (4dcad099) handles the *share-data-framed* `ShareDataPdu::AutoDetectReq`. The
+  fork does not have that arm, but it independently handles the framing GRD
+  actually uses — the *message-channel / security-header-framed* auto-detect
+  request (`connect_time_autodetect` + `x224::process_unrouted_channel`, commit
+  61af5a77). Crucially, #1178 does NOT address gap 4's real blocker (suppressing
+  re-advertisement of `SUPPORT_NET_CHAR_AUTODETECT` on the GRD handover reconnect,
+  which tears the handover down) — upstream has no such suppression. So gap 4's
+  importable part was already delivered by the fork; the remaining blocker has no
+  upstream fix. `--network-autodetect` stays opt-in/off by default. #1178 SKIPPED
+  (different framing than GRD, not the blocker, and would conflict with the fork's
+  reworked `active_stage.rs`/`x224` while adding always-on autodetect the fork
+  deliberately gated).
+
+- Gap 5 (robustness) — IMPORTED: **#1236 (78effb3f)** `fix(connector): surface
+  actual PDU type when an unexpected Share Control PDU arrives`. Replaces opaque
+  "unexpected Share Control Pdu" errors in `legacy.rs` (`decode_share_data`,
+  `decode_io_channel`) and `connection_activation.rs` CapabilitiesExchange with
+  `reason_err!` messages naming the actual PDU via `as_short_name()` — improves
+  the exact diagnostic surface the fork hit while root-causing the GRD handover
+  BadCapabilities teardown. ADAPTED: kept the fork's `ServerRedirect` arm in
+  `decode_io_channel`; `connection_activation.rs` auto-merged preserving the fork's
+  interleaved Set-Error-Info diagnostic. Gate results: `cargo test --workspace`
+  1348 passed / 0 failed (baseline held), `cargo build --release -p ironrdp-client`
+  (default rustls+openh264) clean, clippy 0 findings on both touched files.
+  dtm-work live insurance: TCP+TLS+CredSSP/NLA auth SUCCEEDED with a runtime-read
+  Credential-Manager credential (the connect path #1236 touches — intact); the
+  session then hit a transport `ConnectionReset` (WSA 10054) before first frame,
+  an environment/server-session condition on a code path #1236 does not touch, not
+  a client regression.
+
+- Already-present / no-op: **#1395 (368fe8e6)** `don't require CONTEXT block on
+  every progressive frame` is ALREADY in the fork (`progressive.rs:835-850`,
+  same fix + same GNOME-Remote-Desktop rationale comment) — NOT re-imported.
+
+Intentionally SKIPPED (high-value but out-of-scope/entangled/unverifiable):
+- #1178 (session auto-detect) — see gap-4 note above.
+- #1132 (93833802, slow-path graphics + pointer): real feature but a 480-line
+  rewrite of `fast_path.rs`, which the fork already reworked (item 27
+  reactivation fix); heavy conflict, and both banked targets use the fast-path,
+  not slow-path, so no observable benefit. SKIPPED.
+- #1174 (059ca902, ClearCodec bitmap codec): from-scratch codec; no banked target
+  negotiates ClearCodec (GRD=AVC420, dtm-work=bitmap/RFX). SKIPPED.
+- #1305 (91ea46bd, RawCapabilitySet split): already dispositioned as deferred in
+  item 46 (392-line breaking rework of the fork's most-diverged egfx file; client
+  benefit already delivered by the #1298 adaptation). Still SKIPPED.
 
 ## Live smoke-test findings (2026-07-04, Windows -> asuspro13 GRD 46.3 + dtm-work)
 
