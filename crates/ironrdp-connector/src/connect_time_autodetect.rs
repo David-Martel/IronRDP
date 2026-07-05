@@ -15,7 +15,7 @@
 //! the request and reply without desynchronising the following Licensing PDU.
 
 use ironrdp_core::{Decode as _, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_size};
-use ironrdp_pdu::rdp::autodetect::{AutoDetectRequest, AutoDetectResponse};
+use ironrdp_pdu::rdp::autodetect::{AutoDetectRequest, AutoDetectResponse, BW_RESULTS_CONNECT_TIME};
 use ironrdp_pdu::rdp::headers::{BASIC_SECURITY_HEADER_SIZE, BasicSecurityHeader, BasicSecurityHeaderFlags};
 
 /// A connect-time Auto-Detect Response PDU: a [`BasicSecurityHeader`] carrying the
@@ -92,22 +92,43 @@ pub(crate) fn classify_connect_time_pdu(user_data: &[u8]) -> DecodeResult<Connec
 /// Build the connect-time Auto-Detect Response for a given request, if one is
 /// required.
 ///
-/// Per [MS-RDPBCGR] §1.3.8.1 the client MUST answer an RTT Measure Request with
-/// an RTT Measure Response carrying the same sequence number. Bandwidth Measure
-/// Start/Payload require no immediate reply; a Bandwidth Measure Stop would ask
-/// for a Bandwidth Measure Results response, but producing an honest time-delta /
-/// byte-count requires a measurement state machine that is out of scope here, so
-/// those are acknowledged by continuing to read (returning `None`). The RTT
-/// response alone is sufficient for FreeRDP servers to consider the client
-/// auto-detect-capable and enable gated features such as audio redirection.
+/// Per [MS-RDPBCGR] §1.3.8:
+/// - an RTT Measure Request is answered with an RTT Measure Response carrying the
+///   same sequence number (§2.2.14.2.1);
+/// - a Bandwidth Measure **Stop** is answered with a Bandwidth Measure Results
+///   response (§2.2.14.2.2) — this is mandatory: gnome-remote-desktop performs a
+///   *bandwidth*-based connect-time detection (Start → Stop) and blocks the
+///   handshake (never advancing to Licensing) until it receives the Results, so
+///   omitting it deadlocks the connection;
+/// - Bandwidth Measure Start / Payload and Network Characteristics Result require
+///   no immediate reply.
+///
+/// The Results `byte_count` is taken from the connect-time Stop payload (the data
+/// whose transfer is being measured) and a nominal 1 ms `time_delta` is reported.
+/// An exact measurement would require timing across the whole Start→Stop window,
+/// but the value only informs the server's codec sizing; what matters for gating
+/// (e.g. audio redirection) is that the client answered, marking itself
+/// auto-detect-capable.
 pub(crate) fn response_for_request(request: &AutoDetectRequest) -> Option<AutoDetectResponse> {
     match request {
         AutoDetectRequest::RttRequest { sequence_number, .. } => Some(AutoDetectResponse::RttResponse {
             sequence_number: *sequence_number,
         }),
+        AutoDetectRequest::BandwidthMeasureStop {
+            sequence_number,
+            payload,
+            ..
+        } => {
+            let byte_count = payload.as_ref().map_or(0, |p| u32::try_from(p.len()).unwrap_or(u32::MAX));
+            Some(AutoDetectResponse::BandwidthMeasureResults {
+                sequence_number: *sequence_number,
+                response_type: BW_RESULTS_CONNECT_TIME,
+                time_delta_ms: 1,
+                byte_count,
+            })
+        }
         AutoDetectRequest::BandwidthMeasureStart { .. }
         | AutoDetectRequest::BandwidthMeasurePayload { .. }
-        | AutoDetectRequest::BandwidthMeasureStop { .. }
         | AutoDetectRequest::NetworkCharacteristicsResult { .. } => None,
     }
 }
@@ -162,9 +183,28 @@ mod tests {
     }
 
     #[test]
-    fn bandwidth_requests_need_no_response() {
+    fn bandwidth_start_needs_no_response() {
         let start = AutoDetectRequest::bw_start_connect_time(3);
         assert!(response_for_request(&start).is_none());
+    }
+
+    #[test]
+    fn bandwidth_stop_produces_results_with_payload_byte_count() {
+        let stop = AutoDetectRequest::BandwidthMeasureStop {
+            sequence_number: 9,
+            request_type: ironrdp_pdu::rdp::autodetect::BW_STOP_CONNECT_TIME,
+            payload: Some(vec![0u8; 1600]),
+        };
+        let response = response_for_request(&stop).expect("connect-time BW stop must be answered");
+        assert_eq!(
+            response,
+            AutoDetectResponse::BandwidthMeasureResults {
+                sequence_number: 9,
+                response_type: BW_RESULTS_CONNECT_TIME,
+                time_delta_ms: 1,
+                byte_count: 1600,
+            }
+        );
     }
 
     #[test]
