@@ -472,15 +472,47 @@ flag, which the connector does not advertise (`connection.rs`
   (dtm-work happened to survive because Windows did not send connect-time
   auto-detect in that idle window — so whether the desync fires is
   server-dependent, making the flag unsafe to advertise without the handler.)
-- Real fix (feature-sized, TODO not done): implement a content-dispatching
-  `ConnectTimeAutoDetection` state that consumes the server Auto-Detect Request
-  (respond to RTT; handle the optional BandwidthMeasure Start/Payload/Stop/Results
-  + NetworkCharacteristics sub-sequence) then advances to LicensingExchange, and
-  validate against BOTH Windows and GRD before enabling the flag. The in-session
-  auto-detect handler already exists (`ironrdp-session` x224 RttResponse).
+- Real fix — IMPLEMENTED (opt-in), 2026-07-04. A content-dispatching connect-time
+  auto-detect handler now exists and is gated behind an opt-in config flag
+  (`Config::network_autodetect`, client `--network-autodetect`):
+  - new `connect_time_autodetect` module: classify a connect-time I/O-channel PDU
+    by its `BasicSecurityHeader` (AUTODETECT_REQ vs anything else — this is the
+    *security-header* framing used at connect time, distinct from the in-session
+    share-data `ShareDataPdu::AutoDetectReq` framing) and build the security-header
+    -framed Auto-Detect Response. Answers RTT Measure Request (RTT Response) and
+    connect-time Bandwidth Measure Stop (Bandwidth Measure Results,
+    byte_count = Stop payload length, nominal 1 ms delta).
+  - `ConnectTimeAutoDetection` connector state: reads the next PDU ONLY when the
+    flag is set; answers auto-detect requests and loops; feeds the first
+    non-auto-detect PDU (the Licensing request) forward to `LicenseExchangeSequence`
+    (mirroring the LicensingExchange terminal check so a single-PDU licensing
+    exchange advances instead of being stepped twice).
+  - Safe by construction: with the flag OFF (default) the GCC blocks are
+    byte-identical and the state keeps its historical immediate passthrough
+    (`next_pdu_hint = None`), so the standard connect path — dtm-work included — is
+    unchanged. 5 connector unit tests cover classify/respond/passthrough/framing.
+  - VALIDATED (live): dtm-work `--network-autodetect` connects + first frame
+    presented 1920x1080 (feed-forward path, no auto-detect fired — the exact case
+    that used to desync). GRD `--network-autodetect`: the connect-time auto-detect
+    now COMPLETES — system-daemon path answered 10 RTT requests + received
+    NetworkCharacteristics; handover path answered Bandwidth Start/Stop. No more
+    LicensingExchange desync.
+  - REMAINING BLOCKER (flag NOT flipped to default; needs `ironrdp-session` work):
+    with the flag on, GRD's session now fails LATER with
+    `[X224] unexpected channel received: ID 0`. The connection fully establishes
+    (io_channel_id=1003, user_channel_id=1008, 1920x1080) and then the first
+    active-session SendDataIndication decodes to channel_id 0. This is a deeper
+    session-layer issue surfaced ONLY when auto-detect is negotiated (likely a
+    continuous/in-session auto-detect or post-connect PDU the `x224` router does
+    not expect); it is beyond the connector auto-detect handler. Next step: rerun
+    with `IRONRDP_LOG=...,ironrdp_session=debug` to dump the offending PDU's
+    channel_id + head bytes (the `x224 process: routing` trace) and handle/route it
+    in `crates/ironrdp-session/src/x224/mod.rs`.
+  - Because of that blocker, audio-enabled playback on GRD is not yet proven; the
+    handshake half is done and safe. Do NOT make `network_autodetect` default until
+    the channel-0 issue is resolved and GRD render+audio survive with the flag on.
 - Audio playback itself remains unconfirmable headlessly (no output device to
-  hear); honest status = "gated off by missing flag; real enablement blocked on
-  the connector auto-detect work."
+  hear).
 
 3. dtm-work (standard Windows RDP) baseline: WORKS. NLA/HYBRID_EX via Credential
 Manager, connect + first frame presented 1920x1080, session held. The `-d
