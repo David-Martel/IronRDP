@@ -200,6 +200,16 @@ pub struct BitmapUpdate {
     pub width: u16,
     /// Height of the decoded data in pixels
     pub height: u16,
+    /// Full width of the destination surface in pixels.
+    ///
+    /// Together with `surface_height` this lets a presenting handler decide
+    /// whether the update covers the whole surface (a full-frame replacement)
+    /// or only a sub-rectangle that must be blitted at
+    /// (`destination_rectangle.left`, `destination_rectangle.top`) into a
+    /// persistent surface-sized framebuffer.
+    pub surface_width: u16,
+    /// Full height of the destination surface in pixels. See `surface_width`.
+    pub surface_height: u16,
 }
 
 // ============================================================================
@@ -688,6 +698,10 @@ impl GraphicsPipelineClient {
             .get(&pdu.surface_id)
             .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface1"))?;
 
+        // Copy surface dimensions out before any `&mut self` call below (the
+        // decoder borrow conflicts with an outstanding `self.surfaces` borrow).
+        let (surface_width, surface_height) = (surface.width, surface.height);
+
         // Validate rectangle ordering (left <= right, top <= bottom)
         let rect = &pdu.destination_rectangle;
         if rect.left > rect.right || rect.top > rect.bottom {
@@ -715,14 +729,20 @@ impl GraphicsPipelineClient {
 
         match pdu.codec_id {
             Codec1Type::Avc420 => {
-                self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
+                self.decode_avc420(
+                    pdu.surface_id,
+                    &pdu.destination_rectangle,
+                    surface_width,
+                    surface_height,
+                    &pdu.bitmap_data,
+                )?;
             }
             Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
                 debug!("AVC444 codec not yet implemented, forwarding to handler");
                 self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
             }
             Codec1Type::Uncompressed => {
-                self.handle_uncompressed(pdu);
+                self.handle_uncompressed(pdu, surface_width, surface_height);
             }
             _ => {
                 trace!(codec_id = ?pdu.codec_id, "Forwarding unsupported codec to handler");
@@ -733,7 +753,14 @@ impl GraphicsPipelineClient {
         Ok(())
     }
 
-    fn decode_avc420(&mut self, surface_id: u16, dest_rect: &InclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
+    fn decode_avc420(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &InclusiveRectangle,
+        surface_width: u16,
+        surface_height: u16,
+        bitmap_data: &[u8],
+    ) -> PduResult<()> {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
@@ -772,13 +799,15 @@ impl GraphicsPipelineClient {
             data: cropped_data,
             width: dest_width,
             height: dest_height,
+            surface_width,
+            surface_height,
         };
 
         self.handler.on_bitmap_updated(update);
         Ok(())
     }
 
-    fn handle_uncompressed(&mut self, pdu: crate::pdu::WireToSurface1Pdu) {
+    fn handle_uncompressed(&mut self, pdu: crate::pdu::WireToSurface1Pdu, surface_width: u16, surface_height: u16) {
         let dest_width = pdu.destination_rectangle.width();
         let dest_height = pdu.destination_rectangle.height();
 
@@ -795,6 +824,8 @@ impl GraphicsPipelineClient {
             data: rgba_data,
             width: dest_width,
             height: dest_height,
+            surface_width,
+            surface_height,
         };
 
         self.handler.on_bitmap_updated(update);
@@ -805,9 +836,13 @@ impl GraphicsPipelineClient {
     /// GNOME Remote Desktop (and other RFX-progressive servers) deliver each
     /// frame as a progressive block stream that updates only the 64x64 tiles
     /// that changed. We decode those tiles, composite them into a persistent
-    /// per-surface RGBA framebuffer, and deliver the whole framebuffer as one
-    /// [`BitmapUpdate`] so the renderer (which treats an update as a full-frame
-    /// image) shows the accumulated surface.
+    /// per-surface RGBA framebuffer (kept here because its lifecycle is tied to
+    /// ResetGraphics/DeleteSurface), then crop the bounding box of the changed
+    /// tiles out of that framebuffer and deliver only that sub-rectangle as a
+    /// [`BitmapUpdate`]. `surface_width`/`surface_height` on the update let the
+    /// presenting handler place the region at
+    /// (`destination_rectangle.left`, `destination_rectangle.top`) inside its
+    /// own persistent surface-sized buffer instead of full-cloning every frame.
     fn handle_wire_to_surface2(&mut self, pdu: &WireToSurface2Pdu) {
         let Some(surface) = self.surfaces.get(&pdu.surface_id) else {
             warn!(surface_id = pdu.surface_id, "WireToSurface2 for unknown surface");
@@ -820,8 +855,9 @@ impl GraphicsPipelineClient {
         // Decode the progressive stream into 64x64 RGBA tiles, then composite
         // into the persistent framebuffer. Both `progressive` and
         // `progressive_framebuffers` are distinct fields, so the borrows are
-        // disjoint.
-        let rendered = {
+        // disjoint. The block yields the exclusive-bounds bounding box of the
+        // changed tiles (min_x, min_y, max_x, max_y), clipped to the surface.
+        let bbox = {
             let tiles = match self.progressive.decode_bitmap(
                 pdu.codec_context_id,
                 surface_width,
@@ -852,33 +888,50 @@ impl GraphicsPipelineClient {
                     v
                 });
 
+            // Track the changed-tile bounding box while compositing. Tile (x_idx,
+            // y_idx) covers surface pixels [x_idx*64, (x_idx+1)*64), clipped to
+            // the surface edge.
+            let (mut min_x, mut min_y) = (usize::MAX, usize::MAX);
+            let (mut max_x, mut max_y) = (0usize, 0usize);
             let tile_count = tiles.len();
             for tile in &tiles {
-                blit_tile(
-                    &tile.pixels,
-                    fb,
-                    width,
-                    height,
-                    usize::from(tile.x_idx) * 64,
-                    usize::from(tile.y_idx) * 64,
-                );
+                let tx = usize::from(tile.x_idx) * 64;
+                let ty = usize::from(tile.y_idx) * 64;
+                blit_tile(&tile.pixels, fb, width, height, tx, ty);
+                min_x = min_x.min(tx);
+                min_y = min_y.min(ty);
+                max_x = max_x.max((tx + 64).min(width));
+                max_y = max_y.max((ty + 64).min(height));
             }
             trace!(surface_id = pdu.surface_id, tile_count, "progressive tiles composited");
-            true
+
+            // Clip the origin to the surface too (a tile fully off-surface would
+            // leave min_* past the edge). If the box collapses, nothing to send.
+            min_x = min_x.min(width);
+            min_y = min_y.min(height);
+            if min_x >= max_x || min_y >= max_y {
+                trace!(surface_id = pdu.surface_id, "progressive bbox empty after clipping");
+                return;
+            }
+            (min_x, min_y, max_x, max_y)
         };
 
-        if !rendered {
-            return;
-        }
+        let (min_x, min_y, max_x, max_y) = bbox;
+        let bbox_w = max_x - min_x;
+        let bbox_h = max_y - min_y;
 
-        // Clone the composited framebuffer for delivery (Image path is full-frame).
-        let data = self.progressive_framebuffers[&pdu.surface_id].clone();
+        // Crop the changed bounding box out of the persistent framebuffer. Only
+        // this sub-rectangle travels to the handler; the accumulator stays whole.
+        let fb = &self.progressive_framebuffers[&pdu.surface_id];
+        let data = crop_region(fb, width, min_x, min_y, bbox_w, bbox_h);
 
-        // One-shot diagnostic dump for visual verification of the decode.
+        // One-shot diagnostic dump for visual verification of the decode. Dumps
+        // the FULL accumulated framebuffer (not the cropped region) so it can be
+        // diffed against a whole-surface reference.
         if !self.progressive_dump_done
             && let Some(path) = std::env::var_os("IRONRDP_EGFX_DUMP")
         {
-            if std::fs::write(&path, &data).is_ok() {
+            if std::fs::write(&path, fb).is_ok() {
                 let mut dims = std::path::PathBuf::from(&path);
                 dims.set_extension("dims");
                 let _ = std::fs::write(dims, format!("{width}x{height}"));
@@ -887,20 +940,27 @@ impl GraphicsPipelineClient {
             self.progressive_dump_done = true;
         }
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::as_conversions,
+            reason = "bbox is clipped to the u16 surface bounds, so every coordinate fits in u16"
+        )]
         let update = BitmapUpdate {
             surface_id: pdu.surface_id,
             destination_rectangle: InclusiveRectangle {
-                left: 0,
-                top: 0,
-                right: surface_width.saturating_sub(1),
-                bottom: surface_height.saturating_sub(1),
+                left: min_x as u16,
+                top: min_y as u16,
+                right: (max_x - 1) as u16,
+                bottom: (max_y - 1) as u16,
             },
             // Placeholder: BitmapUpdate.codec_id is a Codec1Type; the renderer
             // ignores it and always treats `data` as RGBA8888.
             codec_id: Codec1Type::Uncompressed,
             data,
-            width: surface_width,
-            height: surface_height,
+            width: bbox_w as u16,
+            height: bbox_h as u16,
+            surface_width,
+            surface_height,
         };
 
         self.handler.on_bitmap_updated(update);
@@ -1100,6 +1160,26 @@ fn blit_tile(tile: &[u8], fb: &mut [u8], fb_w: usize, fb_h: usize, dst_x: usize,
     }
 }
 
+/// Crop a `w`x`h` sub-rectangle at (`x`, `y`) out of a `fb_w`-wide RGBA
+/// framebuffer into a fresh tightly-packed `w`x`h` RGBA buffer (stride `w*4`).
+///
+/// The rectangle must lie within the framebuffer; callers clip it to the
+/// surface bounds beforehand. Rows partially outside the framebuffer are
+/// skipped defensively rather than panicking.
+fn crop_region(fb: &[u8], fb_w: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
+    for row in 0..h {
+        let src_start = ((y + row) * fb_w + x) * 4;
+        let src_end = src_start + w * 4;
+        let dst_start = row * w * 4;
+        let dst_end = dst_start + w * 4;
+        if src_end <= fb.len() && dst_end <= out.len() {
+            out[dst_start..dst_end].copy_from_slice(&fb[src_start..src_end]);
+        }
+    }
+    out
+}
+
 /// Unit tests that require access to private fields (state, surfaces, frame tracking).
 /// Integration tests exercising the public DVC API are in ironrdp-testsuite-core/tests/egfx/client.rs.
 #[cfg(test)]
@@ -1188,6 +1268,81 @@ mod tests {
         let data = vec![0xAAu8; 1920 * 1088 * 4];
         let cropped = crop_decoded_frame(&data, 1920, 1088, 1920, 1080);
         assert_eq!(cropped.len(), 1920 * 1080 * 4);
+    }
+
+    /// Build a `w`x`h` RGBA framebuffer whose every pixel encodes its own (x, y)
+    /// so a crop can be checked positionally: pixel (x, y) = [x, y, 0, 0xFF].
+    fn coord_framebuffer(w: usize, h: usize) -> Vec<u8> {
+        let mut fb = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                fb[i] = u8::try_from(x).expect("test width < 256");
+                fb[i + 1] = u8::try_from(y).expect("test height < 256");
+                fb[i + 3] = 0xFF;
+            }
+        }
+        fb
+    }
+
+    #[test]
+    fn crop_region_offset_subrect_is_byte_exact() {
+        // Discriminating case (advisor #2): x>0 AND y>0 AND w<W AND h<H, so the
+        // source stride (W) differs from the destination stride (w). A stride or
+        // offset bug shows up here where an origin/full-surface crop would not.
+        let (surface_w, surface_h) = (10usize, 8usize);
+        let fb = coord_framebuffer(surface_w, surface_h);
+        let (x, y, w, h) = (3usize, 2usize, 4usize, 3usize);
+
+        let cropped = crop_region(&fb, surface_w, x, y, w, h);
+
+        assert_eq!(cropped.len(), w * h * 4);
+        for ry in 0..h {
+            for rx in 0..w {
+                let ci = (ry * w + rx) * 4;
+                assert_eq!(cropped[ci], u8::try_from(x + rx).expect("fits u8"), "R at ({rx},{ry})");
+                assert_eq!(cropped[ci + 1], u8::try_from(y + ry).expect("fits u8"), "G at ({rx},{ry})");
+                assert_eq!(cropped[ci + 3], 0xFF);
+            }
+        }
+    }
+
+    #[test]
+    fn crop_region_then_blit_back_matches_full_frame_delivery() {
+        // Invariant gate (advisor #1): cropping a bbox out of a full framebuffer
+        // and blitting it back into a black surface-sized buffer reproduces that
+        // region byte-for-byte (== what a full-frame delivery would show there),
+        // while leaving the rest of the surface untouched.
+        let (surface_w, surface_h) = (12usize, 9usize);
+        let fb = coord_framebuffer(surface_w, surface_h);
+        let (x, y, w, h) = (5usize, 4usize, 4usize, 3usize);
+
+        let region = crop_region(&fb, surface_w, x, y, w, h);
+
+        // Reconstruct app.rs's blit into an opaque-black persistent buffer.
+        let mut dst = vec![0u8; surface_w * surface_h * 4];
+        for px in dst.chunks_exact_mut(4) {
+            px[3] = 0xFF;
+        }
+        for ry in 0..h {
+            let src = ry * w * 4;
+            let d = ((y + ry) * surface_w + x) * 4;
+            dst[d..d + w * 4].copy_from_slice(&region[src..src + w * 4]);
+        }
+
+        for py in 0..surface_h {
+            for px in 0..surface_w {
+                let i = (py * surface_w + px) * 4;
+                let inside = px >= x && px < x + w && py >= y && py < y + h;
+                if inside {
+                    // Region pixels equal the full-frame source exactly.
+                    assert_eq!(&dst[i..i + 4], &fb[i..i + 4], "region pixel ({px},{py})");
+                } else {
+                    // Everything outside the dirty rect stays opaque black.
+                    assert_eq!(&dst[i..i + 4], &[0, 0, 0, 0xFF], "untouched pixel ({px},{py})");
+                }
+            }
+        }
     }
 
     #[test]

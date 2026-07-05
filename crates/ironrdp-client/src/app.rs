@@ -218,6 +218,72 @@ impl App {
 
         recycled
     }
+
+    /// Blit a dirty-rect `region` (`w` x `h`, tightly packed RGBA) at (`x`, `y`)
+    /// into the persistent surface-sized framebuffer.
+    ///
+    /// Unlike [`Self::queue_image_buffer`], this does NOT replace the whole
+    /// framebuffer: unchanged regions of the surface survive between frames.
+    /// The persistent buffer is (re)allocated to `surface_w` x `surface_h`
+    /// (opaque black) whenever the surface size changes. The region is clipped
+    /// to the surface bounds so a malformed server rectangle can never panic or
+    /// write out of bounds.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::non_zero_suggestions,
+        reason = "the parameters mirror the ImageRegion event fields; grouping them into a struct would only relocate the plumbing, and the region size is used as plain usize"
+    )]
+    fn blit_image_region(
+        &mut self,
+        region: &[u8],
+        x: u16,
+        y: u16,
+        w: NonZeroU16,
+        h: NonZeroU16,
+        surface_w: u16,
+        surface_h: u16,
+    ) {
+        let sw = usize::from(surface_w);
+        let sh = usize::from(surface_h);
+        let needed = sw.saturating_mul(sh).saturating_mul(4);
+
+        // Surface size is zero — nothing to present.
+        if needed == 0 {
+            return;
+        }
+
+        if self.buffer.len() != needed || self.buffer_size != (surface_w, surface_h) {
+            // (Re)allocate the persistent framebuffer as opaque black.
+            let mut fb = vec![0u8; needed];
+            for px in fb.chunks_exact_mut(4) {
+                px[3] = 0xFF;
+            }
+            self.buffer = fb;
+            self.buffer_size = (surface_w, surface_h);
+        }
+
+        let x = usize::from(x);
+        let y = usize::from(y);
+        if x >= sw || y >= sh {
+            return;
+        }
+        let region_w = usize::from(w.get());
+        let region_h = usize::from(h.get());
+        let copy_w = region_w.min(sw - x);
+        let copy_h = region_h.min(sh - y);
+
+        for row in 0..copy_h {
+            let src_start = row * region_w * 4;
+            let src_end = src_start + copy_w * 4;
+            let dst_start = ((y + row) * sw + x) * 4;
+            let dst_end = dst_start + copy_w * 4;
+            if src_end <= region.len() && dst_end <= self.buffer.len() {
+                self.buffer[dst_start..dst_end].copy_from_slice(&region[src_start..src_end]);
+            }
+        }
+
+        self.frame_pending_present = true;
+    }
 }
 
 impl ApplicationHandler<RdpOutputEvent> for App {
@@ -576,6 +642,54 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                     self.redraw_requested = true;
                 }
             }
+            RdpOutputEvent::ImageRegion {
+                buffer,
+                x,
+                y,
+                w,
+                h,
+                surface_w,
+                surface_h,
+            } => {
+                trace!(x, y, w = ?w, h = ?h, surface_w, surface_h, "Received image region");
+                self.blit_image_region(&buffer, x, y, w, h, surface_w, surface_h);
+                // Recycle the small region buffer back to the session driver
+                // (harmless: the capacity guard there discards undersized buffers).
+                let _ = self.input_event_sender.send(RdpInputEvent::RecycleFrameBuffer(buffer));
+
+                // Resize the presentation surface if the persistent framebuffer
+                // was (re)allocated to a new size.
+                if self.surface_size != self.buffer_size {
+                    let Some(window_state) = self.window_state.as_mut() else {
+                        return;
+                    };
+                    let (Some(sw), Some(sh)) = (
+                        NonZeroU32::new(u32::from(self.buffer_size.0)),
+                        NonZeroU32::new(u32::from(self.buffer_size.1)),
+                    ) else {
+                        return;
+                    };
+                    if let Err(error) = window_state.presenter.resize(sw, sh) {
+                        error!(%error, "Failed to resize drawing surface");
+                        self.exit_with_code(event_loop, proc_exit::sysexits::TEMP_FAIL);
+                        return;
+                    }
+                    self.surface_size = self.buffer_size;
+                    self.surface_resize_count = self.surface_resize_count.saturating_add(1);
+                    debug!(
+                        surface_resize_count = self.surface_resize_count,
+                        width = self.surface_size.0,
+                        height = self.surface_size.1,
+                        "Resized presentation surface"
+                    );
+                }
+
+                self.draw();
+                if self.frame_pending_present && !self.redraw_requested {
+                    window.request_redraw();
+                    self.redraw_requested = true;
+                }
+            }
             RdpOutputEvent::ConnectionFailure(error) => {
                 let msg = error.report().to_string();
                 error!(?error, "Connection failed");
@@ -815,5 +929,102 @@ mod tests {
             "replacing an already presented frame should not be marked as overwritten"
         );
         assert!(app.frame_pending_present);
+    }
+
+    fn nz(v: u16) -> NonZeroU16 {
+        NonZeroU16::new(v).expect("non-zero")
+    }
+
+    /// Blit an offset dirty-rect into a fresh (black) persistent framebuffer and
+    /// confirm the region lands at (x, y) byte-exactly while the rest stays black.
+    /// Uses x>0, y>0, w<surface_w, h<surface_h so the source/dest strides differ.
+    #[test]
+    fn blit_image_region_places_offset_subrect_and_leaves_rest_black() {
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned()).expect("app");
+
+        let (surface_w, surface_h) = (10u16, 8u16);
+        let (x, y, w, h) = (3u16, 2u16, 4u16, 3u16);
+
+        // Region filled with a recognizable non-black value.
+        let region = vec![0x11u8; usize::from(w) * usize::from(h) * 4];
+        app.blit_image_region(&region, x, y, nz(w), nz(h), surface_w, surface_h);
+
+        assert_eq!(app.buffer_size, (surface_w, surface_h));
+        assert_eq!(app.buffer.len(), usize::from(surface_w) * usize::from(surface_h) * 4);
+        assert!(app.frame_pending_present);
+
+        for py in 0..surface_h {
+            for px in 0..surface_w {
+                let i = (usize::from(py) * usize::from(surface_w) + usize::from(px)) * 4;
+                let inside = px >= x && px < x + w && py >= y && py < y + h;
+                if inside {
+                    assert_eq!(&app.buffer[i..i + 4], &[0x11, 0x11, 0x11, 0x11], "region ({px},{py})");
+                } else {
+                    assert_eq!(&app.buffer[i..i + 4], &[0, 0, 0, 0xFF], "black ({px},{py})");
+                }
+            }
+        }
+    }
+
+    /// A malformed region extending past the surface bounds must be clipped, not
+    /// panic or write out of bounds.
+    #[test]
+    fn blit_image_region_clips_out_of_bounds_region() {
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned()).expect("app");
+
+        let (surface_w, surface_h) = (8u16, 8u16);
+        // Region starts near the edge and claims more width/height than remains.
+        let (x, y, w, h) = (6u16, 6u16, 5u16, 5u16);
+        let region = vec![0x22u8; usize::from(w) * usize::from(h) * 4];
+
+        // Must not panic.
+        app.blit_image_region(&region, x, y, nz(w), nz(h), surface_w, surface_h);
+
+        // Only the in-bounds 2x2 corner got written.
+        for py in 0..surface_h {
+            for px in 0..surface_w {
+                let i = (usize::from(py) * usize::from(surface_w) + usize::from(px)) * 4;
+                let inside = px >= x && py >= y; // clipped to surface edge
+                if inside {
+                    assert_eq!(&app.buffer[i..i + 4], &[0x22, 0x22, 0x22, 0x22], "corner ({px},{py})");
+                } else {
+                    assert_eq!(&app.buffer[i..i + 4], &[0, 0, 0, 0xFF], "black ({px},{py})");
+                }
+            }
+        }
+    }
+
+    /// A dirty-rect blitted on top of an existing full frame updates only the
+    /// region; unchanged pixels of the surface survive (the core dirty-rect win).
+    #[test]
+    fn blit_image_region_preserves_unchanged_pixels_of_prior_frame() {
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned()).expect("app");
+
+        let (surface_w, surface_h) = (6u16, 6u16);
+        // Seed a full frame (as the Image path would) filled with 0x55.
+        app.queue_image_buffer(
+            vec![0x55u8; usize::from(surface_w) * usize::from(surface_h) * 4],
+            nz(surface_w),
+            nz(surface_h),
+        );
+
+        let (x, y, w, h) = (1u16, 1u16, 2u16, 2u16);
+        let region = vec![0x99u8; usize::from(w) * usize::from(h) * 4];
+        app.blit_image_region(&region, x, y, nz(w), nz(h), surface_w, surface_h);
+
+        for py in 0..surface_h {
+            for px in 0..surface_w {
+                let i = (usize::from(py) * usize::from(surface_w) + usize::from(px)) * 4;
+                let inside = px >= x && px < x + w && py >= y && py < y + h;
+                let expected = if inside { 0x99 } else { 0x55 };
+                assert!(
+                    app.buffer[i..i + 4].iter().all(|&b| b == expected),
+                    "pixel ({px},{py}) expected {expected:#x}"
+                );
+            }
+        }
     }
 }
