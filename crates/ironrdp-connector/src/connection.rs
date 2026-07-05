@@ -565,17 +565,29 @@ impl Sequence for ClientConnector {
                         connect_time_autodetect::ConnectTimePdu::Other => {
                             // Auto-detection is over; this PDU is the first Licensing PDU.
                             // Feed it forward: LicenseExchangeSequence::step decodes the
-                            // Send Data Indication from `input` directly.
+                            // Send Data Indication from `input` directly. Because we have
+                            // already consumed and stepped this PDU here, mirror the
+                            // LicensingExchange state's own completion check so a licensing
+                            // exchange that finishes in a single PDU (the common case)
+                            // advances instead of being stepped a second time (which would
+                            // fail with "license already exchanged").
                             let mut license_exchange = new_license_exchange();
                             let written = license_exchange.step(input, output)?;
-                            (
-                                written,
+
+                            let next_state = if license_exchange.state.is_terminal() {
+                                ClientConnectorState::MultitransportBootstrapping {
+                                    io_channel_id,
+                                    user_channel_id,
+                                }
+                            } else {
                                 ClientConnectorState::LicensingExchange {
                                     io_channel_id,
                                     user_channel_id,
                                     license_exchange,
-                                },
-                            )
+                                }
+                            };
+
+                            (written, next_state)
                         }
                     }
                 }
