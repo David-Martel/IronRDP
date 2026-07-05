@@ -334,6 +334,24 @@ separately):
   DVC accessors (#1368/#1358, breaking dvc changes), agent resize (#1401, ironrdp-agent
   crate not present in fork).
 
+47. Full workspace clippy gate is now GREEN (2026-07-05, chore/tech worktree,
+commit `9f1966c3`). `cargo clippy --workspace --all-targets --features
+helper,__bench -- -D warnings` → "No issues found". The pre-existing red items
+(item 46 noted the gate was red on unrelated crates) are all resolved WITHOUT
+behavior changes: ironrdp-pdu ARC packet-size `expect` → infallible u32 wire
+literal; ironrdp-session x224 collapsible_if; ironrdp-client app.rs
+string_add/non_ascii, config.rs undocumented-unsafe + as_conversions (via
+`ptr::addr()` + `try_from`); ironrdp-gateway std→core, `from_str`→`from_toml_str`,
+merged inherent impls, `#[expect]` accept loop, tests' unused-dep/panic/anon-trait;
+ironrdp-testsuite-extra NonZeroUsize; ironrdp-rdpeusb unused import. Two LATENT
+COMPILE errors in the `ffi` crate (it had drifted behind the connector/session
+API) were also fixed: added `enable_graphics_pipeline: false` to the FFI connector
+Config builder and a `Redirect` arm to the FFI `ActiveStageOutputType` mapping.
+NOTE: the new `Redirect` variant on the diplomat `ActiveStageOutputType` enum may
+require .NET binding regeneration downstream (additive; out of the Rust gates).
+Gates: clippy clean; `cargo test --workspace` 1370 passed/3 ignored;
+`cargo build --release -p ironrdp-client` OK.
+
 ## GRD render RESOLVED — root cause was a build-feature footgun, NOT a capability rejection (2026-07-04, later pass)
 
 **The "ERRINFO_BAD_CAPABILITIES / Confirm Active capability rejection" framing was
@@ -947,6 +965,43 @@ flag, which the connector does not advertise (`connection.rs`
     GRD audio needs the deeper handover-reactivation blocker above resolved first.
 - Audio playback itself remains unconfirmable headlessly (no output device to
   hear).
+- HANDOVER-RECONNECT HYPOTHESIS DISPROVEN (2026-07-05, chore/tech worktree). The
+  "advertise autodetect on the INITIAL connect only, not the redirect/handover
+  reconnect" hypothesis was implemented (suppress `network_autodetect` on the
+  `RdpControlFlow::Redirect` arm in `rdp.rs`) and live-validated against asuspro13
+  — then REVERTED (commit `b1bc5f00` reverts `1a1f2d04`) because the premise is
+  false for this server:
+  - asuspro13's GRD handover is an IN-SESSION deactivation-reactivation, NOT a
+    Server Redirection PDU redirect. Proven with `ironrdp_connector=trace`: no
+    `RdpControlFlow::Redirect` fires; the log shows only "Received Server Deactivate
+    All" → `handle_deactivation_reactivation`. `ConnectionActivationSequence` starts
+    at `CapabilitiesExchange` and re-sends Demand/Confirm Active ONLY — it never
+    re-emits the GCC `ClientCoreData` early-capability flags. So
+    `SUPPORT_NET_CHAR_AUTODETECT` is advertised exactly ONCE (initial GCC); there is
+    no reconnect advertisement to suppress, and the suppression point is never
+    reached on this handover. Teardown persisted unchanged with the fix in place.
+  - A/B, fresh GRD restart per run (system + `--user` unit), `--egfx`:
+    - WITH `--network-autodetect`: client "received disconnect provider ultimatum:
+      UserRequested" during the reactivation, 0 frames rendered. GRD system journal:
+      "[DaemonSystem] RDP client disconnected during the handover" +
+      "[DaemonSystem] Aborting handover, removing remote client".
+    - WITHOUT: "First frame presented to the window width=1920 height=1080" + EGFX
+      frames flowing (frame_id=2+), session held the full 22 s. GRD journal:
+      "[RDP] Client does not support autodetecting network characteristics.
+      Disabling audio output redirection".
+  - CONCLUSION: on asuspro13 connect-time autodetect and the handover are mutually
+    exclusive — advertising it at the initial GCC makes the server ABORT the
+    handover (no session at all), so audio cannot be had that way; not advertising
+    it gives a session but no audio. The teardown is a server-side handover abort
+    keyed on the single initial advertisement, not on any re-advertisement. Item
+    status: ADVANCED (root-caused) / DEFERRED (not fixed). Banked no-autodetect GRD
+    render confirmed intact (regression check).
+  - REMAINING LEAD (not chased this session): "tolerate-only channel-0 also tears
+    down" does NOT rule out ANSWERING in-session autodetect on the MCS *message
+    channel* (the client currently replies on the I/O channel because it never
+    joined a message channel). Tolerate-only != reply-on-correct-channel. Next
+    step: join the message channel to reply, and instrument GRD's user-session
+    FreeRDP instance (`WLOG_LEVEL=TRACE`) to see what it expects post-handover.
 
 3. dtm-work (standard Windows RDP) baseline: WORKS. NLA/HYBRID_EX via Credential
 Manager, connect + first frame presented 1920x1080, session held. The `-d
