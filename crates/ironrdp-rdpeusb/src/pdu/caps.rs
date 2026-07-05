@@ -5,8 +5,6 @@
 //!
 //! [MS-RDPEUSB § 2.2.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeusb/6aee4e70-9d3b-49d7-a9b9-3c437cb27c8e
 
-use alloc::borrow::ToOwned as _;
-
 use ironrdp_core::{
     DecodeError, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size,
     unsupported_value_err,

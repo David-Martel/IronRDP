@@ -14,6 +14,10 @@ const LOGON_EX_PADDING_BUFFER: [u8; LOGON_EX_PADDING_SIZE] = [0; LOGON_EX_PADDIN
 const LOGON_INFO_FIELD_DATA_SIZE: usize = 4;
 const AUTO_RECONNECT_VERSION_1: u32 = 0x0000_0001;
 const AUTO_RECONNECT_PACKET_SIZE: usize = 28;
+/// Same value as [`AUTO_RECONNECT_PACKET_SIZE`] (28), typed as the `u32` written on
+/// the wire. Declared as its own literal (rather than a fallible `u32::try_from`) so
+/// the wire encode/decode paths are infallible. Both constants MUST stay equal to 28.
+const AUTO_RECONNECT_PACKET_SIZE_U32: u32 = 28;
 const AUTO_RECONNECT_RANDOM_BITS_SIZE: usize = 16;
 const LOGON_ERRORS_INFO_SIZE: usize = 8;
 
@@ -112,8 +116,8 @@ impl Encode for ServerAutoReconnect {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_fixed_part_size!(in: dst);
 
-        dst.write_u32(u32::try_from(AUTO_RECONNECT_PACKET_SIZE).expect("AUTO_RECONNECT_PACKET_SIZE fits into u32"));
-        dst.write_u32(u32::try_from(AUTO_RECONNECT_PACKET_SIZE).expect("AUTO_RECONNECT_PACKET_SIZE fits into u32"));
+        dst.write_u32(AUTO_RECONNECT_PACKET_SIZE_U32);
+        dst.write_u32(AUTO_RECONNECT_PACKET_SIZE_U32);
         dst.write_u32(AUTO_RECONNECT_VERSION_1);
         dst.write_u32(self.logon_id);
         dst.write_slice(self.random_bits.as_ref());
@@ -136,8 +140,7 @@ impl<'de> Decode<'de> for ServerAutoReconnect {
 
         let _data_length = src.read_u32();
         let packet_length = src.read_u32();
-        if packet_length != u32::try_from(AUTO_RECONNECT_PACKET_SIZE).expect("AUTO_RECONNECT_PACKET_SIZE fits into u32")
-        {
+        if packet_length != AUTO_RECONNECT_PACKET_SIZE_U32 {
             return Err(invalid_field_err!("packetLen", "invalid auto-reconnect packet size"));
         }
 
@@ -224,8 +227,7 @@ impl ClientAutoReconnect {
     /// little-endian) for the Client Info PDU's auto-reconnect cookie field.
     pub fn to_bytes(&self) -> [u8; CLIENT_AUTO_RECONNECT_COOKIE_SIZE] {
         let mut out = [0u8; CLIENT_AUTO_RECONNECT_COOKIE_SIZE];
-        let packet_size = u32::try_from(AUTO_RECONNECT_PACKET_SIZE).expect("AUTO_RECONNECT_PACKET_SIZE fits into u32");
-        out[0..4].copy_from_slice(&packet_size.to_le_bytes());
+        out[0..4].copy_from_slice(&AUTO_RECONNECT_PACKET_SIZE_U32.to_le_bytes());
         out[4..8].copy_from_slice(&AUTO_RECONNECT_VERSION_1.to_le_bytes());
         out[8..12].copy_from_slice(&self.logon_id.to_le_bytes());
         out[12..28].copy_from_slice(&self.security_verifier);

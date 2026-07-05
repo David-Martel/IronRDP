@@ -33,7 +33,7 @@ impl GatewaySession {
 
     /// Elapsed time since the session was established.
     #[must_use]
-    pub fn elapsed(&self) -> std::time::Duration {
+    pub fn elapsed(&self) -> core::time::Duration {
         self.started_at.elapsed()
     }
 }

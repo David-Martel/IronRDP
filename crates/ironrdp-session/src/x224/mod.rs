@@ -214,11 +214,11 @@ impl Processor {
                         // the client auto-reconnect cookie on a reconnect attempt
                         // ([MS-RDPBCGR] 2.2.4). Output is unchanged, so this is behaviourally
                         // transparent to callers that do not opt into auto-reconnect.
-                        if let InfoData::LogonExtended(extended) = &session_info.info_data {
-                            if let Some(auto_reconnect) = &extended.auto_reconnect {
-                                debug!(logon_id = auto_reconnect.logon_id, "Captured server auto-reconnect cookie");
-                                self.reconnect_cookie = Some(auto_reconnect.clone());
-                            }
+                        if let InfoData::LogonExtended(extended) = &session_info.info_data
+                            && let Some(auto_reconnect) = &extended.auto_reconnect
+                        {
+                            debug!(logon_id = auto_reconnect.logon_id, "Captured server auto-reconnect cookie");
+                            self.reconnect_cookie = Some(auto_reconnect.clone());
                         }
                         Ok(Vec::new())
                     }

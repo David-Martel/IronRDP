@@ -186,12 +186,16 @@ fn parse_hex(input: &str) -> Result<u32, ParseIntError> {
 fn detect_keyboard_layout() -> u32 {
     #[cfg(windows)]
     {
-        // SAFETY: GetKeyboardLayout(0) queries the layout of the calling thread.
-        // It always returns a valid HKL (null means no layout, treated as 0 here).
-        // The low 16 bits of the pointer-sized HKL value are the language identifier.
         use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+        // SAFETY: `GetKeyboardLayout(0)` queries the keyboard layout of the calling
+        // thread. It has no preconditions and always returns a valid `HKL` handle
+        // (a null handle simply means "no layout", which the mask below reduces to 0).
         let hkl = unsafe { GetKeyboardLayout(0) };
-        (hkl.0 as usize as u32) & 0xFFFF
+        // The low 16 bits of the pointer-sized `HKL` are the language identifier that
+        // RDP uses as the keyboard layout code. Read the pointer's address without a
+        // lossy `as` cast, mask to 16 bits (so the value always fits in `u32`), then
+        // convert infallibly.
+        u32::try_from(hkl.0.addr() & 0xFFFF).unwrap_or(0)
     }
     #[cfg(not(windows))]
     {
