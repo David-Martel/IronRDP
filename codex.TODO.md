@@ -653,6 +653,23 @@ The follow-up designs below are retained for reference; the two banked wins
       CredSSP retry on `InvalidToken` during the handover reconnect ONLY (do not
       touch the initial-connect CredSSP path, which is the dtm-work banked win), and
       confirm against a freshly-restarted GRD where the handover SAM is warm.
+      SCOPE SHARPENED (2026-07-05, chore/tech worktree, informed by the audio-on-
+      handover investigation above): "the handover reconnect" that re-runs CredSSP is
+      the **ServerRedirectionPdu redirect** path, i.e. the `connect()` /
+      `connect_ws()` call in `RdpClient::run`'s loop taken AFTER a
+      `RdpControlFlow::Redirect` set `request_data` (a full new connection → full new
+      CredSSP handshake). The asuspro13 GRD handover observed in these runs is instead
+      an IN-SESSION deactivation-reactivation, which re-sends only Demand/Confirm
+      Active and NEVER re-runs CredSSP — so it is NOT a target for this retry. Bounded
+      design: thread a "this is a redirect reconnect" signal (e.g. `redirect_count > 0`
+      captured before the loop's `connect()`) so a small (1-2 attempt, short-backoff)
+      retry wraps ONLY the CredSSP sequence of a redirect reconnect; the initial
+      connect and the resize/ARC reconnects keep today's no-retry behavior verbatim.
+      NOT IMPLEMENTED here: the redirect-reconnect CredSSP path does not fire against
+      asuspro13's (reactivation-style) handover, so the change would be unvalidatable
+      live in this environment and could only regress — deferred until a genuine
+      ServerRedirectionPdu redirect peer (or a warm-SAM GRD that redirects) is
+      available to validate against.
 
 ## Upstream import re-scan for the deferred gaps (2026-07-05)
 
