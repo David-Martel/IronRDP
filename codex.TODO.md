@@ -462,8 +462,9 @@ dtm-work classic RDP and asuspro13 GRD AVC420 render):
   peer for validation.
 
 - Reconnect-into-existing-session + CredSSP InvalidToken handover [prior gap 5].
-  Status: DEFERRED (feature-sized; auth/reconnect only — does NOT touch the render
-  path, so lowest regression risk of the deferred items). Two distinct pieces:
+  Status: (a) RDP auto-reconnect (ARC) — **IMPLEMENTED** 2026-07-04 (branch
+  `gap/arc-reconnect`, off 60bee85a), see "ARC auto-reconnect IMPLEMENTED" section
+  below. (b) CredSSP InvalidToken retry — still DEFERRED. Two distinct pieces:
   (a) Reconnect-into-existing-session is NOT the same as the GRD handover redirect
       (that one — reconnect carrying LoadBalanceInfo + LB_USERNAME/LB_PASSWORD as an
       X.224 routing token — is already RESOLVED, see Track B item 0). This is RDP
@@ -514,7 +515,9 @@ so there is nothing to cherry-pick for them.** Primary-source evidence:
   the banked GRD render; it must stay behind the opt-in `--avc444` flag if ever
   built. Design in the AVC444 bullet above still stands.
 
-- ARC auto-reconnect cookie: **no upstream source exists.**
+- ARC auto-reconnect cookie: **no upstream source exists → IMPLEMENTED from
+  scratch 2026-07-04** (branch `gap/arc-reconnect`; see the dedicated
+  "ARC auto-reconnect IMPLEMENTED" section below for the full write-up).
   `upstream/master crates/ironrdp-client/src/rdp.rs:774` is a bare
   `// TODO(#271): use the "auto-reconnect cookie"`. Both fork and upstream have the
   PDU infrastructure (`client_info.rs` `reconnect_cookie: Option<[u8;28]>` +
@@ -601,6 +604,71 @@ Intentionally SKIPPED (high-value but out-of-scope/entangled/unverifiable):
 - #1305 (91ea46bd, RawCapabilitySet split): already dispositioned as deferred in
   item 46 (392-line breaking rework of the fork's most-diverged egfx file; client
   benefit already delivered by the #1298 adaptation). Still SKIPPED.
+
+## ARC auto-reconnect IMPLEMENTED (2026-07-04, branch `gap/arc-reconnect` off 60bee85a)
+
+Closes the importable half of gap 5(a). RDP Auto-Reconnect per [MS-RDPBCGR] 2.2.4
+/ 5.5, opt-in behind `--auto-reconnect` (default OFF → default connect + drop
+paths byte-identical). Capture and use are wired together (no dead plumbing).
+
+**1. Capture (ARC_SC_PRIVATE_PACKET).** The Save Session Info PDU is no longer
+just logged+dropped: `x224::Processor` (`crates/ironrdp-session/src/x224/mod.rs`)
+now stores `Option<ServerAutoReconnect>`; the `SaveSessionInfo` handler pulls
+`InfoData::LogonExtended -> auto_reconnect` and caches it. `process_io_channel`
+became `&mut self`; output is unchanged (`Ok(Vec::new())`), so the session layer
+stays flag-agnostic and behaviourally transparent. `ActiveStage::reconnect_cookie()`
+exposes it. `run_active_session` (`session_driver.rs`) takes a
+`&mut Option<ServerAutoReconnect>` out-param and syncs the captured cookie right
+after each `process_server_frame` **before** propagating a processing error, so a
+later unexpected drop can still use a cookie captured earlier this session.
+
+**2. Derivation (ARC_CS_PRIVATE_PACKET).** New in
+`crates/ironrdp-pdu/src/rdp/session_info/logon_extended.rs`: `ClientAutoReconnect
+{ logon_id, security_verifier }` with `from_server(server, client_random)` →
+`SecurityVerifier = HMAC-MD5(ArcRandomBits, ClientRandom)` (the crypto derivation,
+NOT a copy of `random_bits`). `to_bytes()` serializes the 28-byte packet
+cbLen(4)=28 / Version(4)=1 / LogonId(4) / SecurityVerifier(16), all LE.
+HMAC-MD5 is implemented directly over the crate's existing `md-5 0.10` primitive
+(RFC 2104; 64-byte block, ipad/opad) — deliberately NOT the `hmac` crate, whose
+lock version (0.13-rc, digest 0.11) mismatches pdu's `md-5 0.10`/digest 0.10 and
+would churn Cargo.lock.
+
+**Spec ambiguity resolved (the crux fact):** under Enhanced RDP Security
+(TLS/CredSSP/NLA — the dtm-work path) `ClientRandom` is 32 **zero** bytes per
+[MS-RDPBCGR] 5.5; the real client random is only fed to the verifier under
+Standard RDP Security (`PROTOCOL_RDP`). This matches FreeRDP's
+`rdp_compute_client_auto_reconnect_cookie` (zero-inits the buffer; copies real
+bytes only when `SelectedProtocol == PROTOCOL_RDP`). Exposed as
+`ENHANCED_SECURITY_CLIENT_RANDOM` + `from_server_enhanced_security()`. Structured
+as a parameter, not an assertion, so a wrong assumption would be a one-line fix
+and the KAT still tests pure HMAC. NOTE: only validated by unit tests — a live
+Standard-Security peer was not exercised, so the non-zero-client-random branch is
+correct-by-construction but unproven on the wire.
+
+**3. Use / gating.** `connector::Config` gains `reconnect_cookie: Option<[u8;28]>`
+(default None → `create_client_info_pdu` builder is byte-identical; typestate
+builder handled via a `match` so both arms `.build()`). Client `Config` gains
+`auto_reconnect: bool` from `--auto-reconnect`. `RdpClient::run` (`rdp.rs`): on an
+unexpected `Err(_)` drop, if `auto_reconnect && arc_cookie.is_some() && attempts <
+MAX_AUTO_RECONNECTS(20)`, it derives the client cookie, sets
+`connector.reconnect_cookie`, and reconnects; the cookie is one-shot (cleared
+right after `connect()` consumes it into the info PDU). The budget resets whenever
+a session reaches full logon (captures a cookie), so genuine long-lived sessions
+aren't starved. Guard is naturally safe for the documented dtm-work post-auth WSA
+10054: that drop happens before SaveSessionInfo, so no cookie is captured → no
+auto-reconnect loop; and resize/redirect (banked GRD handover) paths are untouched.
+
+**Tests / gates:** 6 new unit tests in `logon_extended.rs::arc_tests` — HMAC-MD5
+against RFC 2202 vectors 1 & 2 (independent KATs), ARC verifier KAT (random_bits
+1..16 + zero client-random → `894025a9…261c`, computed independently in Python),
+a not-a-copy-of-random-bits regression guard, and the 28-byte wire-layout check.
+ARC_SC parse/encode was already covered by the existing `session_info/tests.rs`
+`LOGON_EXTENDED` fixtures. Gates: see report at end / commit message.
+
+Deferred still: gap 5(b) CredSSP `InvalidToken` handover retry (server-side/env
+race, unreproducible on demand). Live ARC round-trip validation (needs a
+reproducible ARC-issuing unexpected drop; GRD's redirect is a different, already-
+resolved mechanism) is a later dedicated phase — unit tests + build are the bar here.
 
 ## Live smoke-test findings (2026-07-04, Windows -> asuspro13 GRD 46.3 + dtm-work)
 

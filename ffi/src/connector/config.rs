@@ -215,6 +215,7 @@ pub mod ffi {
                 hardware_id: None,
                 license_cache: None,
                 network_autodetect: false,
+                reconnect_cookie: None,
                 timezone_info: self.timezone_info.clone().unwrap_or_default(),
                 alternate_shell: String::new(),
                 work_dir: String::new(),

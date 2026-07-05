@@ -24,6 +24,7 @@ use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::rdp::multitransport::MultitransportResponsePdu;
+use ironrdp::pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{self, ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult};
 use ironrdp_core::WriteBuf;
@@ -573,6 +574,7 @@ pub(crate) async fn run_active_session<S>(
     connection_result: ConnectionResult,
     event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
     input_event_receiver: &mut mpsc::UnboundedReceiver<RdpInputEvent>,
+    reconnect_cookie: &mut Option<ServerAutoReconnect>,
 ) -> SessionResult<RdpControlFlow>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
@@ -594,7 +596,14 @@ where
             frame = reader.read_pdu() => {
                 let (action, payload) = frame.map_err(|e| session::custom_err!("read frame", e))?;
                 trace!(?action, frame_length = payload.len(), "Frame received");
-                SessionDriverFlow::Outputs(driver.process_server_frame(action, &payload)?)
+                let outputs = driver.process_server_frame(action, &payload);
+                // Sync any server auto-reconnect cookie captured while processing this
+                // frame *before* propagating a processing error, so a later unexpected
+                // drop can still reconnect using a cookie captured earlier this session.
+                if let Some(cookie) = driver.active_stage.reconnect_cookie() {
+                    *reconnect_cookie = Some(cookie.clone());
+                }
+                SessionDriverFlow::Outputs(outputs?)
             }
             input_event = input_event_receiver.recv() => {
                 let input_event = match input_event {

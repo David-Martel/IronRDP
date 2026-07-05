@@ -153,6 +153,128 @@ impl<'de> Decode<'de> for ServerAutoReconnect {
     }
 }
 
+/// Size in bytes of the serialized client auto-reconnect cookie
+/// (`ARC_CS_PRIVATE_PACKET`): cbLen(4) + Version(4) + LogonId(4) +
+/// SecurityVerifier(16).
+pub const CLIENT_AUTO_RECONNECT_COOKIE_SIZE: usize = 28;
+
+/// The 32-byte ClientRandom value used to derive the auto-reconnect security
+/// verifier under Enhanced RDP Security (TLS / CredSSP / NLA).
+///
+/// Per [MS-RDPBCGR] 5.5 (Automatic Reconnection), the real client random is only
+/// fed into the verifier under **Standard RDP Security** (`PROTOCOL_RDP`), where a
+/// client random is exchanged during the security-exchange phase. Under Enhanced
+/// RDP Security (TLS/CredSSP/NLA) no client random is exchanged, so the value used
+/// for the HMAC is a 32-byte array of zeros. (FreeRDP-based clients follow the same
+/// rule: the client-random buffer is zero-initialised and only populated with real
+/// bytes when the selected protocol is Standard RDP Security.)
+///
+/// NOTE: only the zero-client-random (Enhanced Security) path is exercised by the
+/// unit tests and against real servers here; the Standard-Security branch is
+/// correct-by-construction (`from_server` takes the client random as a parameter)
+/// but unproven on the wire.
+///
+/// [MS-RDPBCGR] 5.5: <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/>
+pub const ENHANCED_SECURITY_CLIENT_RANDOM: [u8; 32] = [0; 32];
+
+/// Client Auto-Reconnect Packet (`ARC_CS_PRIVATE_PACKET`).
+///
+/// Sent by the client in the `autoReconnectCookie` field of the extended Client
+/// Info PDU on a reconnect attempt so the server can re-attach the existing
+/// session instead of starting a new one.
+///
+/// The [`security_verifier`](Self::security_verifier) is a cryptographic
+/// derivation from the server-issued [`ServerAutoReconnect`] cookie — **not** a
+/// copy of its random bits:
+///
+/// `SecurityVerifier = HMAC-MD5(ArcRandomBits, ClientRandom)`
+///
+/// See [MS-RDPBCGR] 2.2.4.4 (packet layout) and 5.5 (derivation).
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/1cf7bcc4-f6d1-4924-a37c-7c9975ba9f47
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientAutoReconnect {
+    pub logon_id: u32,
+    pub security_verifier: [u8; AUTO_RECONNECT_RANDOM_BITS_SIZE],
+}
+
+impl ClientAutoReconnect {
+    /// Derives the client auto-reconnect packet from the server's cookie.
+    ///
+    /// `client_random` is the negotiated client random. Under Enhanced Security
+    /// (TLS/CredSSP/NLA) this is [`ENHANCED_SECURITY_CLIENT_RANDOM`] (32 zero
+    /// bytes); prefer [`from_server_enhanced_security`](Self::from_server_enhanced_security)
+    /// for that common case.
+    pub fn from_server(server: &ServerAutoReconnect, client_random: &[u8]) -> Self {
+        Self {
+            logon_id: server.logon_id,
+            security_verifier: hmac_md5(&server.random_bits, client_random),
+        }
+    }
+
+    /// Derives the packet for an Enhanced-Security (TLS/CredSSP/NLA) connection,
+    /// where the client random is 32 zero bytes per [MS-RDPBCGR] 5.5.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/1d263f84-6153-4a16-b329-8770be364e1b
+    pub fn from_server_enhanced_security(server: &ServerAutoReconnect) -> Self {
+        Self::from_server(server, &ENHANCED_SECURITY_CLIENT_RANDOM)
+    }
+
+    /// Serializes to the 28-byte `ARC_CS_PRIVATE_PACKET` wire form (all fields
+    /// little-endian) for the Client Info PDU's auto-reconnect cookie field.
+    pub fn to_bytes(&self) -> [u8; CLIENT_AUTO_RECONNECT_COOKIE_SIZE] {
+        let mut out = [0u8; CLIENT_AUTO_RECONNECT_COOKIE_SIZE];
+        let packet_size = u32::try_from(AUTO_RECONNECT_PACKET_SIZE).expect("AUTO_RECONNECT_PACKET_SIZE fits into u32");
+        out[0..4].copy_from_slice(&packet_size.to_le_bytes());
+        out[4..8].copy_from_slice(&AUTO_RECONNECT_VERSION_1.to_le_bytes());
+        out[8..12].copy_from_slice(&self.logon_id.to_le_bytes());
+        out[12..28].copy_from_slice(&self.security_verifier);
+        out
+    }
+}
+
+/// Computes `HMAC-MD5(key, msg)` (RFC 2104) using MD5 as the underlying hash.
+///
+/// Implemented directly over the `md-5` primitive already vendored by this crate
+/// to avoid pulling in a mismatched `hmac`/`digest` version. MD5 has a 64-byte
+/// block; auto-reconnect keys are 16 bytes so the `key.len() > BLOCK` branch is
+/// never taken in practice, but it is kept for correctness.
+fn hmac_md5(key: &[u8], msg: &[u8]) -> [u8; 16] {
+    use md5::{Digest as _, Md5};
+
+    const BLOCK: usize = 64;
+
+    let mut block_key = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let mut hasher = Md5::new();
+        hasher.update(key);
+        let digest = hasher.finalize();
+        block_key[..digest.len()].copy_from_slice(&digest);
+    } else {
+        block_key[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for ((ip, op), kb) in ipad.iter_mut().zip(opad.iter_mut()).zip(block_key.iter()) {
+        *ip ^= *kb;
+        *op ^= *kb;
+    }
+
+    let mut inner = Md5::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Md5::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+
+    let mut result = [0u8; 16];
+    result.copy_from_slice(&outer.finalize());
+    result
+}
+
 /// TS_LOGON_ERRORS_INFO
 ///
 /// [Doc](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/845eb789-6edf-453a-8b0e-c976823d1f72)
@@ -269,5 +391,83 @@ impl LogonErrorNotificationData {
             LogonErrorNotificationData::ErrorCode(code) => code.as_u32(),
             LogonErrorNotificationData::SessionId(id) => *id,
         }
+    }
+}
+
+#[cfg(test)]
+mod arc_tests {
+    use super::*;
+
+    /// RFC 2202 HMAC-MD5 test case 1 (independent known-answer vector):
+    /// key = 0x0b × 16, data = "Hi There" → 0x9294727a3638bb1c13f48ef8158bfc9d.
+    #[test]
+    fn hmac_md5_matches_rfc2202_vector_1() {
+        let key = [0x0bu8; 16];
+        let data = b"Hi There";
+        let expected = [
+            0x92, 0x94, 0x72, 0x7a, 0x36, 0x38, 0xbb, 0x1c, 0x13, 0xf4, 0x8e, 0xf8, 0x15, 0x8b, 0xfc, 0x9d,
+        ];
+        assert_eq!(hmac_md5(&key, data), expected);
+    }
+
+    /// RFC 2202 HMAC-MD5 test case 2 (short key, non-block-aligned):
+    /// key = "Jefe", data = "what do ya want for nothing?"
+    /// → 0x750c783e6ab0b503eaa86e310a5db738.
+    #[test]
+    fn hmac_md5_matches_rfc2202_vector_2() {
+        let expected = [
+            0x75, 0x0c, 0x78, 0x3e, 0x6a, 0xb0, 0xb5, 0x03, 0xea, 0xa8, 0x6e, 0x31, 0x0a, 0x5d, 0xb7, 0x38,
+        ];
+        assert_eq!(hmac_md5(b"Jefe", b"what do ya want for nothing?"), expected);
+    }
+
+    /// Known-answer test for the client auto-reconnect derivation under Enhanced
+    /// Security. The expected verifier was computed independently:
+    /// `python -c "import hmac,hashlib; print(hmac.new(bytes(range(1,17)), bytes(32), hashlib.md5).hexdigest())"`
+    /// → 894025a99d64ab966419ec1ef13c261c.
+    #[test]
+    fn client_auto_reconnect_verifier_known_answer() {
+        let server = ServerAutoReconnect {
+            logon_id: 0x0201,
+            random_bits: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        };
+        let expected_verifier = [
+            0x89, 0x40, 0x25, 0xa9, 0x9d, 0x64, 0xab, 0x96, 0x64, 0x19, 0xec, 0x1e, 0xf1, 0x3c, 0x26, 0x1c,
+        ];
+
+        let client = ClientAutoReconnect::from_server_enhanced_security(&server);
+        assert_eq!(client.logon_id, 0x0201);
+        assert_eq!(client.security_verifier, expected_verifier);
+    }
+
+    /// The derivation must NOT be a copy of the server random bits (regression
+    /// guard against the naive `reconnect_cookie = random_bits` mistake).
+    #[test]
+    fn client_verifier_is_not_a_copy_of_random_bits() {
+        let random_bits = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let server = ServerAutoReconnect {
+            logon_id: 7,
+            random_bits,
+        };
+        let client = ClientAutoReconnect::from_server_enhanced_security(&server);
+        assert_ne!(client.security_verifier, random_bits);
+    }
+
+    /// The 28-byte `ARC_CS_PRIVATE_PACKET` wire layout: cbLen(4)=28, Version(4)=1,
+    /// LogonId(4), SecurityVerifier(16), all little-endian.
+    #[test]
+    fn client_auto_reconnect_wire_layout() {
+        let server = ServerAutoReconnect {
+            logon_id: 0x0403_0201,
+            random_bits: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        };
+        let client = ClientAutoReconnect::from_server_enhanced_security(&server);
+        let bytes = client.to_bytes();
+
+        assert_eq!(bytes.len(), CLIENT_AUTO_RECONNECT_COOKIE_SIZE);
+        assert_eq!(&bytes[0..4], &[0x1c, 0x00, 0x00, 0x00]); // cbLen = 28
+        assert_eq!(&bytes[4..8], &[0x01, 0x00, 0x00, 0x00]); // Version = 1
+        assert_eq!(&bytes[8..12], &[0x01, 0x02, 0x03, 0x04]); // LogonId (LE)
+        assert_eq!(&bytes[12..28], &client.security_verifier);
     }
 }

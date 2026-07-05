@@ -921,11 +921,20 @@ fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::Cli
             },
             address: client_addr.ip().to_string(),
             dir: config.client_dir.clone(),
-            optional_data: ExtendedClientOptionalInfo::builder()
-                .timezone(config.timezone_info.clone())
-                .session_id(0)
-                .performance_flags(config.performance_flags)
-                .build(),
+            optional_data: {
+                // The builder is a compile-time typestate machine, so the two
+                // arms below are different builder types; both terminate in
+                // `.build()` yielding `ExtendedClientOptionalInfo`. The `None`
+                // arm is byte-identical to the historical connect path.
+                let builder = ExtendedClientOptionalInfo::builder()
+                    .timezone(config.timezone_info.clone())
+                    .session_id(0)
+                    .performance_flags(config.performance_flags);
+                match config.reconnect_cookie {
+                    Some(cookie) => builder.reconnect_cookie(cookie).build(),
+                    None => builder.build(),
+                }
+            },
         },
     };
 

@@ -7,6 +7,7 @@ use ironrdp_pdu::rdp::autodetect::AutoDetectResponse;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
+use ironrdp_pdu::rdp::session_info::{InfoData, ServerAutoReconnect};
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages, client_encode_svc_messages};
 use tracing::{debug, warn};
@@ -62,6 +63,10 @@ pub struct Processor {
     io_channel_id: u16,
     share_id: u32,
     connection_activation: ConnectionActivationSequence,
+    /// Most recent server-issued auto-reconnect cookie captured from a
+    /// Save Session Info PDU (Logon Info Extended → `ARC_SC_PRIVATE_PACKET`).
+    /// Used to build the client auto-reconnect cookie on a reconnect attempt.
+    reconnect_cookie: Option<ServerAutoReconnect>,
 }
 
 impl Processor {
@@ -78,11 +83,18 @@ impl Processor {
             io_channel_id,
             share_id,
             connection_activation,
+            reconnect_cookie: None,
         }
     }
 
     pub fn set_share_id(&mut self, share_id: u32) {
         self.share_id = share_id;
+    }
+
+    /// Returns the most recent server auto-reconnect cookie captured from a
+    /// Save Session Info PDU, if any.
+    pub fn reconnect_cookie(&self) -> Option<&ServerAutoReconnect> {
+        self.reconnect_cookie.as_ref()
     }
 
     pub fn get_svc_processor<T: SvcProcessor + 'static>(&self) -> Option<&T> {
@@ -187,7 +199,7 @@ impl Processor {
         }
     }
 
-    fn process_io_channel(&self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
+    fn process_io_channel(&mut self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
         debug_assert_eq!(data_ctx.channel_id, self.io_channel_id);
 
         let io_channel = ironrdp_connector::legacy::decode_io_channel(data_ctx).map_err(crate::legacy::map_error)?;
@@ -197,6 +209,17 @@ impl Processor {
                 match ctx.pdu {
                     ShareDataPdu::SaveSessionInfo(session_info) => {
                         debug!("Got Session Save Info PDU: {session_info:?}");
+                        // Capture the auto-reconnect cookie (ARC_SC_PRIVATE_PACKET) if the
+                        // server sent Logon Info Extended with one. It is later used to derive
+                        // the client auto-reconnect cookie on a reconnect attempt
+                        // ([MS-RDPBCGR] 2.2.4). Output is unchanged, so this is behaviourally
+                        // transparent to callers that do not opt into auto-reconnect.
+                        if let InfoData::LogonExtended(extended) = &session_info.info_data {
+                            if let Some(auto_reconnect) = &extended.auto_reconnect {
+                                debug!(logon_id = auto_reconnect.logon_id, "Captured server auto-reconnect cookie");
+                                self.reconnect_cookie = Some(auto_reconnect.clone());
+                            }
+                        }
                         Ok(Vec::new())
                     }
                     // FIXME: workaround fix to not terminate the session on "unhandled PDU: Set Keyboard Indicators PDU"
