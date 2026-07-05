@@ -404,20 +404,89 @@ and `.github/workflows/windows-release.yml` ship the H.264 default or the
 the class explicitly in artifact manifests. Scope of gap 1 was intentionally
 Cargo.toml default + this note + build/live validation only.
 
-Two remaining EGFX-quality follow-ups, now LIVE-VALIDATABLE (render works again):
-- AVC444 dual-stream decode (Track B refinement / prior gap 3): currently the
-  `Avc444|Avc444v2` arm in `egfx/client.rs` forwards to `on_unhandled_pdu`. The
-  client caps this at V8.1/AVC420 so servers avoid AVC444; implementing dual-stream
-  re-enables V10.7 quality vs Windows.
-- EGFX bounding-box (dirty-rect) delivery: `handle_wire_to_surface2` still clones
-  the full per-surface framebuffer once per frame. A `perf(egfx)` commit already
-  removed the redundant SECOND clone (handler now moves the buffer). True
-  bbox-only delivery (composite changed tiles into an app-recycled buffer, like
-  the classic `session_driver` dirty_region + copy_rgba_frame path) is deferred:
-  it needs the RecycleFrameBuffer channel wired to the EGFX handler, and its
-  acceptance gate ("no visual corruption") is only performable now that GRD
-  renders. Do NOT move the accumulator to app.rs — `progressive_framebuffers` has
-  correct reset/delete lifecycle in egfx that app.rs cannot see.
+Two remaining EGFX-quality follow-ups (NOT attempted this session — deferred with
+concrete, containment-first designs so neither can threaten the two banked wins,
+dtm-work classic RDP and asuspro13 GRD AVC420 render):
+
+- EGFX bounding-box (dirty-rect) delivery [prior gap 2 / Priority 2.1]. Status:
+  DEFERRED — not cleanly validatable under the new openh264 default. Key finding:
+  `handle_wire_to_surface2` (RemoteFX **Progressive**) is the code path that marks
+  the whole surface dirty and clones the full framebuffer each frame — but with
+  `openh264` now DEFAULT, GRD sends AVC420 via `WireToSurface1` and STOPS sending
+  progressive RFX, so `handle_wire_to_surface2` is not exercised against GRD in the
+  default build. Validating a progressive dirty-rect change therefore requires a
+  `--no-default-features --features rustls,egfx` build (no H.264) connected to GRD
+  (which then falls back to progressive RFX), OR a Windows host that sends
+  progressive. Concrete containment-first design when picked up:
+    1. Add a PARALLEL render event `RdpOutputEvent::ImageRegion { buffer, x, y, w,
+       h, surface_w, surface_h }` — do NOT modify the shared `RdpOutputEvent::Image`
+       full-frame path (that path carries BOTH banked wins; the naive sub-rect-in-
+       Image approach shrinks the frame to the top-left = corruption).
+    2. `app.rs` keeps its own PERSISTENT full-surface `self.buffer` (sized
+       surface_w*surface_h) and BLITS the sub-rect at (x,y) into it, then presents,
+       instead of `queue_image_buffer` swapping the whole buffer. Recycle small
+       sub-rect buffers back to egfx via the existing `RecycleFrameBuffer` channel.
+    3. `egfx/client.rs` computes the changed-tile bounding box (min/max of
+       `tile.x_idx/y_idx * 64`, clipped to surface) in `handle_wire_to_surface2`,
+       crops that rect out of `progressive_framebuffers[surface_id]`, and delivers
+       it as the ImageRegion. KEEP the accumulator in egfx — do NOT move
+       `progressive_framebuffers` to app.rs (its reset/delete lifecycle is tied to
+       ResetGraphics/DeleteSurface that app.rs cannot see).
+    4. Acceptance gate: dump both full-frame (pre) and dirty-rect (post) framebuffers
+       via `IRONRDP_EGFX_DUMP` on the no-openh264 build and diff to PNG — no visual
+       corruption vs the whole-surface delivery. dtm-work `Image` path stays
+       byte-identical by construction, so that banked win is untouchable.
+  NOTE: the AVC420 (`WireToSurface1`) path already delivers only `dest_rect`-sized
+  data, but the renderer ignores `destination_rectangle` and treats every update as
+  full-frame at origin (0,0) — see `rdp.rs::on_bitmap_updated` -> `RdpOutputEvent::
+  Image`. If GRD ever sends AVC420 sub-rect updates (it currently sends full-surface
+  frames), that path would ALSO need the ImageRegion offset treatment. Same event
+  design covers both codecs.
+
+- AVC444 dual-stream decode [prior gap 4 / Track B refinement]. Status: DEFERRED.
+  Currently the `Avc444|Avc444v2` arm in `egfx/client.rs::handle_wire_to_surface1`
+  forwards to `on_unhandled_pdu`, and `rdp.rs::EgfxRenderHandler::capabilities`
+  deliberately caps advertisement at V8.1/AVC420 so servers never select AVC444.
+  Containment-first design: implement dual-stream decode (parse the AVC444 bitmap
+  stream = an `LC` field + up to two `Avc420BitmapStream`s: the main/luma view and
+  the chroma-auxiliary view per [MS-RDPEGFX] 2.2.4.4/2.2.4.5; decode BOTH via the
+  existing `openh264` AVC420 path, then reconstruct YUV444 from the two YUV420
+  planes and convert to RGBA) BEHIND AN OPT-IN FLAG (mirror `--network-autodetect`:
+  add `Config::avc444` + `--avc444`, and only re-raise `capabilities()` to include
+  V10.7/AVC444 when the flag is set). NEVER make AVC444 default — a buggy dual-stream
+  decode reachable by default would break the banked GRD render. Live-validate by
+  flipping the flag against GRD/Windows and visually confirming the frame; keep the
+  default (V8.1/AVC420) advertisement so the banked render is never at risk. Note
+  GRD's AVC444 encode support is unconfirmed (its handover instance advertised only
+  AVC420 acceptance in these runs); a Windows RDS host is the more reliable AVC444
+  peer for validation.
+
+- Reconnect-into-existing-session + CredSSP InvalidToken handover [prior gap 5].
+  Status: DEFERRED (feature-sized; auth/reconnect only — does NOT touch the render
+  path, so lowest regression risk of the deferred items). Two distinct pieces:
+  (a) Reconnect-into-existing-session is NOT the same as the GRD handover redirect
+      (that one — reconnect carrying LoadBalanceInfo + LB_USERNAME/LB_PASSWORD as an
+      X.224 routing token — is already RESOLVED, see Track B item 0). This is RDP
+      *auto-reconnect* ([MS-RDPBCGR] 2.2.4): the server sends a Server Auto-Reconnect
+      Cookie (ARC) in the Save Session Info PDU; on an unexpected drop the client
+      reconnects sending the ARC_CS_PRIVATE_PACKET (Client Auto-Reconnect Packet) so
+      the server re-attaches the existing session instead of starting a new one. The
+      client currently sends `reconnect_cookie: None` (confirmed in connect logs) and
+      discards SaveSessionInfo (`x224/mod.rs` logs+drops it). Concrete next step:
+      capture the ARC cookie from `ShareDataPdu::SaveSessionInfo` (LogonInfoExtended
+      -> ServerAutoReconnect), store it on the session/config, and populate
+      `reconnect_cookie` in `ExtendedClientOptionalInfo` on the reconnect attempt in
+      `RdpClient::run`'s reconnect loop. Regression-safe: default `None` preserves
+      today's behavior.
+  (b) CredSSP `InvalidToken` (nstatus 0xc00700ea) on the GRD handover reconnect is a
+      FLAKY, server-side/environment auth race (winpr NTLM SAM not ready vs the
+      client's NTLMSSP), present at both old and new commits and not an import/client
+      regression. It is NOT the NTLM-SAM *username/password* mismatch (that was fixed
+      by sending LB_USERNAME/LB_PASSWORD as UTF-16LE). Concrete next step: it is
+      unreproducible-on-demand from the client; if it must be chased, add a bounded
+      CredSSP retry on `InvalidToken` during the handover reconnect ONLY (do not
+      touch the initial-connect CredSSP path, which is the dtm-work banked win), and
+      confirm against a freshly-restarted GRD where the handover SAM is warm.
 
 ## Live smoke-test findings (2026-07-04, Windows -> asuspro13 GRD 46.3 + dtm-work)
 
