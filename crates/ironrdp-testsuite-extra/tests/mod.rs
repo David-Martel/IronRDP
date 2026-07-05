@@ -804,6 +804,7 @@ fn default_client_config() -> connector::Config {
         bitmap: None,
         enable_graphics_pipeline: false,
         network_autodetect: false,
+        reconnect_cookie: None,
         dig_product_id: "".into(),
         // NOTE: hardcode this value like in freerdp
         // https://github.com/FreeRDP/FreeRDP/blob/4e24b966c86fdf494a782f0dfcfc43a057a2ea60/libfreerdp/core/settings.c#LL49C34-L49C70

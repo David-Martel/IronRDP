@@ -78,6 +78,11 @@ pub struct Config {
     /// received from the server. This is useful for observing whether the server switches
     /// from bitmap updates to EGFX traffic. Requires the `egfx` feature flag.
     pub egfx: bool,
+
+    /// Enable RDP auto-reconnect: capture the server auto-reconnect cookie and,
+    /// on an unexpected drop, attempt a bounded reconnect carrying the derived
+    /// client cookie ([MS-RDPBCGR] 2.2.4). Off by default.
+    pub auto_reconnect: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -463,6 +468,18 @@ struct Args {
     #[clap(long, default_value_t = false)]
     network_autodetect: bool,
 
+    /// Enable RDP auto-reconnect ([MS-RDPBCGR] 2.2.4).
+    ///
+    /// When set, the client captures the server-issued auto-reconnect cookie
+    /// (Save Session Info PDU) and, on an unexpected connection drop, attempts a
+    /// bounded reconnect that sends the derived client auto-reconnect cookie so
+    /// the server re-attaches the existing session instead of starting a new one.
+    ///
+    /// Opt-in: with the flag off (default) the connect path and drop behaviour
+    /// are byte-for-byte unchanged.
+    #[clap(long, default_value_t = false)]
+    auto_reconnect: bool,
+
     /// Keyboard layout code sent to the server (e.g., 0x00000409 for US English).
     ///
     /// When omitted, the layout is auto-detected from the active input locale on Windows.
@@ -681,6 +698,9 @@ impl Config {
             },
             hardware_id: None,
             license_cache: None,
+            // Set per reconnect attempt by the auto-reconnect path; None keeps
+            // the initial connect byte-identical.
+            reconnect_cookie: None,
             enable_server_pointer: !args.no_server_pointer,
             autologon: args.autologon,
             enable_audio_playback: true,
@@ -710,6 +730,7 @@ impl Config {
             #[cfg(windows)]
             dvc_plugins: args.dvc_plugin,
             egfx: egfx_enabled,
+            auto_reconnect: args.auto_reconnect,
         })
     }
 }

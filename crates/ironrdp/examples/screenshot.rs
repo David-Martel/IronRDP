@@ -237,6 +237,7 @@ fn build_config(
         bitmap: None,
         enable_graphics_pipeline: false,
         network_autodetect: false,
+        reconnect_cookie: None,
         client_build: 0,
         client_name: "ironrdp-screenshot-example".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),

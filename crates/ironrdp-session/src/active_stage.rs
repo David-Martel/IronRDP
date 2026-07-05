@@ -210,6 +210,14 @@ impl ActiveStage {
         self.enable_server_pointer = enable_server_pointer;
     }
 
+    /// Returns the most recent server auto-reconnect cookie
+    /// (`ARC_SC_PRIVATE_PACKET`) captured from a Save Session Info PDU, if the
+    /// server issued one during this session. Used to derive the client
+    /// auto-reconnect cookie on a reconnect attempt ([MS-RDPBCGR] 2.2.4).
+    pub fn reconnect_cookie(&self) -> Option<&ironrdp_pdu::rdp::session_info::ServerAutoReconnect> {
+        self.x224_processor.reconnect_cookie()
+    }
+
     /// Encodes client-side graceful shutdown request. Note that upon sending this request,
     /// client should wait for server's ShutdownDenied PDU before closing the connection.
     ///

@@ -39,6 +39,7 @@ fn test_config() -> ironrdp_connector::Config {
         bitmap: None,
         enable_graphics_pipeline: false,
         network_autodetect: false,
+        reconnect_cookie: None,
         dig_product_id: String::new(),
         client_dir: String::new(),
         platform: MajorPlatformType::UNIX,

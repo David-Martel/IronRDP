@@ -16,6 +16,7 @@ use ironrdp::dvc::DvcProcessor as _;
 use ironrdp::echo::client::EchoClient;
 use ironrdp::graphics::pointer::DecodedPointer;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
+use ironrdp::pdu::rdp::session_info::{ClientAutoReconnect, ServerAutoReconnect};
 use ironrdp::pdu::{PduResult, pdu_other_err};
 use ironrdp::session::{GracefulDisconnectReason, SessionResult};
 use ironrdp::svc::SvcMessage;
@@ -207,6 +208,11 @@ impl RdpClient {
     pub async fn run(mut self) {
         let mut same_size_reconnects = 0;
         let mut redirect_count: u8 = 0;
+        // Most recent server auto-reconnect cookie captured across sessions, and a
+        // bounded budget of consecutive auto-reconnect attempts. Both only matter
+        // when `--auto-reconnect` is set.
+        let mut arc_cookie: Option<ServerAutoReconnect> = None;
+        let mut auto_reconnect_attempts: u8 = 0;
 
         loop {
             let (connection_result, framed) = if let Some(rdcleanpath) = self.config.rdcleanpath.as_ref() {
@@ -244,14 +250,30 @@ impl RdpClient {
                 }
             };
 
-            match run_active_session(
+            // The one-shot auto-reconnect cookie (if any) was consumed by the
+            // connect above (serialized into the Client Info PDU). Clear it so a
+            // subsequent non-auto reconnect (resize/redirect) starts clean; the
+            // auto-reconnect branch below re-derives it per attempt.
+            self.config.connector.reconnect_cookie = None;
+
+            let mut session_cookie: Option<ServerAutoReconnect> = None;
+            let session_result = run_active_session(
                 framed,
                 connection_result,
                 &self.event_loop_proxy,
                 &mut self.input_event_receiver,
+                &mut session_cookie,
             )
-            .await
-            {
+            .await;
+
+            // A session that received an auto-reconnect cookie reached full logon;
+            // treat that as real progress and refresh the cookie + reset the budget.
+            if let Some(cookie) = session_cookie {
+                arc_cookie = Some(cookie);
+                auto_reconnect_attempts = 0;
+            }
+
+            match session_result {
                 Ok(RdpControlFlow::ReconnectWithNewSize { width, height }) => {
                     let current_width = self.config.connector.desktop_size.width;
                     let current_height = self.config.connector.desktop_size.height;
@@ -332,6 +354,25 @@ impl RdpClient {
                     break;
                 }
                 Err(e) => {
+                    // Opt-in RDP auto-reconnect: on an unexpected drop, if the server
+                    // issued an auto-reconnect cookie this connection and the bounded
+                    // budget remains, reconnect carrying the derived client cookie so
+                    // the server re-attaches the existing session ([MS-RDPBCGR] 2.2.4).
+                    let can_auto_reconnect =
+                        self.config.auto_reconnect && auto_reconnect_attempts < MAX_AUTO_RECONNECTS;
+                    if let (true, Some(server_cookie)) = (can_auto_reconnect, arc_cookie.as_ref()) {
+                        auto_reconnect_attempts += 1;
+                        let client_cookie = ClientAutoReconnect::from_server_enhanced_security(server_cookie);
+                        self.config.connector.reconnect_cookie = Some(client_cookie.to_bytes());
+                        info!(
+                            error = %e,
+                            attempt = auto_reconnect_attempts,
+                            max = MAX_AUTO_RECONNECTS,
+                            "Session dropped unexpectedly; attempting RDP auto-reconnect"
+                        );
+                        continue;
+                    }
+
                     error!(error = %e, "Session terminated with error");
                     self.send_terminal_event(Err(e));
                     break;
@@ -355,6 +396,11 @@ const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_SAME_SIZE_RECONNECTS: u8 = 3;
 const MAX_REDIRECTS: u8 = 3;
+/// Bounded budget of consecutive opt-in auto-reconnect attempts after an
+/// unexpected drop, reset whenever a session reaches full logon (receives an
+/// auto-reconnect cookie). Mirrors the spirit of the [MS-RDPBCGR] client
+/// auto-reconnect retry limit (20).
+const MAX_AUTO_RECONNECTS: u8 = 20;
 
 fn update_resize_reconnect_state(
     current_width: u16,

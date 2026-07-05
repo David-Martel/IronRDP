@@ -252,6 +252,18 @@ pub struct Config {
     /// - A cookie containing the username for a username/password.
     /// - Nothing for a smart card.
     pub request_data: Option<NegoRequestData>,
+    /// Auto-reconnect cookie (`ARC_CS_PRIVATE_PACKET`, 28 bytes) to send in the
+    /// `autoReconnectCookie` field of the Client Info PDU on a reconnect attempt.
+    ///
+    /// When `Some`, the server may re-attach the client to its existing session
+    /// ([MS-RDPBCGR] auto-reconnect). Derive it with
+    /// [`ClientAutoReconnect`](ironrdp_pdu::rdp::session_info::ClientAutoReconnect)
+    /// from the server-issued cookie captured on the previous session.
+    ///
+    /// `None` (the default) reproduces the standard connect path byte-for-byte.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/6dc5f21c-04d4-4a2d-b1b3-5fed2f74e2a5
+    pub reconnect_cookie: Option<[u8; 28]>,
     /// If true, the INFO_AUTOLOGON flag is set in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu)
     pub autologon: bool,
     /// If true, the INFO_NOAUDIOPLAYBACK flag is set in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu)
