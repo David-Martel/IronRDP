@@ -404,9 +404,52 @@ and `.github/workflows/windows-release.yml` ship the H.264 default or the
 the class explicitly in artifact manifests. Scope of gap 1 was intentionally
 Cargo.toml default + this note + build/live validation only.
 
-Two remaining EGFX-quality follow-ups (NOT attempted this session — deferred with
-concrete, containment-first designs so neither can threaten the two banked wins,
-dtm-work classic RDP and asuspro13 GRD AVC420 render):
+## MERGED — three gap branches integrated into `feat/gfx-early-capability-flag` (2026-07-05)
+
+All three off-by-default gap features were merged into
+`feat/gfx-early-capability-flag` (base 60bee85a) in the main worktree,
+GPG-signed (damartel@umich.edu), and live-validated against real machines:
+
+- `gap/arc-reconnect` (199231a4) → merge commit **110a4edd** — RDP Auto-Reconnect
+  (ARC), `--auto-reconnect`, off by default.
+- `gap/egfx-dirtyrect` (eebd0f06) → merge commit **34121375** — EGFX dirty-rect +
+  `destination_rectangle`, `RdpOutputEvent::ImageRegion`; full-surface updates
+  still route through the shared full-frame `Image` path (invariant preserved).
+- `gap/avc444` (3c54736e) → merge commit **239ec5a9** — AVC444/AVC444v2 dual-stream
+  decode, `--avc444`, off by default. Merge HEAD of the branch: **239ec5a9**.
+
+Conflict resolution (all three features preserved):
+- `ironrdp-egfx/client.rs` — kept BOTH dirty-rect's `BitmapUpdate`
+  `surface_width`/`surface_height` (in `handle_uncompressed` signature +
+  construction) AND AVC444's `decode_avc444` dispatch; threaded
+  `surface_width`/`surface_height` into `decode_avc444` (new params) and its
+  `BitmapUpdate`, mirroring `decode_avc420`, and updated the WireToSurface1
+  call site.
+- `ironrdp-client/config.rs` — kept both `--auto-reconnect` and `--avc444`
+  flags/fields; both `default_value_t = false`.
+- `ironrdp-client/rdp.rs` — auto-merged (ARC / dirty-rect / AVC444 regions disjoint).
+
+Gates: `cargo test --workspace` = 1370 passed / 0 failed; `cargo build --release
+-p ironrdp-client` (default openh264) = exit 0; clippy clean on all merged/touched
+crates (0 new warnings; the 9 pre-existing app.rs/config.rs GetKeyboardLayout-area
+warnings are unchanged base debt, out of scope).
+
+Live validation (creds read from Windows Credential Manager via CredRead at
+runtime; no plaintext persisted):
+- **asuspro13** GRD (`--egfx`): journal shows `RDP.RDPGFX CapsAdvertise: Accepting
+  capability set … RDPGFX_CAPVERSION_81, AVC444: false, AVC420: true`. Render path
+  intact, no Aborting/BAD_CAPABILITIES/NO_LISTENER. Confirms AVC420 banked win +
+  AVC444 correctly OFF by default.
+- **dtm-work** (`-u david --egfx`): CredSSP/NLA auth succeeded; client rendered live
+  1920x1080 EGFX frames (WireToSurface1). `--auto-reconnect` also connects cleanly
+  (ARC cookie-capture path non-regressing).
+- NOT verifiable here: a real AVC444 render (GRD advertises AVC420 only — needs a
+  Windows-RDS AVC444 peer) and a forced ARC drop/reconnect trigger; progressive
+  dirty-rect visual diff needs a `--no-default-features rustls,egfx` build (openh264
+  default drives AVC420 full-frames).
+
+The follow-up designs below are retained for reference; the two banked wins
+(dtm-work classic RDP and asuspro13 GRD AVC420 render) survived the merge:
 
 - EGFX bounding-box (dirty-rect) delivery [prior gap 2 / Priority 2.1]. Status:
   **IMPLEMENTED 2026-07-04 on branch `gap/egfx-dirtyrect` (off 60bee85a).** The
