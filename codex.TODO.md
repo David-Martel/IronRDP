@@ -443,10 +443,24 @@ runtime; no plaintext persisted):
 - **dtm-work** (`-u david --egfx`): CredSSP/NLA auth succeeded; client rendered live
   1920x1080 EGFX frames (WireToSurface1). `--auto-reconnect` also connects cleanly
   (ARC cookie-capture path non-regressing).
-- NOT verifiable here: a real AVC444 render (GRD advertises AVC420 only — needs a
-  Windows-RDS AVC444 peer) and a forced ARC drop/reconnect trigger; progressive
-  dirty-rect visual diff needs a `--no-default-features rustls,egfx` build (openh264
-  default drives AVC420 full-frames).
+- **AVC444 negotiation CONFIRMED end-to-end on dtm-work** (Windows RDS Graphics
+  Pipeline): with `--avc444 --egfx`, client advertises V10.7 and dtm-work confirms
+  `EGFX capabilities confirmed avc420=true avc444=true`; client's dedicated OpenH264
+  chroma decoder initialized (`AVC444 enabled: …`). dtm-work already had
+  `HKLM\…\Terminal Services\AVC444ModePreferred = 1` (verified via WinRM) — **no
+  registry change was made, nothing to revert.** This is further than the AVC444
+  gap agent reached (GRD only ever advertised AVC420). HOWEVER, an actual
+  AVC444-coded frame decoding through `decode_avc444` was **not observed**: during
+  the brief window before david's active-console single-session state dropped the
+  connection (clean exit code 0, expected server-state), the server sent only empty
+  `StartFrame`/`EndFrame` markers with no `WireToSurface` content (nothing visually
+  changing on the locked/static console). Exercising `decode_avc444` needs an
+  interactive/changing dtm-work session (or a non-console RDS session), which cannot
+  be arranged without disrupting the operator's console.
+- NOT verified here: an actual AVC444 frame decode (negotiation ✓, frame content ✗ —
+  see above); a forced ARC drop/reconnect trigger; progressive dirty-rect visual
+  diff needs a `--no-default-features rustls,egfx` build (openh264 default drives
+  AVC420 full-frames).
 
 The follow-up designs below are retained for reference; the two banked wins
 (dtm-work classic RDP and asuspro13 GRD AVC420 render) survived the merge:
