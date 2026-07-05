@@ -497,20 +497,30 @@ flag, which the connector does not advertise (`connection.rs`
     now COMPLETES — system-daemon path answered 10 RTT requests + received
     NetworkCharacteristics; handover path answered Bandwidth Start/Stop. No more
     LicensingExchange desync.
+  - SERVER-SIDE AUDIO ENABLE — PROVEN (live A/B, 2026-07-04): with the flag OFF,
+    GRD logs every connection `[RDP] Client does not support autodetecting network
+    characteristics. Disabling audio output redirection`. With `--network-autodetect`
+    that line is GONE from the GRD journal — the connect-time handshake flips GRD's
+    server-side gate and it no longer disables audio output redirection. This is the
+    exact behaviour gap 4 targeted; the negotiation half is done and verified.
   - REMAINING BLOCKER (flag NOT flipped to default; needs `ironrdp-session` work):
-    with the flag on, GRD's session now fails LATER with
+    with the flag on, GRD's session fails LATER with
     `[X224] unexpected channel received: ID 0`. The connection fully establishes
-    (io_channel_id=1003, user_channel_id=1008, 1920x1080) and then the first
-    active-session SendDataIndication decodes to channel_id 0. This is a deeper
-    session-layer issue surfaced ONLY when auto-detect is negotiated (likely a
-    continuous/in-session auto-detect or post-connect PDU the `x224` router does
-    not expect); it is beyond the connector auto-detect handler. Next step: rerun
-    with `IRONRDP_LOG=...,ironrdp_session=debug` to dump the offending PDU's
-    channel_id + head bytes (the `x224 process: routing` trace) and handle/route it
-    in `crates/ironrdp-session/src/x224/mod.rs`.
-  - Because of that blocker, audio-enabled playback on GRD is not yet proven; the
-    handshake half is done and safe. Do NOT make `network_autodetect` default until
-    the channel-0 issue is resolved and GRD render+audio survive with the flag on.
+    (io_channel_id=1003, user_channel_id=1008, 1920x1080), then an active-session
+    SendDataIndication routes to MCS channel_id 0. Captured PDU (ironrdp_session=debug):
+    `x224 process: routing SendDataIndication channel_id=0 io_channel_id=1003
+    user_data_len=10 head=[0, 16, 0, 0, 6, 0, 11, 0, 1, 0]`. channel_id 0 is not the
+    I/O channel and not a registered static channel, so `x224/mod.rs` rejects it. This
+    is surfaced ONLY when auto-detect is negotiated (a post-connect PDU the `x224`
+    router does not expect on channel 0 — possibly an MCS PDU mis-decoded as
+    SendDataIndication, or a server PDU addressed to channel 0). It is beyond the
+    connector auto-detect handler and NOT attempted here (risks the dtm-work baseline).
+    Next step: decode those 10 head bytes as a Share Control Header / MCS PDU and
+    route or tolerate channel 0 in `crates/ironrdp-session/src/x224/mod.rs`.
+  - NET: negotiation + server-side audio-enable are DONE and safe (flag off by
+    default, dtm-work byte-identical). Audible playback is unverifiable headlessly
+    (no output device). Do NOT make `network_autodetect` default until the channel-0
+    issue is resolved and a full GRD session survives with the flag on.
 - Audio playback itself remains unconfirmable headlessly (no output device to
   hear).
 
