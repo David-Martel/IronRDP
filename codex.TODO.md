@@ -352,6 +352,23 @@ require .NET binding regeneration downstream (additive; out of the Rust gates).
 Gates: clippy clean; `cargo test --workspace` 1370 passed/3 ignored;
 `cargo build --release -p ironrdp-client` OK.
 
+48. Dirty-rect / no-H264 RemoteFX-Progressive path VISUALLY VALIDATED (2026-07-05,
+chore/tech worktree). Built `--no-default-features --features rustls,egfx` (no
+openh264 → AVC caps filtered → GRD falls back to RemoteFX Progressive, exercising
+the `progressive_framebuffers` dirty-rect crop path), connected to asuspro13
+`100.64.0.3:3389 -u damartel --egfx` with `IRONRDP_EGFX_DUMP` set. Result:
+"EGFX capabilities confirmed" + "First frame presented 1920x1080", no ERROR-level
+lines, no RFX decode failures. The dumped framebuffer is exactly 8,294,400 bytes
+(1920x1080x4 RGBA, `.dims` = 1920x1080) and, converted to PNG, shows a fully
+coherent GDM/Ubuntu login screen: top-bar clock + status icons, centered login
+box with the correct yellow selection highlight, "Not listed?", and the red
+Ubuntu logo bottom-centre — every element at its correct offset with correct
+colours (yellow/red/white all correct, so the RGBA channel order and sub-region
+blit offsets are right). No visual corruption from the dirty-rect changes. NOTE:
+`IRONRDP_EGFX_DUMP` is one-shot on the FIRST progressive update, so the dump is the
+accumulated framebuffer at first-frame time (sparse non-black on the dark login
+screen is expected, not a defect).
+
 ## GRD render RESOLVED — root cause was a build-feature footgun, NOT a capability rejection (2026-07-04, later pass)
 
 **The "ERRINFO_BAD_CAPABILITIES / Confirm Active capability rejection" framing was
