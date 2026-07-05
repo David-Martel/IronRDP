@@ -64,13 +64,14 @@ use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, trace, warn};
 
 use crate::CHANNEL_NAME;
+use crate::avc444::{self, ChromaVersion};
 use crate::decode::H264Decoder;
 use crate::pdu::{
-    Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
-    CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
-    EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
-    MapSurfaceToWindowPdu, PixelFormat, QueueDepth, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu,
-    WireToSurface2Pdu,
+    Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
+    CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type,
+    DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu,
+    MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth, SolidFillPdu, SurfaceToCachePdu,
+    SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 
 /// Max capacity to keep for decompressed buffer when cleared.
@@ -396,6 +397,15 @@ enum ClientState {
 pub struct GraphicsPipelineClient {
     handler: Box<dyn GraphicsPipelineHandler>,
     h264_decoder: Option<Box<dyn H264Decoder>>,
+    /// Dedicated H.264 context for the AVC444 chroma-auxiliary sub-stream.
+    ///
+    /// AVC444's luma and chroma sub-streams are two independent H.264 sequences;
+    /// they must not share a decode context (inter-frame prediction would be
+    /// corrupted). The luma sub-stream reuses `h264_decoder`; this slot decodes
+    /// the chroma sub-stream. Populated only when AVC444 is opted into via
+    /// [`GraphicsPipelineClient::set_avc444_chroma_decoder`]; `None` keeps the
+    /// AVC420 default path (and its single decoder) entirely unchanged.
+    h264_chroma_decoder: Option<Box<dyn H264Decoder>>,
 
     decompressor: zgfx::Decompressor,
     decompressed_buffer: Vec<u8>,
@@ -431,6 +441,7 @@ impl GraphicsPipelineClient {
         Self {
             handler,
             h264_decoder,
+            h264_chroma_decoder: None,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
             state: ClientState::WaitingForConfirm,
@@ -444,6 +455,18 @@ impl GraphicsPipelineClient {
             progressive_framebuffers: BTreeMap::new(),
             progressive_dump_done: false,
         }
+    }
+
+    /// Provide a dedicated H.264 decode context for the AVC444 chroma-auxiliary
+    /// sub-stream, enabling AVC444 dual-stream decode.
+    ///
+    /// This is opt-in and separate from the primary (luma/AVC420) decoder passed
+    /// to [`GraphicsPipelineClient::new`]: AVC444's two sub-streams are
+    /// independent H.264 sequences and must not share a decode context. Only call
+    /// this when the caller also advertises AVC444 capability (V10.7); otherwise
+    /// the server never selects AVC444 and the slot stays unused.
+    pub fn set_avc444_chroma_decoder(&mut self, decoder: Box<dyn H264Decoder>) {
+        self.h264_chroma_decoder = Some(decoder);
     }
 
     // ========================================================================
@@ -738,8 +761,27 @@ impl GraphicsPipelineClient {
                 )?;
             }
             Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
-                debug!("AVC444 codec not yet implemented, forwarding to handler");
-                self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
+                if self.h264_chroma_decoder.is_some() {
+                    let version = if pdu.codec_id == Codec1Type::Avc444v2 {
+                        ChromaVersion::V2
+                    } else {
+                        ChromaVersion::V1
+                    };
+                    self.decode_avc444(
+                        pdu.surface_id,
+                        &pdu.destination_rectangle,
+                        surface_width,
+                        surface_height,
+                        &pdu.bitmap_data,
+                        version,
+                    )?;
+                } else {
+                    // AVC444 was not opted into (no chroma decoder), so we never
+                    // advertised it and the server should not have selected it.
+                    // Forward to the handler rather than silently dropping.
+                    debug!("AVC444 received without an AVC444 decoder configured; forwarding to handler");
+                    self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
+                }
             }
             Codec1Type::Uncompressed => {
                 self.handle_uncompressed(pdu, surface_width, surface_height);
@@ -797,6 +839,109 @@ impl GraphicsPipelineClient {
             destination_rectangle: dest_rect.clone(),
             codec_id: Codec1Type::Avc420,
             data: cropped_data,
+            width: dest_width,
+            height: dest_height,
+            surface_width,
+            surface_height,
+        };
+
+        self.handler.on_bitmap_updated(update);
+        Ok(())
+    }
+
+    /// Decode an AVC444 (`0x0E`) / AVC444v2 (`0x0F`) dual-stream frame.
+    ///
+    /// Parses the [`Avc444BitmapStream`] (an `LC` selector plus one or two
+    /// [`Avc420BitmapStream`]s), decodes the luma sub-stream via the primary
+    /// H.264 context and the chroma-auxiliary sub-stream via the dedicated
+    /// context, reconstructs YUV 4:4:4 per [MS-RDPEGFX], converts to RGBA, crops
+    /// to the destination rectangle, and delivers a [`BitmapUpdate`] just like
+    /// the AVC420 path.
+    ///
+    /// Only the two-stream case (`LC == LUMA_AND_CHROMA`) is reconstructed.
+    /// Luma-only / chroma-only partial updates need a persistent per-surface YUV
+    /// 4:4:4 framebuffer to composite against; those are warned and skipped here.
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    fn decode_avc444(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &InclusiveRectangle,
+        surface_width: u16,
+        surface_height: u16,
+        bitmap_data: &[u8],
+        version: ChromaVersion,
+    ) -> PduResult<()> {
+        let mut cursor = ReadCursor::new(bitmap_data);
+        let stream = Avc444BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
+
+        // Both decode contexts are required for the two-stream reconstruction.
+        // They are distinct struct fields, so the mutable borrows are disjoint.
+        let (Some(luma_decoder), Some(chroma_decoder)) =
+            (self.h264_decoder.as_mut(), self.h264_chroma_decoder.as_mut())
+        else {
+            debug!("AVC444 frame but no H.264 decoders configured; skipping");
+            return Ok(());
+        };
+
+        let Some(stream2) = stream.stream2.as_ref() else {
+            // LC == LUMA (0x01) or CHROMA (0x02): a partial update carrying only
+            // one view. Correct handling requires retaining the previous YUV444
+            // surface to composite against; not implemented. Skip safely.
+            warn!(
+                encoding = ?stream.encoding,
+                "AVC444 single-view (luma-only/chroma-only) partial update not supported; skipping frame"
+            );
+            return Ok(());
+        };
+
+        if stream.encoding != Encoding::LUMA_AND_CHROMA {
+            warn!(encoding = ?stream.encoding, "AVC444 stream carries two sub-streams but LC != LUMA_AND_CHROMA; skipping");
+            return Ok(());
+        }
+
+        // Decode the luma view (primary context) and chroma-aux view (dedicated).
+        let main = luma_decoder
+            .decode_yuv(stream.stream1.data)
+            .map_err(|e| pdu_other_err!("AVC444 luma H.264 decode", source: e))?;
+        let aux = chroma_decoder
+            .decode_yuv(stream2.data)
+            .map_err(|e| pdu_other_err!("AVC444 chroma H.264 decode", source: e))?;
+
+        let dest_width = dest_rect.width();
+        let dest_height = dest_rect.height();
+
+        // The luma frame must cover the destination rectangle (larger is expected
+        // due to macroblock alignment and handled by the reconstruction ROI).
+        if main.width < u32::from(dest_width) || main.height < u32::from(dest_height) {
+            warn!(
+                luma_width = main.width,
+                luma_height = main.height,
+                dest_width,
+                dest_height,
+                "AVC444 luma frame smaller than destination rectangle; skipping"
+            );
+            return Ok(());
+        }
+
+        let yuv444 = avc444::reconstruct_yuv444(
+            &main,
+            &aux,
+            version,
+            u32::from(dest_width),
+            u32::from(dest_height),
+        );
+        let rgba = avc444::yuv444_to_rgba(&yuv444);
+
+        let update = BitmapUpdate {
+            surface_id,
+            destination_rectangle: dest_rect.clone(),
+            codec_id: if version == ChromaVersion::V2 {
+                Codec1Type::Avc444v2
+            } else {
+                Codec1Type::Avc444
+            },
+            data: rgba,
             width: dest_width,
             height: dest_height,
             surface_width,

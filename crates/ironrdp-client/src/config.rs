@@ -83,6 +83,15 @@ pub struct Config {
     /// on an unexpected drop, attempt a bounded reconnect carrying the derived
     /// client cookie ([MS-RDPBCGR] 2.2.4). Off by default.
     pub auto_reconnect: bool,
+
+    /// Opt in to AVC444/AVC444v2 dual-stream H.264 (4:4:4) EGFX decode.
+    ///
+    /// When enabled (and `egfx` + `openh264` are available), the client advertises
+    /// V10.7 so the server may select AVC444, and reconstructs YUV 4:4:4 from the
+    /// luma + chroma-auxiliary sub-streams. Default is off: the client advertises
+    /// AVC420 (V8.1) only, so a server never selects AVC444 and the AVC420 render
+    /// path is untouched. Experimental and not validated end-to-end.
+    pub avc444: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -458,6 +467,15 @@ struct Args {
     #[clap(long, default_value_t = false)]
     egfx: bool,
 
+    /// Opt in to experimental AVC444/AVC444v2 dual-stream H.264 (4:4:4) EGFX decode.
+    ///
+    /// Advertises EGFX V10.7 so the server may select AVC444 and reconstructs YUV
+    /// 4:4:4 from the luma + chroma sub-streams. Requires `--egfx` and the
+    /// `openh264` feature. Off by default (AVC420-only advertisement) so the
+    /// working AVC420 render path is never affected; not validated end-to-end.
+    #[clap(long, default_value_t = false)]
+    avc444: bool,
+
     /// Advertise connect-time network auto-detection (RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT)
     /// and answer the server's RTT/bandwidth measurement requests.
     ///
@@ -731,6 +749,7 @@ impl Config {
             dvc_plugins: args.dvc_plugin,
             egfx: egfx_enabled,
             auto_reconnect: args.auto_reconnect,
+            avc444: args.avc444,
         })
     }
 }

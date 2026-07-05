@@ -483,10 +483,38 @@ dtm-work classic RDP and asuspro13 GRD AVC420 render):
   frames), that path would ALSO need the ImageRegion offset treatment. Same event
   design covers both codecs.
 
-- AVC444 dual-stream decode [prior gap 4 / Track B refinement]. Status: DEFERRED.
-  Currently the `Avc444|Avc444v2` arm in `egfx/client.rs::handle_wire_to_surface1`
-  forwards to `on_unhandled_pdu`, and `rdp.rs::EgfxRenderHandler::capabilities`
-  deliberately caps advertisement at V8.1/AVC420 so servers never select AVC444.
+- AVC444 dual-stream decode [prior gap 4 / Track B refinement].
+  Status: IMPLEMENTED (2026-07-04, branch `gap/avc444`), behind opt-in `--avc444`;
+  UNVERIFIED end-to-end (no AVC444-advertising peer — GRD advertised AVC420 only).
+  What shipped:
+    * `egfx/src/avc444.rs` — YUV444 reconstruction from the luma + chroma-aux
+      YUV420 views (FreeRDP-faithful `LumaToYUV444` / `ChromaV1ToYUV444` /
+      `ChromaV2ToYUV444`), + `yuv444_to_rgba` reusing the AVC420 path's exact
+      BT.601 coefficients. All plane reads/writes bounds-checked (panic-free).
+    * `egfx/src/decode.rs` — `Yuv420Frame` + `H264Decoder::decode_yuv` (default
+      `Err`); `OpenH264Decoder` packs decoder planes tightly.
+    * `egfx/src/client.rs::decode_avc444` — parses `Avc444BitmapStream`, decodes
+      luma via the primary H.264 context and chroma-aux via a SEPARATE context
+      (`h264_chroma_decoder`; the two sub-streams are independent H.264 sequences
+      and must not share DPB state), reconstructs, converts, crops, delivers a
+      `BitmapUpdate`. Only `LC == LUMA_AND_CHROMA` (two streams) is reconstructed;
+      luma-only / chroma-only partial updates are warned + skipped (would need a
+      persistent per-surface YUV444 framebuffer — deliberately out of scope).
+    * `ironrdp-client`: `--avc444` CLI flag + `Config::avc444`; when set,
+      `EgfxRenderHandler::capabilities` prepends V10.7 and a dedicated OpenH264
+      chroma decoder is attached. Default is unchanged (V8.1/AVC420 only).
+  Validation: 15 unit tests — 10 assert reconstruction placement against the
+  spec geometry directly (not via a round-trip that a mis-transcribed split
+  could mask) + RGBA conversion + panic-free on truncated aux; 5 cover the
+  `Avc444BitmapStream` parse (LC round-trips for LUMA_AND_CHROMA / LUMA / CHROMA
+  and rejection of reserved-encoding and zero-length-LUMA_AND_CHROMA inputs). v2 (`Avc444v2`) is
+  implemented to spec geometry but has NO round-trip/peer validation (FreeRDP
+  ships no v2 split reference). Live-validate by flipping `--avc444` against a
+  Windows RDS host (more reliable AVC444 peer than GRD) and visually confirming.
+  Historical context (why it was deferred):
+  Previously the `Avc444|Avc444v2` arm in `egfx/client.rs::handle_wire_to_surface1`
+  forwarded to `on_unhandled_pdu`, and `rdp.rs::EgfxRenderHandler::capabilities`
+  deliberately capped advertisement at V8.1/AVC420 so servers never select AVC444.
   Containment-first design: implement dual-stream decode (parse the AVC444 bitmap
   stream = an `LC` field + up to two `Avc420BitmapStream`s: the main/luma view and
   the chroma-auxiliary view per [MS-RDPEGFX] 2.2.4.4/2.2.4.5; decode BOTH via the

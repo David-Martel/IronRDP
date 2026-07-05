@@ -553,4 +553,109 @@ mod tests {
         assert_eq!(decoded.quant_qual_vals.len(), 1);
         assert_eq!(decoded.data, &h264_data);
     }
+
+    // ========================================================================
+    // AVC444 dual-stream (Avc444BitmapStream) parse tests
+    // ========================================================================
+
+    fn sample_avc420(data: &[u8]) -> Avc420BitmapStream<'_> {
+        Avc420BitmapStream {
+            rectangles: vec![InclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 15,
+                bottom: 15,
+            }],
+            quant_qual_vals: vec![QuantQuality {
+                quantization_parameter: 22,
+                progressive: false,
+                quality: 100,
+            }],
+            data,
+        }
+    }
+
+    fn encode_avc444(stream: &Avc444BitmapStream<'_>) -> Vec<u8> {
+        let mut buf = vec![0u8; stream.size()];
+        let mut cursor = WriteCursor::new(&mut buf);
+        stream.encode(&mut cursor).expect("avc444 encode");
+        buf
+    }
+
+    #[test]
+    fn avc444_round_trip_luma_and_chroma() {
+        // LC == LUMA_AND_CHROMA: both sub-streams present; the 30-bit streamInfo
+        // length selects where stream1 ends and stream2 (chroma) begins.
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: sample_avc420(b"luma-nalu"),
+            stream2: Some(sample_avc420(b"chroma-nalu")),
+        };
+        let buf = encode_avc444(&stream);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = Avc444BitmapStream::decode(&mut cursor).expect("avc444 decode");
+        assert_eq!(decoded.encoding, Encoding::LUMA_AND_CHROMA);
+        assert_eq!(decoded.stream1.data, b"luma-nalu".as_slice());
+        let stream2 = decoded.stream2.as_ref().expect("stream2 present for LUMA_AND_CHROMA");
+        assert_eq!(stream2.data, b"chroma-nalu".as_slice());
+    }
+
+    #[test]
+    fn avc444_round_trip_luma_only() {
+        // LC == LUMA: only stream1; decoder must yield stream2 == None.
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: sample_avc420(b"luma-only"),
+            stream2: None,
+        };
+        let buf = encode_avc444(&stream);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = Avc444BitmapStream::decode(&mut cursor).expect("avc444 decode");
+        assert_eq!(decoded.encoding, Encoding::LUMA);
+        assert_eq!(decoded.stream1.data, b"luma-only".as_slice());
+        assert!(decoded.stream2.is_none(), "LUMA carries no chroma sub-stream");
+    }
+
+    #[test]
+    fn avc444_round_trip_chroma_only() {
+        // LC == CHROMA: only stream1 (the chroma view); stream2 == None.
+        let stream = Avc444BitmapStream {
+            encoding: Encoding::CHROMA,
+            stream1: sample_avc420(b"chroma-only"),
+            stream2: None,
+        };
+        let buf = encode_avc444(&stream);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let decoded = Avc444BitmapStream::decode(&mut cursor).expect("avc444 decode");
+        assert_eq!(decoded.encoding, Encoding::CHROMA);
+        assert_eq!(decoded.stream1.data, b"chroma-only".as_slice());
+        assert!(decoded.stream2.is_none(), "CHROMA carries no second sub-stream");
+    }
+
+    #[test]
+    fn avc444_decode_rejects_reserved_encoding() {
+        // streamInfo: bits 30..32 = encoding. 0b11 (== 3) is reserved -> error.
+        // Little-endian u32 0xC000_0000 => length 0, encoding 3.
+        let bytes = [0x00, 0x00, 0x00, 0xC0];
+        let mut cursor = ReadCursor::new(&bytes);
+        assert!(
+            Avc444BitmapStream::decode(&mut cursor).is_err(),
+            "reserved encoding value must be rejected"
+        );
+    }
+
+    #[test]
+    fn avc444_decode_rejects_zero_len_luma_and_chroma() {
+        // streamInfo == 0 => length 0 with encoding LUMA_AND_CHROMA, which is
+        // contradictory (both views require a non-zero split length) -> error.
+        let bytes = [0x00, 0x00, 0x00, 0x00];
+        let mut cursor = ReadCursor::new(&bytes);
+        assert!(
+            Avc444BitmapStream::decode(&mut cursor).is_err(),
+            "zero-length LUMA_AND_CHROMA must be rejected"
+        );
+    }
 }
