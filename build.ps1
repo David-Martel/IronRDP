@@ -12,6 +12,7 @@ param(
     [switch]$NativeCpu,
     [switch]$NoSccache,
     [switch]$SkipDotNet,
+    [switch]$NoH264,
     [string]$ArtifactRoot,
     [string]$DeploymentName,
     [string]$TargetMachine,
@@ -56,6 +57,22 @@ $script:DeploymentName = $null
 $script:ImportedModules = [ordered]@{}
 $script:ToolchainInfo = [ordered]@{}
 $script:HardwareProfile = [ordered]@{}
+
+# Extra `cargo` args for every `ironrdp-client` build so the H.264 posture is
+# decided in exactly one place. Default (empty) keeps the default-feature build
+# byte-identical to `cargo build --release -p ironrdp-client` (rustls + openh264,
+# i.e. bundled OpenH264 / EGFX H.264). `-NoH264` produces the patent-clean,
+# nasm-free portable variant (classic bitmap/RemoteFX only).
+$script:ClientFeatureArgs = if ($NoH264) {
+    @('--no-default-features', '--features', 'rustls')
+} else {
+    @()
+}
+
+# Modes that emit a redistributable release artifact. For these, silently
+# shipping the non-SIMD pure-C H.264 fallback (because nasm was missing) is a
+# footgun, so the prereq check is an error rather than a warning.
+$script:ReleaseArtifactModes = @('package', 'publish', 'deploy', 'deploy-suite')
 
 function Set-DefaultEnvVar {
     param(
@@ -179,6 +196,15 @@ function Install-ChocoTool {
     if ($LASTEXITCODE -ne 0) {
         throw "failed to install $PackageName"
     }
+
+    # Chocolatey updated the persisted (machine) PATH; re-hydrate this process so
+    # the just-installed executable is resolvable by the child cargo/build-script
+    # processes launched later in this same invocation (see notes on the helper).
+    Sync-SessionPathFromRegistry
+
+    if (-not (Test-Tool $ExecutableName)) {
+        Write-Warning "$ExecutableName was installed via '$PackageName' but is still not resolvable on PATH after a registry refresh; downstream builds that need it may fall back or fail."
+    }
 }
 
 function Register-ImportedModule {
@@ -230,6 +256,78 @@ function Add-PathEntry {
     }
 
     $env:PATH = "$resolvedEntry;$env:PATH"
+}
+
+# Re-hydrate this process's PATH from the Machine + User registry hives.
+# Chocolatey packages that install "real" programs (e.g. `nasm`, which lands in
+# `C:\Program Files\NASM` with no shim under `C:\ProgramData\chocolatey\bin`)
+# update the *machine* PATH, but a running process keeps the PATH it spawned
+# with. Without this refresh a freshly bootstrapped `nasm` stays invisible to
+# the child `cargo`/build-script processes in the SAME build.ps1 invocation, so
+# openh264-sys2 silently falls back to its non-SIMD pure-C H.264 path. Call this
+# after any tool install that mutates the persisted PATH.
+function Sync-SessionPathFromRegistry {
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $ordered = [System.Collections.Generic.List[string]]::new()
+
+    # Prefer entries already live in this session, then layer in Machine + User.
+    $sources = @(
+        $env:PATH,
+        [Environment]::GetEnvironmentVariable('Path', 'Machine'),
+        [Environment]::GetEnvironmentVariable('Path', 'User')
+    )
+
+    foreach ($source in $sources) {
+        if ([string]::IsNullOrWhiteSpace($source)) { continue }
+        foreach ($entry in ($source -split ';')) {
+            $trimmed = $entry.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+            if ($seen.Add($trimmed)) { $ordered.Add($trimmed) }
+        }
+    }
+
+    $env:PATH = ($ordered -join ';')
+}
+
+# Verify the toolchain can produce the H.264 build the operator asked for.
+# The default `ironrdp-client` features include `openh264` -> openh264-bundled ->
+# `openh264/source`, which compiles Cisco's OpenH264 from source. That needs a
+# C/C++ compiler (always, via the `cc` crate) plus `nasm` for the SIMD assembly.
+# openh264-sys2 treats a missing/failing nasm as a *silent* fallback to a slower
+# pure-C decoder, so we surface it here instead of letting it pass unnoticed.
+function Assert-ClientBuildPrereqs {
+    param([Parameter(Mandatory)][string]$BuildMode)
+
+    if ($NoH264) {
+        Write-Host "H.264 posture: DISABLED (-NoH264 -> --no-default-features --features rustls; patent-clean, no OpenH264, nasm not required)." -ForegroundColor Yellow
+        return
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:OPENH264_NO_ASM)) {
+        Write-Warning "OPENH264_NO_ASM is set: OpenH264 will build without SIMD assembly (pure-C H.264 decoder). This is slower and should only be used deliberately."
+        return
+    }
+
+    if (Test-Tool 'nasm') {
+        Write-Host "H.264 posture: ENABLED (bundled OpenH264 from source, nasm present for SIMD assembly)." -ForegroundColor Cyan
+        return
+    }
+
+    # nasm missing and no explicit opt-out.
+    $guidance = @(
+        "nasm was not found on PATH, but the default client build compiles bundled OpenH264 from source and needs nasm for its SIMD assembly.",
+        "Without nasm, openh264-sys2 SILENTLY falls back to a slower pure-C H.264 decoder.",
+        "Resolve by one of:",
+        "  * install nasm and re-run (e.g. re-run with -BootstrapTools, or 'choco install nasm'),",
+        "  * pass -NoH264 to build the patent-clean, H.264-free client (no nasm needed),",
+        "  * set OPENH264_NO_ASM=1 to deliberately accept the pure-C fallback."
+    ) -join [Environment]::NewLine
+
+    if ($script:ReleaseArtifactModes -contains $BuildMode) {
+        throw "Release build prerequisite missing.`n$guidance"
+    }
+
+    Write-Warning $guidance
 }
 
 function Set-DefaultEnvPathList {
@@ -1390,12 +1488,16 @@ function Write-DoctorReport {
         Format-DoctorRow -Tag '[ABSENT]' -Label '.NET SDK' -Detail '(FFI .NET bindings will be skipped)' -TagColor DarkGray
     }
 
-    # NASM
+    # NASM — required for the SIMD assembly of the DEFAULT client build, which
+    # compiles bundled OpenH264 from source (openh264 feature is on by default).
+    # Missing nasm is not fatal (openh264-sys2 silently falls back to a slower
+    # pure-C decoder), so it is a warning, not a hard failure. Build patent-clean
+    # with -NoH264 to drop OpenH264 entirely and make nasm irrelevant.
     if ($nasmPath) {
         $nasmDetail = if ($nasmVersion) { $nasmVersion } else { $nasmPath }
-        Format-DoctorRow -Tag '[PRESENT]' -Label 'NASM' -Detail $nasmDetail -TagColor Green
+        Format-DoctorRow -Tag '[PRESENT]' -Label 'NASM (H.264 SIMD)' -Detail $nasmDetail -TagColor Green
     } else {
-        Format-DoctorRow -Tag '[ABSENT]' -Label 'NASM' -Detail '(assembler not found)' -TagColor DarkGray
+        Format-DoctorRow -Tag '[WARN]' -Label 'NASM (H.264 SIMD)' -Detail 'not found — default OpenH264 build falls back to slower pure-C (install nasm, or use -NoH264)' -TagColor Yellow
     }
 
     # Ninja
@@ -1583,19 +1685,27 @@ try {
     Write-Host "Machine config provider: $(if (Get-Command Get-MachineConfiguration -ErrorAction SilentlyContinue) { (Get-Command Get-MachineConfiguration).Source } else { 'unavailable' })" -ForegroundColor Cyan
     Write-Host "Profile config provider: $(if (Get-Command Get-ProfileConfiguration -ErrorAction SilentlyContinue) { (Get-Command Get-ProfileConfiguration).Source } else { 'unavailable' })" -ForegroundColor Cyan
 
+    # Gate any mode that compiles ironrdp-client on the H.264 build prerequisites
+    # (nasm for the default bundled-OpenH264 path). Runs after tool bootstrap and
+    # the toolchain/PATH refresh above so a just-installed nasm is visible.
+    $clientBuildingModes = @('client', 'deploy', 'deploy-suite', 'all', 'package', 'publish')
+    if ($clientBuildingModes -contains $Mode) {
+        Assert-ClientBuildPrereqs -BuildMode $Mode
+    }
+
     switch ($Mode) {
         'check' {
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs @('check', '--workspace'))
         }
         'client' {
             $clientProfile = if ($Release) { $ClientBuildProfile } else { '' }
-            $clientArgs = @('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile)
+            $clientArgs = @('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile) + $script:ClientFeatureArgs
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs $clientArgs -SupportsTimings)
         }
         'deploy' {
             # Always build release; static CRT is added to RUSTFLAGS above via $portableWindowsRuntimeModes.
             $Release = $true
-            $clientArgs = @('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $ClientBuildProfile)
+            $clientArgs = @('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $ClientBuildProfile) + $script:ClientFeatureArgs
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs $clientArgs -SupportsTimings)
             Deploy-ClientBinary
             Write-Host "  Ready for: build.ps1 -Mode hyperv-suite" -ForegroundColor Cyan
@@ -1604,7 +1714,7 @@ try {
         'deploy-suite' {
             # Phase 1: build and deploy the client binary to the artifact root.
             $Release = $true
-            $clientArgs = @('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $ClientBuildProfile)
+            $clientArgs = @('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $ClientBuildProfile) + $script:ClientFeatureArgs
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs $clientArgs -SupportsTimings)
             Deploy-ClientBinary
 
@@ -1706,7 +1816,7 @@ try {
             $ffiProfile = if ($Release) { $FfiBuildProfile } else { '' }
 
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs @('check', '--workspace'))
-            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile)) -SupportsTimings)
+            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile) + $script:ClientFeatureArgs) -SupportsTimings)
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ffi') + (Get-ProfileArgs $ffiProfile)) -SupportsTimings)
             Copy-FfiNativeBinary -ProfileName $(if ($Release) { $FfiBuildProfile } else { 'debug' })
             Ensure-DiplomatTool
@@ -1724,7 +1834,7 @@ try {
             $ffiProfile = $FfiBuildProfile
             $clientProfile = $ClientBuildProfile
 
-            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile)) -SupportsTimings)
+            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile) + $script:ClientFeatureArgs) -SupportsTimings)
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ffi') + (Get-ProfileArgs $ffiProfile)) -SupportsTimings)
             Copy-FfiNativeBinary -ProfileName $ffiProfile
             Ensure-DiplomatTool
@@ -1747,7 +1857,7 @@ try {
             Invoke-RepoCargo -ArgumentList @('nextest', 'run', '--workspace', '--no-fail-fast')
             $ffiProfile = $FfiBuildProfile
             $clientProfile = $ClientBuildProfile
-            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile)) -SupportsTimings)
+            Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ironrdp-client') + (Get-ProfileArgs $clientProfile) + $script:ClientFeatureArgs) -SupportsTimings)
             Invoke-RepoCargo -ArgumentList (Get-BuildArgs -BaseArgs (@('build', '--package', 'ffi') + (Get-ProfileArgs $ffiProfile)) -SupportsTimings)
             Copy-FfiNativeBinary -ProfileName $ffiProfile
             Ensure-DiplomatTool
