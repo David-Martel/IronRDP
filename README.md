@@ -16,6 +16,16 @@ Supported codecs:
 - Interleaved Run-Length Encoding (RLE) Bitmap Codec
 - RDP 6.0 Bitmap Compression
 - Microsoft RemoteFX (RFX)
+- H.264 / AVC420 over the Graphics Pipeline (EGFX), and opt-in AVC444/AVC444v2
+  4:4:4 dual-stream decode, via bundled OpenH264
+
+> On this fork the `ironrdp-client` binary is built with the `openh264` feature
+> **on by default**, so a plain `cargo build --release -p ironrdp-client` can
+> render EGFX/H.264 servers (e.g. gnome-remote-desktop) out of the box. This
+> pulls in a from-source build of Cisco's OpenH264 — see
+> [H.264 / OpenH264 build prerequisites](#h264--openh264-build-prerequisites)
+> below for the toolchain requirement (nasm + a C/C++ compiler) and the H.264
+> patent/licensing consideration for redistribution.
 
 ## Examples
 
@@ -33,6 +43,45 @@ This fork carries a Windows-focused build entrypoint at [`build.ps1`](./build.ps
 It is intended to run with the local `CargoTools` PowerShell module, and it
 opportunistically consumes `ProfileUtilities` and `MachineConfiguration` when
 they are available on the workstation.
+
+### H.264 / OpenH264 build prerequisites
+
+Because the `ironrdp-client` binary is built with the `openh264` feature on by
+default (see [Video Codec Support](#video-codec-support)), the default build
+compiles **Cisco's OpenH264 from source** (`openh264` → `ironrdp-egfx/openh264-bundled`
+→ `openh264/source`). That adds two build-time toolchain requirements beyond the
+Rust toolchain:
+
+- **A C/C++ compiler** — hard requirement. On Windows this is the MSVC toolset
+  (`cl.exe`) that ships with Visual Studio / the C++ Build Tools; `build.ps1`
+  already treats MSVC as a required dependency (`-Mode doctor` reports it).
+- **`nasm`** — required for OpenH264's SIMD assembly. This is a *soft* requirement:
+  `openh264-sys2` silently falls back to a slower pure-C decoder when `nasm` is
+  missing, so a release build can succeed while quietly shipping the unoptimized
+  H.264 path. `build.ps1` therefore checks for `nasm` before building the client
+  and **errors** for release/artifact modes (`package`, `publish`, `deploy`,
+  `deploy-suite`) if it is absent, and warns for `client`/`all`. Install it with
+  `-BootstrapTools` (which runs `choco install nasm` and refreshes the process
+  PATH so the just-installed assembler is visible to the child `cargo`), or
+  `choco install nasm` manually, or run `-Mode doctor` to see its status.
+
+**Building without H.264 (patent-clean / no native toolchain).** Cisco's
+royalty-free H.264 patent grant only covers Cisco's own *binary* OpenH264
+distribution; a from-source build falls outside that umbrella, so shipping the
+default build assumes the distributor either holds an H.264/AVC patent license or
+accepts that risk. This is a **conscious distribution decision** for this fork's
+release artifacts. To produce a patent-clean, nasm-free portable client (classic
+bitmap / RemoteFX only, no H.264), pass `-NoH264`:
+
+```pwsh
+pwsh -NoLogo -NoProfile -File .\build.ps1 -Mode package -Release -NoH264
+```
+
+`-NoH264` maps to `cargo build --no-default-features --features rustls` for the
+client; the equivalent raw cargo invocation is
+`cargo build --release -p ironrdp-client --no-default-features --features rustls`.
+As a middle ground, set `OPENH264_NO_ASM=1` to deliberately build OpenH264
+without SIMD assembly (keeps H.264, drops the nasm requirement, slower decode).
 
 Typical local flows:
 
