@@ -568,11 +568,23 @@ so there is nothing to cherry-pick for them.** Primary-source evidence:
   interleaved Set-Error-Info diagnostic. Gate results: `cargo test --workspace`
   1348 passed / 0 failed (baseline held), `cargo build --release -p ironrdp-client`
   (default rustls+openh264) clean, clippy 0 findings on both touched files.
-  dtm-work live insurance: TCP+TLS+CredSSP/NLA auth SUCCEEDED with a runtime-read
-  Credential-Manager credential (the connect path #1236 touches — intact); the
-  session then hit a transport `ConnectionReset` (WSA 10054) before first frame,
-  an environment/server-session condition on a code path #1236 does not touch, not
-  a client regression.
+  dtm-work live insurance (honest framing): TCP+TLS+CredSSP/NLA auth SUCCEEDED
+  with a runtime-read Credential-Manager credential (generic `TERMSRV/dtm-work.
+  radius.dtmventures.com`, 48-byte blob read via CredRead at runtime, never
+  persisted) — the connect/auth path #1236 sits on is intact. **First-frame
+  present was NOT reproduced this session** (documented baseline was "connect +
+  first frame 1920x1080, session held"), so this run is BELOW baseline: the
+  session hit `[read frame]` `ConnectionReset` **WSA 10054 = "existing connection
+  forcibly closed by the *remote* host"** right after auth, before any frame. This
+  reproduced identically on a single clean run after a 60s half-open drain (not a
+  rapid-reconnect artifact), so the cause is a dtm-work server-state condition
+  (suspected active single-session / post-NLA reject) — suspected, not confirmed.
+  It is provably NOT a #1236 regression: 10054 is remote-initiated (the server
+  closed its socket), and #1236 changed only error-arm *strings* in match arms
+  that do not execute on a successful connect (the `Ok` arms of `decode_io_channel`
+  are byte-identical). asuspro13 GRD render was NOT attempted — #1236 is connector
+  error-text and cannot reach the EGFX render path, so it is structurally
+  irrelevant to that banked win.
 
 - Already-present / no-op: **#1395 (368fe8e6)** `don't require CONTEXT block on
   every progressive frame` is ALREADY in the fork (`progressive.rs:835-850`,
