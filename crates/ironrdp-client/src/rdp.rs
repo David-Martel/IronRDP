@@ -378,6 +378,19 @@ impl RdpClient {
                     self.config.connector.request_data =
                         routing_token.map(ironrdp::pdu::nego::NegoRequestData::raw);
 
+                    // Advertise connect-time network auto-detection on the INITIAL connect
+                    // only, never on the handover reconnect. Re-advertising
+                    // SUPPORT_NET_CHAR_AUTODETECT to gnome-remote-desktop's handover
+                    // (FreeRDP) instance makes it run a deactivation-reactivation and send an
+                    // MCS Disconnect Provider Ultimatum (UserRequested) right after the
+                    // reconnect, so no frame ever renders. The initial connect already flips
+                    // the server-side audio-redirection gate, so suppressing the capability
+                    // here lets audio and the handover coexist. No-op unless the user opted
+                    // into `--network-autodetect` (default is off); keeping it off also keeps
+                    // the connector's ConnectTimeAutoDetection handler consistent with the
+                    // un-advertised capability on the reconnect.
+                    self.config.connector.network_autodetect = false;
+
                     // GRD's handover instance authenticates the redirected connection
                     // against a winpr NTLM SAM populated with the redirection-provided
                     // credentials (not the original PAM login), so switch to them when
