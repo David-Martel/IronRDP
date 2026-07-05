@@ -799,7 +799,11 @@ fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
         None => String::new(),
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        Some(first) => {
+            let mut capitalized: String = first.to_uppercase().collect();
+            capitalized.push_str(chars.as_str());
+            capitalized
+        }
     }
 }
 
@@ -810,12 +814,11 @@ fn capitalize_first(s: &str) -> String {
 /// that the message was cut short.
 fn truncate_for_title(s: &str, max_chars: usize) -> String {
     let mut chars = s.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
+    let mut truncated: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
-        truncated + "\u{2026}" // U+2026 HORIZONTAL ELLIPSIS
-    } else {
-        truncated
+        truncated.push('\u{2026}'); // U+2026 HORIZONTAL ELLIPSIS
     }
+    truncated
 }
 
 fn unicode_text_operations(text: &str) -> smallvec::SmallVec<[ironrdp::input::Operation; 8]> {
@@ -856,8 +859,8 @@ mod tests {
 
     #[test]
     fn capitalize_first_multibyte_char() {
-        // 'é' → 'É'
-        assert_eq!(capitalize_first("été"), "Été");
+        // 'é' → 'É' (escaped to keep the source ASCII-only)
+        assert_eq!(capitalize_first("\u{e9}t\u{e9}"), "\u{c9}t\u{e9}");
     }
 
     #[test]
@@ -878,10 +881,11 @@ mod tests {
 
     #[test]
     fn truncate_for_title_multibyte_chars_respected() {
-        // Each '中' is 3 bytes but 1 char; limit=2 should give "中中…"
-        let s = "中中中中";
+        // Each '中' (U+4E2D) is 3 bytes but 1 char; limit=2 should give "中中…".
+        // Escaped to keep the source ASCII-only.
+        let s = "\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}";
         let result = truncate_for_title(s, 2);
-        assert_eq!(result, "中中\u{2026}");
+        assert_eq!(result, "\u{4e2d}\u{4e2d}\u{2026}");
     }
 
     #[test]

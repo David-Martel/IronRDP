@@ -734,9 +734,9 @@ async fn test_decompressor_regression() {
         let bytes_per_pixel: usize = PixelFormat::RgbA32.bytes_per_pixel().into();
         let stride = NonZeroUsize::new(usize::from(width.get()) * bytes_per_pixel).unwrap();
         // Solid red RGBA pixels.
-        let pixel_data: Vec<u8> = (0..usize::from(height.get()))
+        let pixel_data: Vec<u8> = (0..NonZeroUsize::from(height).get())
             .flat_map(|_| {
-                (0..usize::from(width.get())).flat_map(|_| [0xFFu8, 0x00, 0x00, 0xFF])
+                (0..NonZeroUsize::from(width).get()).flat_map(|_| [0xFFu8, 0x00, 0x00, 0xFF])
             })
             .collect();
 

@@ -18,11 +18,11 @@
 //!   → start bidirectional GatewayRelay
 //! ```
 
+use core::net::SocketAddr;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result, bail};
 use futures_util::stream::SplitSink;
@@ -156,6 +156,13 @@ impl GatewayListener {
 
         info!(listen_addr = %self.config.listen_addr, "gateway listener started");
 
+        // Intentional: the gateway accept loop runs for the lifetime of the process.
+        // Individual accept errors are logged and swallowed so the listener keeps
+        // serving; there is deliberately no break/return condition.
+        #[expect(
+            clippy::infinite_loop,
+            reason = "gateway accept loop runs for the process lifetime; errors are logged and swallowed"
+        )]
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
