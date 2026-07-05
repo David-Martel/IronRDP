@@ -53,35 +53,50 @@ use crate::session_driver::{RdpControlFlow, RedirectInfo, run_active_session};
 #[cfg(feature = "egfx")]
 struct EgfxRenderHandler {
     event_loop_proxy: EventLoopProxy<RdpOutputEvent>,
+    /// When true, advertise EGFX V10.7 so the server may select AVC444 dual-stream
+    /// H.264. Off by default so only AVC420 (V8.1) is advertised.
+    avc444: bool,
 }
 
 #[cfg(feature = "egfx")]
 impl EgfxRenderHandler {
-    fn new(event_loop_proxy: EventLoopProxy<RdpOutputEvent>) -> Self {
-        Self { event_loop_proxy }
+    fn new(event_loop_proxy: EventLoopProxy<RdpOutputEvent>, avc444: bool) -> Self {
+        Self {
+            event_loop_proxy,
+            avc444,
+        }
     }
 }
 
 #[cfg(feature = "egfx")]
 impl ironrdp_egfx::client::GraphicsPipelineHandler for EgfxRenderHandler {
     fn capabilities(&self) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
-        use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet};
+        use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet};
 
-        // Cap the advertised EGFX capability at V8.1 / AVC420. The default
-        // advertisement includes V10.7, which lets servers (Windows and
-        // gnome-remote-desktop alike) select AVC444 dual-stream H.264 — a format
-        // the client's decode path does not yet reconstruct, so those frames are
-        // dropped and nothing is presented. Advertising AVC420 as the highest
-        // capability makes the server send single-stream AVC420, which decodes via
-        // OpenH264 and reaches the framebuffer. V8 (no AVC) is kept as a fallback.
-        vec![
-            CapabilitySet::V8_1 {
-                flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V8 {
-                flags: CapabilitiesV8Flags::SMALL_CACHE,
-            },
-        ]
+        // By default, cap the advertised EGFX capability at V8.1 / AVC420. The
+        // stock default advertisement includes V10.7, which lets servers (Windows
+        // and gnome-remote-desktop alike) select AVC444 dual-stream H.264.
+        // Advertising AVC420 as the highest capability makes the server send
+        // single-stream AVC420, which decodes via OpenH264 and reaches the
+        // framebuffer. V8 (no AVC) is kept as a fallback.
+        //
+        // When `--avc444` is set, prepend V10.7 so the server may select AVC444;
+        // the client reconstructs YUV 4:4:4 from the dual sub-streams. This is
+        // opt-in because AVC444 decode is experimental and unvalidated end-to-end,
+        // and must never displace the working AVC420 render path by default.
+        let mut caps = Vec::new();
+        if self.avc444 {
+            caps.push(CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::SMALL_CACHE,
+            });
+        }
+        caps.push(CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+        });
+        caps.push(CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        });
+        caps
     }
 
     fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
@@ -467,10 +482,27 @@ async fn connect(
         let h264_decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> = None;
 
         info!("Registering EGFX graphics pipeline DVC channel");
-        drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
-            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone())),
+        #[cfg_attr(not(feature = "openh264"), allow(unused_mut))]
+        let mut gfx_client = ironrdp_egfx::client::GraphicsPipelineClient::new(
+            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone(), config.avc444)),
             h264_decoder,
-        ));
+        );
+        // AVC444's chroma-auxiliary sub-stream needs its own H.264 decode context,
+        // separate from the luma/AVC420 decoder (the two are independent H.264
+        // sequences). Build it only when AVC444 is opted into.
+        #[cfg(feature = "openh264")]
+        if config.avc444 {
+            match ironrdp_egfx::decode::OpenH264Decoder::new() {
+                Ok(decoder) => {
+                    info!("AVC444 enabled: dedicated OpenH264 chroma decoder initialized");
+                    gfx_client.set_avc444_chroma_decoder(Box::new(decoder));
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create AVC444 chroma decoder; AVC444 frames will be skipped");
+                }
+            }
+        }
+        drdynvc = drdynvc.with_dynamic_channel(gfx_client);
     }
 
     // Load DVC COM plugins (Windows only)
@@ -634,10 +666,27 @@ async fn connect_ws(
         let h264_decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> = None;
 
         info!("Registering EGFX graphics pipeline DVC channel");
-        drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
-            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone())),
+        #[cfg_attr(not(feature = "openh264"), allow(unused_mut))]
+        let mut gfx_client = ironrdp_egfx::client::GraphicsPipelineClient::new(
+            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone(), config.avc444)),
             h264_decoder,
-        ));
+        );
+        // AVC444's chroma-auxiliary sub-stream needs its own H.264 decode context,
+        // separate from the luma/AVC420 decoder (the two are independent H.264
+        // sequences). Build it only when AVC444 is opted into.
+        #[cfg(feature = "openh264")]
+        if config.avc444 {
+            match ironrdp_egfx::decode::OpenH264Decoder::new() {
+                Ok(decoder) => {
+                    info!("AVC444 enabled: dedicated OpenH264 chroma decoder initialized");
+                    gfx_client.set_avc444_chroma_decoder(Box::new(decoder));
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create AVC444 chroma decoder; AVC444 frames will be skipped");
+                }
+            }
+        }
+        drdynvc = drdynvc.with_dynamic_channel(gfx_client);
     }
 
     // Load DVC COM plugins (Windows only)
