@@ -14,7 +14,7 @@ use winit::event_loop::EventLoop;
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 fn main() -> anyhow::Result<()> {
-    let mut config = Config::parse_args().context("CLI arguments parsing")?;
+    let config = Config::parse_args().context("CLI arguments parsing")?;
 
     setup_logging(config.log_file.as_deref()).context("unable to initialize logging")?;
 
@@ -32,10 +32,13 @@ fn main() -> anyhow::Result<()> {
         u32::from(config.connector.desktop_size.width),
         u32::from(config.connector.desktop_size.height),
     );
-    let mut app = App::new(&input_event_sender, initial_window_size, config.destination.name().to_owned())
-        .context("unable to initialize App")?;
-
-    config.connector.desktop_scale_factor = 0;
+    let mut app = App::new(
+        &input_event_sender,
+        initial_window_size,
+        config.destination.name().to_owned(),
+        config.fake_events_interval,
+    )
+    .context("unable to initialize App")?;
 
     let rt = runtime::Builder::new_multi_thread()
         .enable_all()

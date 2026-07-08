@@ -2,6 +2,7 @@
 
 use core::num::ParseIntError;
 use core::str::FromStr;
+use core::time::Duration;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -92,6 +93,13 @@ pub struct Config {
     /// AVC420 (V8.1) only, so a server never selects AVC444 and the AVC420 render
     /// path is untouched. Experimental and not validated end-to-end.
     pub avc444: bool,
+
+    /// Interval of input inactivity after which a fake mouse-move event is injected
+    /// to prevent the remote session from locking (`--prevent-session-lock`, minutes).
+    ///
+    /// `None` (the default) never injects synthetic input, so an idle session locks
+    /// per the server's own policy.
+    pub fake_events_interval: Option<Duration>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -385,6 +393,29 @@ struct Args {
     #[clap(long, requires("width"))]
     height: Option<u16>,
 
+    /// Desired desktop width for the RDP session.
+    ///
+    /// Populates the same `desktopwidth` property an `.rdp` file would, so it only takes
+    /// effect when `--width`/`--height` are not given.
+    #[clap(long, requires("desktop_height"), value_parser = clap::value_parser!(u16).range(1..=8192))]
+    desktop_width: Option<u16>,
+
+    /// Desired desktop height for the RDP session.
+    ///
+    /// Populates the same `desktopheight` property an `.rdp` file would, so it only takes
+    /// effect when `--width`/`--height` are not given.
+    #[clap(long, requires("desktop_width"), value_parser = clap::value_parser!(u16).range(1..=8192))]
+    desktop_height: Option<u16>,
+
+    /// Scaling factor for desktop applications, as a percentage (100 to 500).
+    #[clap(long, value_parser = clap::value_parser!(u32).range(100..=500))]
+    scale_desktop: Option<u32>,
+
+    /// Prevents session locking by injecting fake mouse movement events when the connection
+    /// is idle (interval in minutes).
+    #[clap(long)]
+    prevent_session_lock: Option<u32>,
+
     /// Ignore mouse pointer messages sent by the server. Increases performance when enabled, as the
     /// client could skip costly software rendering of the pointer with alpha blending
     #[clap(long)]
@@ -639,6 +670,15 @@ impl Config {
             None
         };
 
+        // `--desktop-width`/`--desktop-height` seed the same properties an `.rdp` file would,
+        // so they fall in behind `--width`/`--height` in `resolve_desktop_size` below.
+        if let Some(width) = args.desktop_width {
+            properties.insert("desktopwidth", i64::from(width));
+        }
+        if let Some(height) = args.desktop_height {
+            properties.insert("desktopheight", i64::from(height));
+        }
+
         let desktop_size = resolve_desktop_size(
             args.width,
             args.height,
@@ -646,12 +686,20 @@ impl Config {
             properties.desktop_height(),
         )?;
 
+        // Make a duration from the cmdline argument (minutes).
+        let fake_events_interval = args
+            .prevent_session_lock
+            .map(|v| Duration::from_secs(u64::from(v) * 60));
+
         let keyboard_layout = match args.keyboard_layout {
             Some(layout) => layout,
             None => {
                 let detected = detect_keyboard_layout();
                 if detected != 0 {
-                    tracing::debug!(keyboard_layout = format_args!("0x{detected:08X}"), "Auto-detected keyboard layout");
+                    tracing::debug!(
+                        keyboard_layout = format_args!("0x{detected:08X}"),
+                        "Auto-detected keyboard layout"
+                    );
                 }
                 detected
             }
@@ -696,7 +744,7 @@ impl Config {
             ime_file_name: args.ime_file_name,
             dig_product_id: args.dig_product_id,
             desktop_size,
-            desktop_scale_factor: 0, // Default to 0 per FreeRDP
+            desktop_scale_factor: args.scale_desktop.unwrap_or(0), // Default to 0 per FreeRDP
             bitmap: Some(bitmap),
             // Advertise Graphics Pipeline support when EGFX is requested, so EGFX-only
             // servers (e.g. gnome-remote-desktop 46+) accept the connection.
@@ -754,6 +802,7 @@ impl Config {
             egfx: egfx_enabled,
             auto_reconnect: args.auto_reconnect,
             avc444: args.avc444,
+            fake_events_interval,
         })
     }
 }
@@ -832,5 +881,53 @@ mod tests {
             .expect("multitransport CLI parse");
 
         assert_eq!(args.multitransport, MultitransportMode::PreferLossy);
+    }
+
+    #[test]
+    fn cli_parser_accepts_desktop_width_and_height() {
+        let args = Args::try_parse_from([
+            "ironrdp-client",
+            "server.example",
+            "--desktop-width",
+            "1600",
+            "--desktop-height",
+            "900",
+        ])
+        .expect("desktop-width/height CLI parse");
+
+        assert_eq!(args.desktop_width, Some(1600));
+        assert_eq!(args.desktop_height, Some(900));
+    }
+
+    #[test]
+    fn cli_parser_rejects_lone_desktop_width() {
+        let error = Args::try_parse_from(["ironrdp-client", "server.example", "--desktop-width", "1600"])
+            .expect_err("desktop-width without desktop-height must fail");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn cli_parser_accepts_scale_desktop() {
+        let args = Args::try_parse_from(["ironrdp-client", "server.example", "--scale-desktop", "150"])
+            .expect("scale-desktop CLI parse");
+
+        assert_eq!(args.scale_desktop, Some(150));
+    }
+
+    #[test]
+    fn cli_parser_rejects_out_of_range_scale_desktop() {
+        let error = Args::try_parse_from(["ironrdp-client", "server.example", "--scale-desktop", "50"])
+            .expect_err("scale-desktop below 100 must fail");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn cli_parser_accepts_prevent_session_lock() {
+        let args = Args::try_parse_from(["ironrdp-client", "server.example", "--prevent-session-lock", "5"])
+            .expect("prevent-session-lock CLI parse");
+
+        assert_eq!(args.prevent_session_lock, Some(5));
     }
 }

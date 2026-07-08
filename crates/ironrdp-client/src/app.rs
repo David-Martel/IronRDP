@@ -80,6 +80,12 @@ pub struct App {
     ctrl_pressed: bool,
     /// Tracks the Alt modifier state, updated from `ModifiersChanged` events.
     alt_pressed: bool,
+    /// Timestamp of the last input event sent to the server, used to detect idle periods
+    /// for `--prevent-session-lock`.
+    last_event: Option<Instant>,
+    /// Idle interval after which a fake mouse-move event is injected to prevent the remote
+    /// session from locking (`--prevent-session-lock`). `None` disables the behavior.
+    fake_events_interval: Option<Duration>,
 }
 
 impl App {
@@ -87,6 +93,7 @@ impl App {
         input_event_sender: &mpsc::UnboundedSender<RdpInputEvent>,
         initial_size: PhysicalSize<u32>,
         server_name: String,
+        fake_events_interval: Option<Duration>,
     ) -> anyhow::Result<Self> {
         let input_database = ironrdp::input::Database::new();
         Ok(Self {
@@ -112,6 +119,8 @@ impl App {
             is_fullscreen: false,
             ctrl_pressed: false,
             alt_pressed: false,
+            last_event: None,
+            fake_events_interval,
         })
     }
 
@@ -122,6 +131,29 @@ impl App {
     fn exit_with_code(&mut self, event_loop: &ActiveEventLoop, code: Code) {
         self.exit_code = code;
         event_loop.exit();
+    }
+
+    /// Injects a fake mouse-move event at the current pointer position when input has been
+    /// idle for longer than `fake_events_interval`, preventing the remote session from
+    /// locking on inactivity (`--prevent-session-lock`).
+    fn fake_mouse_move(&mut self) {
+        let (Some(last_event), Some(fake_events_interval)) = (self.last_event, self.fake_events_interval) else {
+            return;
+        };
+
+        if last_event.elapsed() > fake_events_interval {
+            let mut events = smallvec::SmallVec::new();
+            let curr_pos = self.input_database.mouse_position();
+            events.push(ironrdp::pdu::input::fast_path::FastPathInputEvent::MouseEvent(
+                ironrdp::pdu::input::MousePdu {
+                    flags: ironrdp::pdu::input::mouse::PointerFlags::MOVE,
+                    number_of_wheel_rotation_units: 0,
+                    x_position: curr_pos.x,
+                    y_position: curr_pos.y,
+                },
+            ));
+            let _ = self.input_event_sender.send(RdpInputEvent::FastPath(events));
+        }
     }
 
     fn send_resize_event(&mut self) {
@@ -288,6 +320,8 @@ impl App {
 
 impl ApplicationHandler<RdpOutputEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.fake_mouse_move();
+
         if let Some(timeout) = self.resize_timeout {
             if let Some(timeout) = timeout.checked_duration_since(Instant::now()) {
                 event_loop.set_control_flow(ControlFlow::wait_duration(timeout));
@@ -392,7 +426,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
 
                     let input_events = self.input_database.apply(core::iter::once(operation));
 
-                    send_fast_path_events(&self.input_event_sender, input_events);
+                    send_fast_path_events(&self.input_event_sender, input_events, &mut self.last_event);
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
@@ -400,7 +434,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
                 let operations = unicode_text_operations(&text);
                 if !operations.is_empty() {
                     let input_events = self.input_database.apply(operations);
-                    send_fast_path_events(&self.input_event_sender, input_events);
+                    send_fast_path_events(&self.input_event_sender, input_events, &mut self.last_event);
                 }
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
@@ -451,7 +485,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
 
                 let input_events = self.input_database.apply(operations);
 
-                send_fast_path_events(&self.input_event_sender, input_events);
+                send_fast_path_events(&self.input_event_sender, input_events, &mut self.last_event);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let win_size = window.inner_size();
@@ -463,7 +497,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
 
                 let input_events = self.input_database.apply(core::iter::once(operation));
 
-                send_fast_path_events(&self.input_event_sender, input_events);
+                send_fast_path_events(&self.input_event_sender, input_events, &mut self.last_event);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let mut operations = smallvec::SmallVec::<[ironrdp::input::Operation; 2]>::new();
@@ -515,7 +549,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
 
                 let input_events = self.input_database.apply(operations);
 
-                send_fast_path_events(&self.input_event_sender, input_events);
+                send_fast_path_events(&self.input_event_sender, input_events, &mut self.last_event);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let mouse_button = match button {
@@ -540,7 +574,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
 
                 let input_events = self.input_database.apply(core::iter::once(operation));
 
-                send_fast_path_events(&self.input_event_sender, input_events);
+                send_fast_path_events(&self.input_event_sender, input_events, &mut self.last_event);
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
@@ -631,8 +665,7 @@ impl ApplicationHandler<RdpOutputEvent> for App {
 
                 self.draw();
                 if self.frame_pending_present && !self.redraw_requested {
-                    self.pending_after_immediate_draw_count =
-                        self.pending_after_immediate_draw_count.saturating_add(1);
+                    self.pending_after_immediate_draw_count = self.pending_after_immediate_draw_count.saturating_add(1);
                     trace!(
                         pending_after_immediate_draw_count = self.pending_after_immediate_draw_count,
                         frame_was_already_pending = frame_was_pending,
@@ -786,10 +819,12 @@ impl ApplicationHandler<RdpOutputEvent> for App {
 fn send_fast_path_events(
     input_event_sender: &mpsc::UnboundedSender<RdpInputEvent>,
     input_events: smallvec::SmallVec<[ironrdp::pdu::input::fast_path::FastPathInputEvent; 2]>,
+    last_event: &mut Option<Instant>,
 ) {
     if !input_events.is_empty() {
         let _ = input_event_sender.send(RdpInputEvent::FastPath(input_events));
     }
+    *last_event = Some(Instant::now());
 }
 
 /// Capitalizes the first Unicode scalar value of `s`.
@@ -835,12 +870,14 @@ fn unicode_text_operations(text: &str) -> smallvec::SmallVec<[ironrdp::input::Op
 #[cfg(test)]
 mod tests {
     use core::num::NonZeroU16;
+    use core::time::Duration;
+    use std::time::Instant;
 
     use ironrdp::input::Operation;
     use tokio::sync::mpsc;
     use winit::dpi::PhysicalSize;
 
-    use super::{App, capitalize_first, truncate_for_title, unicode_text_operations};
+    use super::{App, RdpInputEvent, capitalize_first, truncate_for_title, unicode_text_operations};
 
     #[test]
     fn capitalize_first_empty_string() {
@@ -909,7 +946,7 @@ mod tests {
     #[test]
     fn queue_image_buffer_only_counts_pending_frames_as_overwritten() {
         let (sender, _receiver) = mpsc::unbounded_channel();
-        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned()).expect("app");
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned(), None).expect("app");
         let width = NonZeroU16::new(640).expect("non-zero width");
         let height = NonZeroU16::new(480).expect("non-zero height");
 
@@ -945,7 +982,7 @@ mod tests {
     #[test]
     fn blit_image_region_places_offset_subrect_and_leaves_rest_black() {
         let (sender, _receiver) = mpsc::unbounded_channel();
-        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned()).expect("app");
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned(), None).expect("app");
 
         let (surface_w, surface_h) = (10u16, 8u16);
         let (x, y, w, h) = (3u16, 2u16, 4u16, 3u16);
@@ -976,7 +1013,7 @@ mod tests {
     #[test]
     fn blit_image_region_clips_out_of_bounds_region() {
         let (sender, _receiver) = mpsc::unbounded_channel();
-        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned()).expect("app");
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned(), None).expect("app");
 
         let (surface_w, surface_h) = (8u16, 8u16);
         // Region starts near the edge and claims more width/height than remains.
@@ -1005,7 +1042,7 @@ mod tests {
     #[test]
     fn blit_image_region_preserves_unchanged_pixels_of_prior_frame() {
         let (sender, _receiver) = mpsc::unbounded_channel();
-        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned()).expect("app");
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned(), None).expect("app");
 
         let (surface_w, surface_h) = (6u16, 6u16);
         // Seed a full frame (as the Image path would) filled with 0x55.
@@ -1030,5 +1067,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fake_mouse_move_sends_event_after_idle_interval_elapses() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            &sender,
+            PhysicalSize::new(640, 480),
+            "test-server".to_owned(),
+            Some(Duration::from_millis(10)),
+        )
+        .expect("app");
+
+        app.last_event = Some(Instant::now() - Duration::from_millis(20));
+        app.fake_mouse_move();
+
+        let event = receiver.try_recv().expect("fake mouse-move event should be sent");
+        assert!(matches!(event, RdpInputEvent::FastPath(_)));
+    }
+
+    #[test]
+    fn fake_mouse_move_does_nothing_before_idle_interval_elapses() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            &sender,
+            PhysicalSize::new(640, 480),
+            "test-server".to_owned(),
+            Some(Duration::from_secs(60)),
+        )
+        .expect("app");
+
+        app.last_event = Some(Instant::now());
+        app.fake_mouse_move();
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "no event should be sent while still idle-fresh"
+        );
+    }
+
+    #[test]
+    fn fake_mouse_move_does_nothing_when_disabled() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(&sender, PhysicalSize::new(640, 480), "test-server".to_owned(), None).expect("app");
+
+        app.last_event = Some(Instant::now() - Duration::from_secs(3600));
+        app.fake_mouse_move();
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "no event should be sent when prevent-session-lock is disabled"
+        );
     }
 }
