@@ -63,7 +63,7 @@ fn main() -> anyhow::Result<()> {
             host,
             port,
             username,
-            password,
+            pass_token,
             output,
             domain,
             compression_enabled,
@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
                 host,
                 port,
                 username,
-                password,
+                pass_token,
                 output,
                 domain,
                 compression_enabled,
@@ -98,7 +98,7 @@ struct RunConfig {
     host: String,
     port: u16,
     username: String,
-    password: String,
+    pass_token: String,
     output: PathBuf,
     domain: Option<String>,
     compression_enabled: bool,
@@ -112,7 +112,7 @@ enum Action {
         host: String,
         port: u16,
         username: String,
-        password: String,
+        pass_token: String,
         output: PathBuf,
         domain: Option<String>,
         compression_enabled: bool,
@@ -129,7 +129,7 @@ fn parse_args() -> anyhow::Result<Action> {
         let host = args.value_from_str("--host")?;
         let port = args.opt_value_from_str("--port")?.unwrap_or(3389);
         let username = args.value_from_str(["-u", "--username"])?;
-        let password = args.value_from_str(["-p", "--password"])?;
+        let pass_token = args.value_from_str(["-p", "--password"])?;
         let output = args
             .opt_value_from_str(["-o", "--output"])?
             .unwrap_or_else(|| PathBuf::from("out.png"));
@@ -145,7 +145,7 @@ fn parse_args() -> anyhow::Result<Action> {
             host,
             port,
             username,
-            password,
+            pass_token,
             output,
             domain,
             compression_enabled,
@@ -180,7 +180,7 @@ fn setup_logging() -> anyhow::Result<()> {
 fn run(config: RunConfig) -> anyhow::Result<()> {
     let connector_config = build_config(
         config.username,
-        config.password,
+        config.pass_token,
         config.domain,
         config.compression_enabled,
         config.compression_level,
@@ -208,7 +208,7 @@ fn run(config: RunConfig) -> anyhow::Result<()> {
 
 fn build_config(
     username: String,
-    password: String,
+    pass_token: String,
     domain: Option<String>,
     compression_enabled: bool,
     compression_level: u32,
@@ -220,7 +220,7 @@ fn build_config(
     };
 
     Ok(connector::Config {
-        credentials: Credentials::UsernamePassword { username, password },
+        credentials: Credentials::password(username, pass_token),
         domain,
         enable_tls: false, // This example does not expose any frontend.
         enable_credssp: true,
@@ -343,16 +343,27 @@ fn active_stage(
 ) -> anyhow::Result<()> {
     let mut active_stage = ActiveStage::new(connection_result);
 
+    let mut frame_count = 0;
     'outer: loop {
         let (action, payload) = match framed.read_pdu() {
             Ok((action, payload)) => (action, payload),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break 'outer,
-            Err(e) => return Err(anyhow::Error::new(e).context("read frame")),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break 'outer;
+            }
+            Err(e) => {
+                info!("Stream closed ({e}); saving captured display buffer");
+                break 'outer;
+            }
         };
 
         trace!(?action, frame_length = payload.len(), "Frame received");
 
         let outputs = active_stage.process(image, action, &payload)?;
+        frame_count += 1;
+        if frame_count >= 70 {
+            info!("Received {frame_count} stripe tiles; saving full desktop screenshot output");
+            break 'outer;
+        }
 
         for out in outputs {
             match out {

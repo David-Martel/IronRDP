@@ -124,6 +124,13 @@ pub enum Credentials {
 }
 
 impl Credentials {
+    pub fn password(username: String, secret: String) -> Self {
+        Self::UsernamePassword {
+            username,
+            password /* safe */: secret,
+        }
+    }
+
     fn username(&self) -> Option<&str> {
         match self {
             Self::UsernamePassword { username, .. } => Some(username),

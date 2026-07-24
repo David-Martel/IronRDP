@@ -21,7 +21,6 @@ use ironrdp::server::{
     SoundServerFactory, TlsIdentityCtx, tokio,
 };
 use ironrdp_cliprdr_native::StubCliprdrBackend;
-use rand::prelude::*;
 use tracing::{debug, info, warn};
 
 const HELP: &str = "\
@@ -149,50 +148,176 @@ impl RdpServerInputHandler for Handler {
 const WIDTH: u16 = 1920;
 const HEIGHT: u16 = 1080;
 
-struct DisplayUpdates;
+struct DisplayUpdates {
+    frame_counter: u64,
+    stripe_y: u16,
+}
+
+impl DisplayUpdates {
+    fn new() -> Self {
+        Self {
+            frame_counter: 0,
+            stripe_y: 0,
+        }
+    }
+}
+
+const STRIPE_HEIGHT: u16 = 16;
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for DisplayUpdates {
     async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
-        sleep(Duration::from_millis(100)).await;
-        let mut rng = rand::rng();
-
-        let y: u16 = rng.random_range(0..HEIGHT);
-        let height = rng.random_range(1..=HEIGHT.checked_sub(y).expect("never underflow"));
-        let height = NonZeroU16::new(height).expect("never zero");
-
-        let x: u16 = rng.random_range(0..WIDTH);
-        let width = rng.random_range(1..=WIDTH.checked_sub(x).expect("never underflow"));
-        let width = NonZeroU16::new(width).expect("never zero");
-
-        let capacity = NonZeroUsize::from(width)
-            .checked_mul(NonZeroUsize::from(height))
-            .expect("never overflow")
-            .get()
-            .checked_mul(4)
-            .expect("never overflow");
-        let mut data = Vec::with_capacity(capacity);
-        for _ in 0..(data.capacity() / 4) {
-            data.push(rng.random());
-            data.push(rng.random());
-            data.push(rng.random());
-            data.push(255);
+        if self.stripe_y >= HEIGHT {
+            self.stripe_y = 0;
+            self.frame_counter += 1;
+            sleep(Duration::from_millis(66)).await; // ~15 FPS VSync pacing
         }
 
-        info!("get_update +{x}+{y} {width}x{height}");
-        let stride = NonZeroUsize::from(width)
-            .checked_mul(NonZeroUsize::new(4).expect("never zero"))
-            .expect("never overflow");
+        let y = self.stripe_y;
+        let h = STRIPE_HEIGHT.min(HEIGHT - y);
+        self.stripe_y += h;
+
+        let full_frame = render_full_desktop_frame(self.frame_counter);
+
+        // Extract stripe data for [y .. y+h]
+        let start_idx = (y as usize) * (WIDTH as usize) * 4;
+        let end_idx = ((y + h) as usize) * (WIDTH as usize) * 4;
+        let stripe_data = full_frame[start_idx..end_idx].to_vec();
+
         let bitmap = BitmapUpdate {
-            x,
+            x: 0,
             y,
-            width,
-            height,
+            width: NonZeroU16::new(WIDTH).unwrap(),
+            height: NonZeroU16::new(h).unwrap(),
             format: PixelFormat::BgrA32,
-            data: data.into(),
-            stride,
+            data: stripe_data.into(),
+            stride: NonZeroUsize::new((WIDTH as usize) * 4).unwrap(),
         };
+
         Ok(Some(DisplayUpdate::Bitmap(bitmap)))
+    }
+}
+
+fn render_full_desktop_frame(frame_num: u64) -> Vec<u8> {
+    let mut data = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
+
+    // 1. Desktop Background Gradient (Dark Slate / Navy)
+    for y in 0..HEIGHT {
+        let r = (26 + (y as u32 * 20 / HEIGHT as u32)) as u8;
+        let g = (29 + (y as u32 * 25 / HEIGHT as u32)) as u8;
+        let b = (36 + (y as u32 * 30 / HEIGHT as u32)) as u8;
+        for x in 0..WIDTH {
+            let idx = ((y as usize) * (WIDTH as usize) + (x as usize)) * 4;
+            data[idx] = b;
+            data[idx + 1] = g;
+            data[idx + 2] = r;
+            data[idx + 3] = 255;
+        }
+    }
+
+    // 2. Top Taskbar (y: 0..40, Dark Charcoal)
+    for y in 0..40 {
+        for x in 0..WIDTH {
+            let idx = ((y as usize) * (WIDTH as usize) + (x as usize)) * 4;
+            data[idx] = 23;
+            data[idx + 1] = 17;
+            data[idx + 2] = 13;
+            data[idx + 3] = 255;
+        }
+    }
+
+    // Taskbar Accent Line (y: 39, Electric Blue)
+    for x in 0..WIDTH {
+        let idx = ((39usize) * (WIDTH as usize) + (x as usize)) * 4;
+        data[idx] = 235;
+        data[idx + 1] = 111;
+        data[idx + 2] = 31;
+        data[idx + 3] = 255;
+    }
+
+    // 3. Central Application Window Frame (x: 400..1520, y: 150..850)
+    let win_x0 = 400;
+    let win_x1 = 1520;
+    let win_y0 = 150;
+    let win_y1 = 850;
+
+    for y in win_y0..win_y1 {
+        for x in win_x0..win_x1 {
+            let idx = ((y as usize) * (WIDTH as usize) + (x as usize)) * 4;
+            if y < 190 {
+                // Window Title Header (#161B22)
+                data[idx] = 34;
+                data[idx + 1] = 27;
+                data[idx + 2] = 22;
+            } else {
+                // Window Body (#21262D)
+                data[idx] = 45;
+                data[idx + 1] = 38;
+                data[idx + 2] = 33;
+            }
+            data[idx + 3] = 255;
+        }
+    }
+
+    // Window Window Control Buttons (Red, Yellow, Green)
+    draw_circle(&mut data, WIDTH, 430, 170, 6, [86, 95, 255, 255]); // Red
+    draw_circle(&mut data, WIDTH, 450, 170, 6, [46, 189, 255, 255]); // Yellow
+    draw_circle(&mut data, WIDTH, 470, 170, 6, [63, 201, 39, 255]); // Green
+
+    // 4. Color Calibration Test Bars (x: 1200..1880, y: 900..1040)
+    let bar_colors = [
+        [255, 0, 0, 255],     // Blue
+        [0, 255, 0, 255],     // Green
+        [0, 0, 255, 255],     // Red
+        [255, 255, 0, 255],   // Cyan
+        [255, 0, 255, 255],   // Magenta
+        [0, 255, 255, 255],   // Yellow
+        [255, 255, 255, 255], // White
+    ];
+    let bar_w = 680 / bar_colors.len() as u16;
+    for (i, col) in bar_colors.iter().enumerate() {
+        let bx0 = 1200 + (i as u16 * bar_w);
+        let bx1 = (bx0 + bar_w).min(1880);
+        for y in 900..1040 {
+            for x in bx0..bx1 {
+                let idx = ((y as usize) * (WIDTH as usize) + (x as usize)) * 4;
+                data[idx] = col[0];
+                data[idx + 1] = col[1];
+                data[idx + 2] = col[2];
+                data[idx + 3] = col[3];
+            }
+        }
+    }
+
+    // 5. Animated Bouncing Motion Target inside Window Body
+    let ball_cx = (600.0 + ((frame_num as f32 * 0.1).sin() * 300.0)) as u16;
+    let ball_cy = (500.0 + ((frame_num as f32 * 0.15).cos() * 200.0)) as u16;
+    draw_circle(&mut data, WIDTH, ball_cx, ball_cy, 25, [31, 111, 235, 255]); // Electric Blue Motion Target
+
+    data
+}
+
+fn draw_circle(data: &mut [u8], stride_w: u16, cx: u16, cy: u16, radius: u16, color: [u8; 4]) {
+    let r2 = (radius as i32) * (radius as i32);
+    let y0 = cy.saturating_sub(radius);
+    let y1 = (cy + radius).min(HEIGHT);
+    let x0 = cx.saturating_sub(radius);
+    let x1 = (cx + radius).min(stride_w);
+
+    for y in y0..y1 {
+        let dy = y as i32 - cy as i32;
+        for x in x0..x1 {
+            let dx = x as i32 - cx as i32;
+            if dx * dx + dy * dy <= r2 {
+                let idx = ((y as usize) * (stride_w as usize) + (x as usize)) * 4;
+                if idx + 3 < data.len() {
+                    data[idx] = color[0];
+                    data[idx + 1] = color[1];
+                    data[idx + 2] = color[2];
+                    data[idx + 3] = color[3];
+                }
+            }
+        }
     }
 }
 
@@ -206,7 +331,7 @@ impl RdpServerDisplay for Handler {
     }
 
     async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
-        Ok(Box::new(DisplayUpdates {}))
+        Ok(Box::new(DisplayUpdates::new()))
     }
 }
 
