@@ -12,6 +12,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod config;
+pub mod gui_manager;
 pub(crate) mod presentation;
 pub mod profile;
 /// Connection setup, transport upgrades, and reconnect policy for the native client.
