@@ -3,7 +3,12 @@
 set -euo pipefail
 
 REPO_DIR="/home/damartel/dev/repos/IronRDP"
+cd "${REPO_DIR}"
+
+if [ ! -f "target/debug/ironrdp-client" ]; then
+    echo "[BUILD] Compiling ironrdp-client..."
+    cargo build --package ironrdp-client
+fi
 
 echo "=== Launching IronRDP GUI Connection Manager ==="
-cd "${REPO_DIR}"
-cargo run --package ironrdp-client -- --help
+exec ./target/debug/ironrdp-client "$@"

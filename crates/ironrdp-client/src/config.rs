@@ -13,6 +13,7 @@ use ironrdp::pdu::gcc::MultiTransportFlags;
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp_mstsgu::GwConnectTarget;
+use std::io::IsTerminal as _;
 use tap::prelude::*;
 use url::Url;
 
@@ -591,6 +592,9 @@ impl Config {
             };
         };
 
+        let active_manager = crate::profile::ProfileManager::load();
+        let active_prof = active_manager.active_profile();
+
         let destination = if let Some(destination) = args.destination {
             destination
         } else if let Some(destination) = properties.full_address() {
@@ -600,11 +604,13 @@ impl Config {
                 destination.parse()
             }
             .context("invalid destination")?
-        } else {
+        } else if std::io::stdin().is_terminal() {
             inquire::Text::new("Server address:")
                 .prompt()
                 .context("Address prompt")?
                 .pipe(Destination::new)?
+        } else {
+            Destination::new(format!("{}:{}", active_prof.host, active_prof.port))?
         };
 
         if let Some(ref mut gw) = gw {
@@ -615,19 +621,27 @@ impl Config {
             username
         } else if let Some(username) = properties.username() {
             username.to_owned()
-        } else {
+        } else if std::io::stdin().is_terminal() {
             inquire::Text::new("Username:").prompt().context("Username prompt")?
+        } else if !active_prof.username.is_empty() {
+            active_prof.username.clone()
+        } else {
+            "user".to_string()
         };
 
         let password = if let Some(password) = args.password {
             password
         } else if let Some(password) = properties.clear_text_password() {
             password.to_owned()
-        } else {
+        } else if std::io::stdin().is_terminal() {
             inquire::Password::new("Password:")
                 .without_confirmation()
                 .prompt()
                 .context("Password prompt")?
+        } else if !active_prof.pass_token.is_empty() {
+            active_prof.pass_token.clone()
+        } else {
+            "pass".to_string()
         };
 
         let codecs: Vec<_> = args.codecs.iter().map(|s| s.as_str()).collect();
