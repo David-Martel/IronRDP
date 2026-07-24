@@ -198,7 +198,76 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
     }
 }
 
+fn load_real_desktop_ppm() -> Option<Vec<u8>> {
+    let path = std::path::Path::new("/tmp/real_spark_desktop.ppm");
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read(path).ok()?;
+    if content.len() < 15 || !content.starts_with(b"P6") {
+        return None;
+    }
+    let mut cursor = 2;
+    while cursor < content.len() && content[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    let mut header_tokens = Vec::new();
+    while header_tokens.len() < 3 && cursor < content.len() {
+        if content[cursor] == b'#' {
+            while cursor < content.len() && content[cursor] != b'\n' {
+                cursor += 1;
+            }
+        } else if content[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        } else {
+            let start = cursor;
+            while cursor < content.len() && !content[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if let Ok(tok) = std::str::from_utf8(&content[start..cursor]) {
+                header_tokens.push(tok.to_owned());
+            }
+        }
+    }
+    if header_tokens.len() < 3 {
+        return None;
+    }
+    let orig_w: usize = header_tokens[0].parse().ok()?;
+    let orig_h: usize = header_tokens[1].parse().ok()?;
+
+    while cursor < content.len() && content[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+
+    let pixel_bytes = &content[cursor..];
+    if pixel_bytes.len() < orig_w * orig_h * 3 {
+        return None;
+    }
+
+    let mut bgra = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
+    for y in 0..HEIGHT as usize {
+        let src_y = (y * orig_h) / (HEIGHT as usize);
+        for x in 0..WIDTH as usize {
+            let src_x = (x * orig_w) / (WIDTH as usize);
+            let src_idx = (src_y * orig_w + src_x) * 3;
+            let dst_idx = (y * (WIDTH as usize) + x) * 4;
+
+            if src_idx + 2 < pixel_bytes.len() {
+                bgra[dst_idx] = pixel_bytes[src_idx + 2]; // B
+                bgra[dst_idx + 1] = pixel_bytes[src_idx + 1]; // G
+                bgra[dst_idx + 2] = pixel_bytes[src_idx]; // R
+                bgra[dst_idx + 3] = 255;
+            }
+        }
+    }
+    Some(bgra)
+}
+
 fn render_full_desktop_frame(frame_num: u64) -> Vec<u8> {
+    if let Some(real_desktop) = load_real_desktop_ppm() {
+        return real_desktop;
+    }
+
     let mut data = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
 
     // 1. Desktop Background Gradient (Dark Slate / Navy)
