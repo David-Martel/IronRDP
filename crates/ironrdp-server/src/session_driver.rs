@@ -100,13 +100,25 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
     ) -> Result<RunState> {
-        // Avoid wave message queuing up and causing extra delays.
-        // This is a naive solution, better solutions should compute the actual delay, add IO priority, encode audio, use UDP etc.
-        // 4 frames should roughly corresponds to hundreds of ms in regular setups.
-        let mut wave_limit = 4;
+        // Avoid wave messages queuing up and causing extra delay. When a
+        // batch carries more than `WAVE_KEEP` waves, drop the OLDEST ones
+        // and keep the most recent — playing stale audio just bakes the
+        // latency in permanently, so a one-time dispatch stall (e.g. a video
+        // encode holding the server lock) would otherwise become a permanent
+        // audio offset.
+        //
+        // This is still a naive solution; better long-term: compute the
+        // actual delay, add IO priority, encode audio, use UDP, etc. 4 frames
+        // is roughly low hundreds of ms in regular setups.
+        const WAVE_KEEP: usize = 4;
+        let wave_total = events
+            .iter()
+            .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
+            .count();
+        let mut wave_skip = wave_total.saturating_sub(WAVE_KEEP);
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
-            match self.dispatch_server_event(event, user_channel_id, &mut wave_limit)? {
+            match self.dispatch_server_event(event, user_channel_id, &mut wave_skip)? {
                 DispatchDecision::Continue => continue,
                 DispatchDecision::Disconnect => return Ok(RunState::Disconnect),
                 DispatchDecision::Write(data) => writer.write_all(&data).await?,
@@ -120,7 +132,7 @@ impl RdpServer {
         &mut self,
         event: ServerEvent,
         user_channel_id: u16,
-        wave_limit: &mut usize,
+        wave_skip: &mut usize,
     ) -> Result<DispatchDecision> {
         match event {
             ServerEvent::Quit(reason) => {
@@ -135,7 +147,7 @@ impl RdpServer {
                 self.set_credentials(Some(creds));
                 Ok(DispatchDecision::Continue)
             }
-            ServerEvent::Rdpsnd(msg) => self.dispatch_rdpsnd_event(msg, user_channel_id, wave_limit),
+            ServerEvent::Rdpsnd(msg) => self.dispatch_rdpsnd_event(msg, user_channel_id, wave_skip),
             ServerEvent::Clipboard(msg) => self.dispatch_clipboard_event(msg, user_channel_id),
             ServerEvent::Echo(msg) => self.dispatch_echo_event(msg, user_channel_id),
             #[cfg(feature = "egfx")]
@@ -147,7 +159,7 @@ impl RdpServer {
         &mut self,
         msg: RdpsndServerMessage,
         user_channel_id: u16,
-        wave_limit: &mut usize,
+        wave_skip: &mut usize,
     ) -> Result<DispatchDecision> {
         let Some(msgs) = ({
             let Some(rdpsnd) = self.get_svc_processor::<RdpsndServer>() else {
@@ -157,11 +169,11 @@ impl RdpServer {
 
             match msg {
                 RdpsndServerMessage::Wave(data, ts) => {
-                    if *wave_limit == 0 {
-                        debug!("Dropping wave");
+                    if *wave_skip > 0 {
+                        *wave_skip -= 1;
+                        debug!("Dropping stale wave");
                         return Ok(DispatchDecision::Continue);
                     }
-                    *wave_limit -= 1;
                     Some(rdpsnd.wave(data, ts))
                 }
                 RdpsndServerMessage::SetVolume { left, right } => Some(rdpsnd.set_volume(left, right)),
@@ -688,17 +700,16 @@ impl RdpServer {
             // Validate credentials for TLS-mode connections on the initial handshake.
             // Deactivation-reactivation cycles re-use an already-authenticated session
             // and are not subject to re-validation.
-            if !result.reactivation {
-                if let Some(validator) = self.credential_validator.as_deref() {
-                    if let Some(creds) = result.credentials.as_ref() {
-                        let accepted = validator
-                            .validate(creds)
-                            .context("credential validator returned an error")?;
-                        if !accepted {
-                            warn!("credential validation rejected the connection");
-                            return Err(anyhow!("credential validation failed"));
-                        }
-                    }
+            if !result.reactivation
+                && let Some(validator) = self.credential_validator.as_deref()
+                && let Some(creds) = result.credentials.as_ref()
+            {
+                let accepted = validator
+                    .validate(creds)
+                    .context("credential validator returned an error")?;
+                if !accepted {
+                    warn!("credential validation rejected the connection");
+                    return Err(anyhow!("credential validation failed"));
                 }
             }
 

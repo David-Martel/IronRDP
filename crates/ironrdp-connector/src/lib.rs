@@ -6,6 +6,7 @@ mod macros;
 pub mod legacy;
 
 mod channel_connection;
+pub mod connect_time_autodetect;
 mod connection;
 pub mod connection_activation;
 mod connection_finalization;
@@ -123,6 +124,13 @@ pub enum Credentials {
 }
 
 impl Credentials {
+    pub fn password(username: String, secret: String) -> Self {
+        Self::UsernamePassword {
+            username,
+            password /* safe */: secret,
+        }
+    }
+
     fn username(&self) -> Option<&str> {
         match self {
             Self::UsernamePassword { username, .. } => Some(username),
@@ -207,6 +215,30 @@ pub struct Config {
     pub keyboard_layout: u32,
     pub ime_file_name: String,
     pub bitmap: Option<BitmapConfig>,
+    /// Advertise support for the Graphics Pipeline Extension (MS-RDPEGFX).
+    ///
+    /// When `true`, the `RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL` (0x0100) flag is set in the
+    /// [`earlyCapabilityFlags`](gcc::ClientEarlyCapabilityFlags) of the Client Core Data
+    /// (`TS_UD_CS_CORE`). Some servers — notably gnome-remote-desktop (GRD) 46+, which is
+    /// EGFX-only and does not fall back to legacy bitmap updates — reject the connection at
+    /// the Demand Active / capabilities-exchange phase unless this flag is advertised.
+    ///
+    /// This should only be enabled when the client is actually prepared to service the
+    /// RDPEGFX dynamic virtual channel (i.e. built with the `egfx` feature and run with the
+    /// corresponding option); otherwise such servers may send EGFX traffic the client cannot
+    /// render, resulting in a blank session.
+    pub enable_graphics_pipeline: bool,
+    /// Advertise support for connect-time network characteristics auto-detection
+    /// (`RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT`) and answer the server's
+    /// connect-time Auto-Detect Request sequence (RTT / bandwidth measurement,
+    /// [MS-RDPBCGR] §2.2.14) before the Licensing phase.
+    ///
+    /// FreeRDP-based servers (notably gnome-remote-desktop) gate audio-output
+    /// redirection on this flag. It is opt-in because advertising it without
+    /// consuming the resulting server Auto-Detect Request would desynchronise the
+    /// Licensing exchange; enabling it activates the handler that keeps the
+    /// sequence in sync.
+    pub network_autodetect: bool,
     pub dig_product_id: String,
     pub client_dir: String,
     /// Alternate shell to execute on the remote server (e.g., specific application instead of desktop)
@@ -227,6 +259,18 @@ pub struct Config {
     /// - A cookie containing the username for a username/password.
     /// - Nothing for a smart card.
     pub request_data: Option<NegoRequestData>,
+    /// Auto-reconnect cookie (`ARC_CS_PRIVATE_PACKET`, 28 bytes) to send in the
+    /// `autoReconnectCookie` field of the Client Info PDU on a reconnect attempt.
+    ///
+    /// When `Some`, the server may re-attach the client to its existing session
+    /// ([MS-RDPBCGR] auto-reconnect). Derive it with
+    /// [`ClientAutoReconnect`](ironrdp_pdu::rdp::session_info::ClientAutoReconnect)
+    /// from the server-issued cookie captured on the previous session.
+    ///
+    /// `None` (the default) reproduces the standard connect path byte-for-byte.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/6dc5f21c-04d4-4a2d-b1b3-5fed2f74e2a5
+    pub reconnect_cookie: Option<[u8; 28]>,
     /// If true, the INFO_AUTOLOGON flag is set in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu)
     pub autologon: bool,
     /// If true, the INFO_NOAUDIOPLAYBACK flag is set in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu)
@@ -396,22 +440,27 @@ pub trait ConnectorErrorExt {
 }
 
 impl ConnectorErrorExt for ConnectorError {
+    #[track_caller]
     fn encode(error: ironrdp_core::EncodeError) -> Self {
         Self::new("encode error", ConnectorErrorKind::Encode(error))
     }
 
+    #[track_caller]
     fn decode(error: ironrdp_core::DecodeError) -> Self {
         Self::new("decode error", ConnectorErrorKind::Decode(error))
     }
 
+    #[track_caller]
     fn general(context: &'static str) -> Self {
         Self::new(context, ConnectorErrorKind::General)
     }
 
+    #[track_caller]
     fn reason(context: &'static str, reason: impl Into<String>) -> Self {
         Self::new(context, ConnectorErrorKind::Reason(reason.into()))
     }
 
+    #[track_caller]
     fn custom<E>(context: &'static str, e: E) -> Self
     where
         E: core::error::Error + Sync + Send + 'static,

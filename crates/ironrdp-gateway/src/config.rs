@@ -44,36 +44,29 @@ impl GatewayConfig {
     /// malformed, or if rustls rejects the certificate/key pair.
     pub fn load_tls_acceptor(&self) -> anyhow::Result<TlsAcceptor> {
         // Prefer explicit split paths; fall back to the combined identity path.
-        let (cert_src, key_src) = if self.tls_cert_path.as_os_str().is_empty()
-            || self.tls_key_path.as_os_str().is_empty()
-        {
-            (self.tls_identity_path.as_path(), self.tls_identity_path.as_path())
-        } else {
-            (self.tls_cert_path.as_path(), self.tls_key_path.as_path())
-        };
+        let (cert_src, key_src) =
+            if self.tls_cert_path.as_os_str().is_empty() || self.tls_key_path.as_os_str().is_empty() {
+                (self.tls_identity_path.as_path(), self.tls_identity_path.as_path())
+            } else {
+                (self.tls_cert_path.as_path(), self.tls_key_path.as_path())
+            };
 
-        let certs: Vec<CertificateDer<'static>> = if cert_src
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("pem"))
-        {
-            CertificateDer::pem_file_iter(cert_src)
-                .with_context(|| format!("reading TLS cert `{cert_src:?}`"))?
+        let certs: Vec<CertificateDer<'static>> =
+            if cert_src.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pem")) {
+                CertificateDer::pem_file_iter(cert_src)
+                    .with_context(|| format!("reading TLS cert `{cert_src:?}`"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .with_context(|| format!("collecting TLS cert `{cert_src:?}`"))?
+            } else {
+                rustls_pemfile::certs(&mut BufReader::new(
+                    File::open(cert_src).with_context(|| format!("opening TLS cert `{cert_src:?}`"))?,
+                ))
                 .collect::<Result<Vec<_>, _>>()
                 .with_context(|| format!("collecting TLS cert `{cert_src:?}`"))?
-        } else {
-            rustls_pemfile::certs(&mut BufReader::new(
-                File::open(cert_src).with_context(|| format!("opening TLS cert `{cert_src:?}`"))?,
-            ))
-            .collect::<Result<Vec<_>, _>>()
-            .with_context(|| format!("collecting TLS cert `{cert_src:?}`"))?
-        };
+            };
 
-        let priv_key = if key_src
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("pem"))
-        {
-            PrivateKeyDer::from_pem_file(key_src)
-                .with_context(|| format!("reading TLS key `{key_src:?}`"))?
+        let priv_key = if key_src.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pem")) {
+            PrivateKeyDer::from_pem_file(key_src).with_context(|| format!("reading TLS key `{key_src:?}`"))?
         } else {
             rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(
                 File::open(key_src).with_context(|| format!("opening TLS key `{key_src:?}`"))?,

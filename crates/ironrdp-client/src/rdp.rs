@@ -16,6 +16,7 @@ use ironrdp::dvc::DvcProcessor as _;
 use ironrdp::echo::client::EchoClient;
 use ironrdp::graphics::pointer::DecodedPointer;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
+use ironrdp::pdu::rdp::session_info::{ClientAutoReconnect, ServerAutoReconnect};
 use ironrdp::pdu::{PduResult, pdu_other_err};
 use ironrdp::session::{GracefulDisconnectReason, SessionResult};
 use ironrdp::svc::SvcMessage;
@@ -37,7 +38,7 @@ use tracing::{debug, error, info, trace};
 use winit::event_loop::EventLoopProxy;
 
 use crate::config::{Config, RDCleanPathConfig};
-use crate::session_driver::{RdpControlFlow, run_active_session};
+use crate::session_driver::{RdpControlFlow, RedirectInfo, run_active_session};
 
 /// EGFX graphics pipeline handler that forwards decoded frames to the event loop.
 ///
@@ -53,42 +54,113 @@ use crate::session_driver::{RdpControlFlow, run_active_session};
 #[cfg(feature = "egfx")]
 struct EgfxRenderHandler {
     event_loop_proxy: EventLoopProxy<RdpOutputEvent>,
+    /// When true, advertise EGFX V10.7 so the server may select AVC444 dual-stream
+    /// H.264. Off by default so only AVC420 (V8.1) is advertised.
+    avc444: bool,
 }
 
 #[cfg(feature = "egfx")]
 impl EgfxRenderHandler {
-    fn new(event_loop_proxy: EventLoopProxy<RdpOutputEvent>) -> Self {
-        Self { event_loop_proxy }
+    fn new(event_loop_proxy: EventLoopProxy<RdpOutputEvent>, avc444: bool) -> Self {
+        Self {
+            event_loop_proxy,
+            avc444,
+        }
     }
 }
 
 #[cfg(feature = "egfx")]
 impl ironrdp_egfx::client::GraphicsPipelineHandler for EgfxRenderHandler {
+    fn capabilities(&self) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
+        use ironrdp_egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet};
+
+        // By default, cap the advertised EGFX capability at V8.1 / AVC420. The
+        // stock default advertisement includes V10.7, which lets servers (Windows
+        // and gnome-remote-desktop alike) select AVC444 dual-stream H.264.
+        // Advertising AVC420 as the highest capability makes the server send
+        // single-stream AVC420, which decodes via OpenH264 and reaches the
+        // framebuffer. V8 (no AVC) is kept as a fallback.
+        //
+        // When `--avc444` is set, prepend V10.7 so the server may select AVC444;
+        // the client reconstructs YUV 4:4:4 from the dual sub-streams. This is
+        // opt-in because AVC444 decode is experimental and unvalidated end-to-end,
+        // and must never displace the working AVC420 render path by default.
+        let mut caps = Vec::new();
+        if self.avc444 {
+            caps.push(CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::SMALL_CACHE,
+            });
+        }
+        caps.push(CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+        });
+        caps.push(CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        });
+        caps
+    }
+
     fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
         debug!(?caps, "EGFX capabilities confirmed");
     }
 
-    fn on_bitmap_updated(&mut self, update: &ironrdp_egfx::client::BitmapUpdate) {
+    fn on_bitmap_updated(&mut self, update: ironrdp_egfx::client::BitmapUpdate) {
         if update.data.is_empty() {
-            trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (no decoder or empty frame)");
+            trace!(
+                surface_id = update.surface_id,
+                "EGFX bitmap update skipped (no decoder or empty frame)"
+            );
             return;
         }
 
         let Some(width) = NonZeroU16::new(update.width) else {
-            trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (zero width)");
+            trace!(
+                surface_id = update.surface_id,
+                "EGFX bitmap update skipped (zero width)"
+            );
             return;
         };
         let Some(height) = NonZeroU16::new(update.height) else {
-            trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (zero height)");
+            trace!(
+                surface_id = update.surface_id,
+                "EGFX bitmap update skipped (zero height)"
+            );
             return;
         };
 
-        let buffer = update.data.clone();
+        // Move the (potentially multi-megabyte) decoded RGBA buffer straight into
+        // the render event instead of cloning it. `update` is owned here, so the
+        // buffer travels egfx accumulator -> handler -> event loop with a single
+        // copy at the egfx boundary rather than two.
+        let buffer = update.data;
+        let rect = &update.destination_rectangle;
 
-        if let Err(e) = self
-            .event_loop_proxy
-            .send_event(RdpOutputEvent::Image { buffer, width, height })
-        {
+        // Route full-surface updates (origin, surface-sized) through the shared
+        // full-frame `Image` path so the AVC420/dtm-work banked wins stay
+        // byte-identical. Sub-rectangle updates (progressive dirty-rects, or any
+        // future AVC420 partial update) take the `ImageRegion` path, which blits
+        // the region at its offset into a persistent surface-sized framebuffer
+        // without shrinking the frame to the top-left corner.
+        let is_full_surface = rect.left == 0
+            && rect.top == 0
+            && width.get() == update.surface_width
+            && height.get() == update.surface_height;
+
+        let event = if is_full_surface {
+            RdpOutputEvent::Image { buffer, width, height }
+        } else {
+            RdpOutputEvent::ImageRegion {
+                buffer,
+                x: rect.left,
+                y: rect.top,
+                w: width,
+                h: height,
+                surface_w: update.surface_width,
+                surface_h: update.surface_height,
+            }
+        };
+
+        if let Err(e) = self.event_loop_proxy.send_event(event) {
             debug!(error = %e, "Failed to forward EGFX bitmap update to event loop");
         }
     }
@@ -104,6 +176,21 @@ pub enum RdpOutputEvent {
         buffer: Vec<u8>,
         width: NonZeroU16,
         height: NonZeroU16,
+    },
+    /// A sub-rectangle of the surface that must be blitted at (`x`, `y`) into a
+    /// persistent surface-sized (`surface_w` x `surface_h`) framebuffer.
+    ///
+    /// `buffer` is a tightly-packed `w` x `h` RGBA image (stride `w*4`). This is
+    /// the dirty-rect delivery path; it never replaces the whole framebuffer, so
+    /// unchanged regions of the surface are preserved between frames.
+    ImageRegion {
+        buffer: Vec<u8>,
+        x: u16,
+        y: u16,
+        w: NonZeroU16,
+        h: NonZeroU16,
+        surface_w: u16,
+        surface_h: u16,
     },
     ConnectionFailure(connector::ConnectorError),
     PointerDefault,
@@ -182,6 +269,12 @@ pub struct RdpClient {
 impl RdpClient {
     pub async fn run(mut self) {
         let mut same_size_reconnects = 0;
+        let mut redirect_count: u8 = 0;
+        // Most recent server auto-reconnect cookie captured across sessions, and a
+        // bounded budget of consecutive auto-reconnect attempts. Both only matter
+        // when `--auto-reconnect` is set.
+        let mut arc_cookie: Option<ServerAutoReconnect> = None;
+        let mut auto_reconnect_attempts: u8 = 0;
 
         loop {
             let (connection_result, framed) = if let Some(rdcleanpath) = self.config.rdcleanpath.as_ref() {
@@ -219,14 +312,30 @@ impl RdpClient {
                 }
             };
 
-            match run_active_session(
+            // The one-shot auto-reconnect cookie (if any) was consumed by the
+            // connect above (serialized into the Client Info PDU). Clear it so a
+            // subsequent non-auto reconnect (resize/redirect) starts clean; the
+            // auto-reconnect branch below re-derives it per attempt.
+            self.config.connector.reconnect_cookie = None;
+
+            let mut session_cookie: Option<ServerAutoReconnect> = None;
+            let session_result = run_active_session(
                 framed,
                 connection_result,
                 &self.event_loop_proxy,
                 &mut self.input_event_receiver,
+                &mut session_cookie,
             )
-            .await
-            {
+            .await;
+
+            // A session that received an auto-reconnect cookie reached full logon;
+            // treat that as real progress and refresh the cookie + reset the budget.
+            if let Some(cookie) = session_cookie {
+                arc_cookie = Some(cookie);
+                auto_reconnect_attempts = 0;
+            }
+
+            match session_result {
                 Ok(RdpControlFlow::ReconnectWithNewSize { width, height }) => {
                     let current_width = self.config.connector.desktop_size.width;
                     let current_height = self.config.connector.desktop_size.height;
@@ -258,12 +367,71 @@ impl RdpClient {
                     self.config.connector.desktop_size.width = width;
                     self.config.connector.desktop_size.height = height;
                 }
+                Ok(RdpControlFlow::Redirect(RedirectInfo {
+                    routing_token,
+                    username,
+                    password,
+                })) => {
+                    redirect_count = redirect_count.saturating_add(1);
+                    if redirect_count > MAX_REDIRECTS {
+                        error!(redirect_count, "Too many server redirections; aborting");
+                        self.send_terminal_event(Err(ironrdp::session::general_err!("too many server redirections")));
+                        break;
+                    }
+
+                    // Forward the load-balance routing token verbatim in the reconnect's
+                    // X.224 Connection Request so the server (e.g. gnome-remote-desktop's
+                    // system daemon) routes us to the handed-over target session.
+                    self.config.connector.request_data = routing_token.map(ironrdp::pdu::nego::NegoRequestData::raw);
+
+                    // GRD's handover instance authenticates the redirected connection
+                    // against a winpr NTLM SAM populated with the redirection-provided
+                    // credentials (not the original PAM login), so switch to them when
+                    // supplied.
+                    if let connector::Credentials::UsernamePassword {
+                        username: cur_username,
+                        password: cur_password,
+                    } = &mut self.config.connector.credentials
+                    {
+                        if let Some(username) = username {
+                            *cur_username = username;
+                        }
+                        if let Some(password) = password {
+                            *cur_password = password;
+                        }
+                    }
+
+                    info!(
+                        redirect_count,
+                        has_routing_token = self.config.connector.request_data.is_some(),
+                        "Reconnecting to follow server redirection (session handover)"
+                    );
+                }
                 Ok(RdpControlFlow::TerminatedGracefully(reason)) => {
                     info!(%reason, "Session terminated gracefully");
                     self.send_terminal_event(Ok(reason));
                     break;
                 }
                 Err(e) => {
+                    // Opt-in RDP auto-reconnect: on an unexpected drop, if the server
+                    // issued an auto-reconnect cookie this connection and the bounded
+                    // budget remains, reconnect carrying the derived client cookie so
+                    // the server re-attaches the existing session ([MS-RDPBCGR] 2.2.4).
+                    let can_auto_reconnect =
+                        self.config.auto_reconnect && auto_reconnect_attempts < MAX_AUTO_RECONNECTS;
+                    if let (true, Some(server_cookie)) = (can_auto_reconnect, arc_cookie.as_ref()) {
+                        auto_reconnect_attempts += 1;
+                        let client_cookie = ClientAutoReconnect::from_server_enhanced_security(server_cookie);
+                        self.config.connector.reconnect_cookie = Some(client_cookie.to_bytes());
+                        info!(
+                            error = %e,
+                            attempt = auto_reconnect_attempts,
+                            max = MAX_AUTO_RECONNECTS,
+                            "Session dropped unexpectedly; attempting RDP auto-reconnect"
+                        );
+                        continue;
+                    }
+
                     error!(error = %e, "Session terminated with error");
                     self.send_terminal_event(Err(e));
                     break;
@@ -286,6 +454,12 @@ type UpgradedFramed = ironrdp_tokio::TokioFramed<Box<dyn AsyncReadWrite + Unpin 
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_SAME_SIZE_RECONNECTS: u8 = 3;
+const MAX_REDIRECTS: u8 = 3;
+/// Bounded budget of consecutive opt-in auto-reconnect attempts after an
+/// unexpected drop, reset whenever a session reaches full logon (receives an
+/// auto-reconnect cookie). Mirrors the spirit of the [MS-RDPBCGR] client
+/// auto-reconnect retry limit (20).
+const MAX_AUTO_RECONNECTS: u8 = 20;
 
 fn update_resize_reconnect_state(
     current_width: u16,
@@ -398,10 +572,27 @@ async fn connect(
         let h264_decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> = None;
 
         info!("Registering EGFX graphics pipeline DVC channel");
-        drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
-            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone())),
+        #[cfg_attr(not(feature = "openh264"), allow(unused_mut))]
+        let mut gfx_client = ironrdp_egfx::client::GraphicsPipelineClient::new(
+            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone(), config.avc444)),
             h264_decoder,
-        ));
+        );
+        // AVC444's chroma-auxiliary sub-stream needs its own H.264 decode context,
+        // separate from the luma/AVC420 decoder (the two are independent H.264
+        // sequences). Build it only when AVC444 is opted into.
+        #[cfg(feature = "openh264")]
+        if config.avc444 {
+            match ironrdp_egfx::decode::OpenH264Decoder::new() {
+                Ok(decoder) => {
+                    info!("AVC444 enabled: dedicated OpenH264 chroma decoder initialized");
+                    gfx_client.set_avc444_chroma_decoder(Box::new(decoder));
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create AVC444 chroma decoder; AVC444 frames will be skipped");
+                }
+            }
+        }
+        drdynvc = drdynvc.with_dynamic_channel(gfx_client);
     }
 
     // Load DVC COM plugins (Windows only)
@@ -439,7 +630,9 @@ async fn connect(
     let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
-        .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(Some(0)));
+        .with_static_channel(
+            rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(Some(0)),
+        );
 
     if let Some(builder) = cliprdr_factory {
         info!("Attach CLIPRDR channel");
@@ -565,10 +758,27 @@ async fn connect_ws(
         let h264_decoder: Option<Box<dyn ironrdp_egfx::decode::H264Decoder>> = None;
 
         info!("Registering EGFX graphics pipeline DVC channel");
-        drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
-            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone())),
+        #[cfg_attr(not(feature = "openh264"), allow(unused_mut))]
+        let mut gfx_client = ironrdp_egfx::client::GraphicsPipelineClient::new(
+            Box::new(EgfxRenderHandler::new(event_loop_proxy.clone(), config.avc444)),
             h264_decoder,
-        ));
+        );
+        // AVC444's chroma-auxiliary sub-stream needs its own H.264 decode context,
+        // separate from the luma/AVC420 decoder (the two are independent H.264
+        // sequences). Build it only when AVC444 is opted into.
+        #[cfg(feature = "openh264")]
+        if config.avc444 {
+            match ironrdp_egfx::decode::OpenH264Decoder::new() {
+                Ok(decoder) => {
+                    info!("AVC444 enabled: dedicated OpenH264 chroma decoder initialized");
+                    gfx_client.set_avc444_chroma_decoder(Box::new(decoder));
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create AVC444 chroma decoder; AVC444 frames will be skipped");
+                }
+            }
+        }
+        drdynvc = drdynvc.with_dynamic_channel(gfx_client);
     }
 
     // Load DVC COM plugins (Windows only)
@@ -606,7 +816,9 @@ async fn connect_ws(
     let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
-        .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(Some(0)));
+        .with_static_channel(
+            rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(Some(0)),
+        );
 
     if let Some(builder) = cliprdr_factory {
         info!("Attach CLIPRDR channel");

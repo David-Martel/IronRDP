@@ -24,6 +24,7 @@ use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::rdp::multitransport::MultitransportResponsePdu;
+use ironrdp::pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{self, ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult};
 use ironrdp_core::WriteBuf;
@@ -40,8 +41,25 @@ use crate::rdp::{RdpInputEvent, RdpOutputEvent};
 /// server-update burst can be coalesced without starving the display pipeline.
 const FRAME_PACING_INTERVAL: Duration = Duration::from_millis(4);
 
+pub(crate) struct RedirectInfo {
+    /// LB_LOAD_BALANCE_INFO routing token, sent verbatim in the reconnect's
+    /// X.224 Connection Request.
+    pub routing_token: Option<Vec<u8>>,
+    /// LB_USERNAME to authenticate the handover connection with, if provided.
+    pub username: Option<String>,
+    /// LB_PASSWORD cookie to authenticate the handover connection with, if
+    /// provided and not public-key encrypted.
+    pub password: Option<String>,
+}
+
 pub(crate) enum RdpControlFlow {
-    ReconnectWithNewSize { width: u16, height: u16 },
+    ReconnectWithNewSize {
+        width: u16,
+        height: u16,
+    },
+    /// The server sent a Server Redirection PDU; reconnect to the target session
+    /// carrying the load-balance routing token and redirection credentials.
+    Redirect(RedirectInfo),
     TerminatedGracefully(GracefulDisconnectReason),
 }
 
@@ -49,6 +67,25 @@ enum SessionDriverFlow {
     Outputs(Vec<ActiveStageOutput>),
     EmitLatestImage,
     ReconnectWithNewSize { width: u16, height: u16 },
+}
+
+/// Renders bytes as a bounded hex string for diagnostic logging (never used for
+/// secret material — only routing tokens / usernames).
+fn hex_preview(bytes: &[u8]) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes.iter().take(64) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Result of handling a single (or batch of) [`ActiveStageOutput`], signalling
+/// whether the active session should continue, terminate, or reconnect.
+enum StageFlow {
+    Continue,
+    Terminate(GracefulDisconnectReason),
+    Redirect(RedirectInfo),
 }
 
 struct SessionDriver {
@@ -237,7 +274,7 @@ impl SessionDriver {
         writer: &mut TokioFramed<W>,
         event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
         outputs: Vec<ActiveStageOutput>,
-    ) -> SessionResult<Option<GracefulDisconnectReason>>
+    ) -> SessionResult<StageFlow>
     where
         R: AsyncRead + Unpin + Send + Sync,
         W: AsyncWrite + Unpin + Send + Sync,
@@ -258,8 +295,9 @@ impl SessionDriver {
                 graphics_update_pending = false;
             }
 
-            if let Some(reason) = self.handle_stage_output(reader, writer, event_loop_proxy, out).await? {
-                return Ok(Some(reason));
+            match self.handle_stage_output(reader, writer, event_loop_proxy, out).await? {
+                StageFlow::Continue => {}
+                flow => return Ok(flow),
             }
         }
 
@@ -267,7 +305,7 @@ impl SessionDriver {
             self.queue_latest_image_update(event_loop_proxy)?;
         }
 
-        Ok(None)
+        Ok(StageFlow::Continue)
     }
 
     async fn handle_stage_output<R, W>(
@@ -276,7 +314,7 @@ impl SessionDriver {
         writer: &mut TokioFramed<W>,
         event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
         out: ActiveStageOutput,
-    ) -> SessionResult<Option<GracefulDisconnectReason>>
+    ) -> SessionResult<StageFlow>
     where
         R: AsyncRead + Unpin + Send + Sync,
         W: AsyncWrite + Unpin + Send + Sync,
@@ -287,41 +325,41 @@ impl SessionDriver {
                     .write_all(&frame)
                     .await
                     .map_err(|e| session::custom_err!("write response", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::GraphicsUpdate(region) => {
                 union_dirty_region(&mut self.dirty_region, region);
                 self.queue_latest_image_update(event_loop_proxy)?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::PointerDefault => {
                 event_loop_proxy
                     .send_event(RdpOutputEvent::PointerDefault)
                     .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::PointerHidden => {
                 event_loop_proxy
                     .send_event(RdpOutputEvent::PointerHidden)
                     .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::PointerPosition { x, y } => {
                 event_loop_proxy
                     .send_event(RdpOutputEvent::PointerPosition { x, y })
                     .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::PointerBitmap(pointer) => {
                 event_loop_proxy
                     .send_event(RdpOutputEvent::PointerBitmap(pointer))
                     .map_err(|e| session::custom_err!("event_loop_proxy", e))?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::DeactivateAll(connection_activation) => {
                 self.handle_deactivation_reactivation(reader, writer, connection_activation)
                     .await?;
-                Ok(None)
+                Ok(StageFlow::Continue)
             }
             ActiveStageOutput::MultitransportRequest(pdu) => {
                 let response = self
@@ -337,11 +375,51 @@ impl SessionDriver {
                     response = "E_ABORT",
                     "Multitransport request received (UDP transport not implemented)"
                 );
-                Ok(None)
+                Ok(StageFlow::Continue)
+            }
+            ActiveStageOutput::Redirect(redirection) => {
+                if let Some(target) = redirection.target_net_address_string() {
+                    // A different reconnect target is not yet supported; GRD's
+                    // handover redirects back to the same endpoint (no target address).
+                    warn!(%target, "Server Redirection targets a different address; reconnecting to the same endpoint anyway");
+                }
+                let routing_token = redirection.load_balance_info.clone();
+                let username = redirection.username_string().filter(|s| !s.is_empty());
+                // GRD's handover instance authenticates the redirected connection
+                // against a winpr NTLM SAM populated with the redirection
+                // credentials, so reuse them rather than the original login.
+                //
+                // GRD sets LB_PASSWORD_IS_PK_ENCRYPTED but does NOT actually encrypt
+                // the password: it sends the plaintext UTF-16LE password and stores
+                // NTOWFv1(password) in the SAM (see gnome-remote-desktop
+                // grd-session-rdp.c `grd_session_rdp_send_server_redirection` and
+                // grd-rdp-sam.c `create_sam_string`). So decode LB_PASSWORD as
+                // UTF-16LE and use it directly, regardless of the PK flag.
+                let pk_encrypted = redirection.is_password_pk_encrypted();
+                let password = redirection.password_string().filter(|s| !s.is_empty());
+                debug!(
+                    load_balance_info_hex = ?routing_token.as_deref().map(hex_preview),
+                    username_hex = ?redirection.username.as_deref().map(hex_preview),
+                    password_len = redirection.password.as_ref().map_or(0, Vec::len),
+                    "Server Redirection raw fields"
+                );
+                info!(
+                    has_routing_token = routing_token.is_some(),
+                    routing_token_len = routing_token.as_ref().map_or(0, Vec::len),
+                    redirection_username = ?username,
+                    has_password = password.is_some(),
+                    password_pk_encrypted = pk_encrypted,
+                    "Following Server Redirection (session handover)"
+                );
+                Ok(StageFlow::Redirect(RedirectInfo {
+                    routing_token,
+                    username,
+                    password,
+                }))
             }
             ActiveStageOutput::Terminate(reason) => {
                 info!(%reason, "Server-initiated graceful disconnect received");
-                Ok(Some(reason))
+                Ok(StageFlow::Terminate(reason))
             }
         }
     }
@@ -499,6 +577,7 @@ pub(crate) async fn run_active_session<S>(
     connection_result: ConnectionResult,
     event_loop_proxy: &EventLoopProxy<RdpOutputEvent>,
     input_event_receiver: &mut mpsc::UnboundedReceiver<RdpInputEvent>,
+    reconnect_cookie: &mut Option<ServerAutoReconnect>,
 ) -> SessionResult<RdpControlFlow>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
@@ -520,7 +599,14 @@ where
             frame = reader.read_pdu() => {
                 let (action, payload) = frame.map_err(|e| session::custom_err!("read frame", e))?;
                 trace!(?action, frame_length = payload.len(), "Frame received");
-                SessionDriverFlow::Outputs(driver.process_server_frame(action, &payload)?)
+                let outputs = driver.process_server_frame(action, &payload);
+                // Sync any server auto-reconnect cookie captured while processing this
+                // frame *before* propagating a processing error, so a later unexpected
+                // drop can still reconnect using a cookie captured earlier this session.
+                if let Some(cookie) = driver.active_stage.reconnect_cookie() {
+                    *reconnect_cookie = Some(cookie.clone());
+                }
+                SessionDriverFlow::Outputs(outputs?)
             }
             input_event = input_event_receiver.recv() => {
                 let input_event = match input_event {
@@ -545,11 +631,15 @@ where
 
         match flow {
             SessionDriverFlow::Outputs(outputs) => {
-                if let Some(reason) = driver
+                match driver
                     .handle_stage_outputs(&mut reader, &mut writer, event_loop_proxy, outputs)
                     .await?
                 {
-                    break 'outer reason;
+                    StageFlow::Continue => {}
+                    StageFlow::Terminate(reason) => break 'outer reason,
+                    StageFlow::Redirect(info) => {
+                        return Ok(RdpControlFlow::Redirect(info));
+                    }
                 }
             }
             SessionDriverFlow::EmitLatestImage => {

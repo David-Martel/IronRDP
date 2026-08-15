@@ -7,6 +7,7 @@ use ironrdp_pdu::rdp::autodetect::AutoDetectResponse;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
+use ironrdp_pdu::rdp::session_info::{InfoData, ServerAutoReconnect};
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages, client_encode_svc_messages};
 use tracing::{debug, warn};
@@ -34,6 +35,14 @@ pub enum ProcessorOutput {
     /// [\[MS-RDPBCGR\] 2.2.15.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/de783158-8b01-4818-8fb0-62523a5b3490
     /// [`MultitransportResponsePdu`]: ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu
     MultitransportRequest(MultitransportRequestPdu),
+    /// Received a Server Redirection PDU. The client should tear down the current
+    /// connection and reconnect to the target session, sending the load-balance
+    /// routing token in the reconnect's X.224 Connection Request.
+    ///
+    /// See [\[MS-RDPBCGR\] 2.2.13.1.1].
+    ///
+    /// [\[MS-RDPBCGR\] 2.2.13.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/1cf18d97-9c1e-4a83-95a2-df3a04c30850
+    Redirect(Box<ironrdp_pdu::rdp::headers::ServerRedirectionPdu>),
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +63,10 @@ pub struct Processor {
     io_channel_id: u16,
     share_id: u32,
     connection_activation: ConnectionActivationSequence,
+    /// Most recent server-issued auto-reconnect cookie captured from a
+    /// Save Session Info PDU (Logon Info Extended → `ARC_SC_PRIVATE_PACKET`).
+    /// Used to build the client auto-reconnect cookie on a reconnect attempt.
+    reconnect_cookie: Option<ServerAutoReconnect>,
 }
 
 impl Processor {
@@ -70,11 +83,18 @@ impl Processor {
             io_channel_id,
             share_id,
             connection_activation,
+            reconnect_cookie: None,
         }
     }
 
     pub fn set_share_id(&mut self, share_id: u32) {
         self.share_id = share_id;
+    }
+
+    /// Returns the most recent server auto-reconnect cookie captured from a
+    /// Save Session Info PDU, if any.
+    pub fn reconnect_cookie(&self) -> Option<&ServerAutoReconnect> {
+        self.reconnect_cookie.as_ref()
     }
 
     pub fn get_svc_processor<T: SvcProcessor + 'static>(&self) -> Option<&T> {
@@ -118,6 +138,13 @@ impl Processor {
         let data_ctx: SendDataIndicationCtx<'_> =
             ironrdp_connector::legacy::decode_send_data_indication(frame).map_err(crate::legacy::map_error)?;
         let channel_id = data_ctx.channel_id;
+        tracing::debug!(
+            channel_id,
+            io_channel_id = self.io_channel_id,
+            user_data_len = data_ctx.user_data.len(),
+            head = ?&data_ctx.user_data[..core::cmp::min(24, data_ctx.user_data.len())],
+            "x224 process: routing SendDataIndication"
+        );
 
         if channel_id == self.io_channel_id {
             self.process_io_channel(data_ctx)
@@ -126,11 +153,50 @@ impl Processor {
             process_svc_messages(response_pdus, channel_id, data_ctx.initiator_id)
                 .map(|data| vec![ProcessorOutput::ResponseFrame(data)])
         } else {
-            Err(reason_err!("X224", "unexpected channel received: ID {channel_id}"))
+            self.process_unrouted_channel(channel_id, data_ctx.user_data)
         }
     }
 
-    fn process_io_channel(&self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
+    /// Handle a Send Data Indication that targets neither the I/O channel nor a
+    /// registered static virtual channel.
+    ///
+    /// gnome-remote-desktop / FreeRDP run *continuous* network auto-detection
+    /// after the connection is active (when the client advertised
+    /// `RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT`, i.e. `--network-autodetect`).
+    /// Those Server Auto-Detect Request PDUs are sent on the MCS message channel,
+    /// which the IronRDP client never joins, so they surface here on an
+    /// unrecognized channel (observed as channel `0`) framed with a
+    /// [`BasicSecurityHeader`] carrying `AUTODETECT_REQ` — *not* as a Share Data
+    /// PDU. Answer them with a security-header-framed Auto-Detect Response, reusing
+    /// the connector's connect-time responder so the framing stays identical.
+    ///
+    /// Any other traffic on the message channel (`0`) is tolerated (logged and
+    /// dropped) rather than fatally aborting an otherwise-healthy session; a
+    /// genuinely unexpected *non-zero* channel keeps the hard error so real
+    /// routing bugs still surface.
+    ///
+    /// [`BasicSecurityHeader`]: ironrdp_pdu::rdp::headers::BasicSecurityHeader
+    fn process_unrouted_channel(&self, channel_id: u16, user_data: &[u8]) -> SessionResult<Vec<ProcessorOutput>> {
+        match ironrdp_connector::connect_time_autodetect::in_session_autodetect_response(user_data) {
+            Ok(Some(rsp)) => {
+                debug!(channel_id, "Answering in-session (message-channel) Auto-Detect Request");
+                let mut buf = WriteBuf::new();
+                self.encode_io_channel(&mut buf, &rsp)?;
+                Ok(vec![ProcessorOutput::ResponseFrame(buf.filled().to_vec())])
+            }
+            Ok(None) if channel_id == 0 => {
+                warn!(channel_id, "Ignoring non-auto-detect PDU on MCS message channel");
+                Ok(Vec::new())
+            }
+            Err(_) if channel_id == 0 => {
+                warn!(channel_id, "Ignoring undecodable PDU on MCS message channel");
+                Ok(Vec::new())
+            }
+            Ok(None) | Err(_) => Err(reason_err!("X224", "unexpected channel received: ID {channel_id}")),
+        }
+    }
+
+    fn process_io_channel(&mut self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
         debug_assert_eq!(data_ctx.channel_id, self.io_channel_id);
 
         let io_channel = ironrdp_connector::legacy::decode_io_channel(data_ctx).map_err(crate::legacy::map_error)?;
@@ -140,6 +206,20 @@ impl Processor {
                 match ctx.pdu {
                     ShareDataPdu::SaveSessionInfo(session_info) => {
                         debug!("Got Session Save Info PDU: {session_info:?}");
+                        // Capture the auto-reconnect cookie (ARC_SC_PRIVATE_PACKET) if the
+                        // server sent Logon Info Extended with one. It is later used to derive
+                        // the client auto-reconnect cookie on a reconnect attempt
+                        // ([MS-RDPBCGR] 2.2.4). Output is unchanged, so this is behaviourally
+                        // transparent to callers that do not opt into auto-reconnect.
+                        if let InfoData::LogonExtended(extended) = &session_info.info_data
+                            && let Some(auto_reconnect) = &extended.auto_reconnect
+                        {
+                            debug!(
+                                logon_id = auto_reconnect.logon_id,
+                                "Captured server auto-reconnect cookie"
+                            );
+                            self.reconnect_cookie = Some(auto_reconnect.clone());
+                        }
                         Ok(Vec::new())
                     }
                     // FIXME: workaround fix to not terminate the session on "unhandled PDU: Set Keyboard Indicators PDU"
@@ -188,20 +268,20 @@ impl Processor {
                         use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
 
                         match req {
-                            AutoDetectRequest::RttRequest { sequence_number, request_type } => {
+                            AutoDetectRequest::RttRequest {
+                                sequence_number,
+                                request_type,
+                            } => {
                                 // Respond immediately with an RTT Measure Response carrying the
                                 // same sequence number as the request.
                                 //
                                 // [MS-RDPBCGR] §2.2.14.2.1
                                 debug!(
                                     sequence_number,
-                                    request_type,
-                                    "Received Auto-Detect RTT Request; sending RTT Response"
+                                    request_type, "Received Auto-Detect RTT Request; sending RTT Response"
                                 );
 
-                                let rsp = AutoDetectResponse::RttResponse {
-                                    sequence_number,
-                                };
+                                let rsp = AutoDetectResponse::RttResponse { sequence_number };
 
                                 let mut buf = WriteBuf::new();
                                 self.encode_static(&mut buf, ShareDataPdu::AutoDetectRsp(rsp))?;
@@ -217,13 +297,15 @@ impl Processor {
                                 // scope for this pass; log and continue.
                                 debug!(
                                     sequence_number,
-                                    request_type,
-                                    "Received Auto-Detect Bandwidth Measure Start"
+                                    request_type, "Received Auto-Detect Bandwidth Measure Start"
                                 );
                                 Ok(Vec::new())
                             }
 
-                            AutoDetectRequest::BandwidthMeasurePayload { sequence_number, payload } => {
+                            AutoDetectRequest::BandwidthMeasurePayload {
+                                sequence_number,
+                                payload,
+                            } => {
                                 // Payload-only PDU sent during connect-time BW detection; no
                                 // response required.
                                 debug!(
@@ -260,8 +342,7 @@ impl Processor {
                                 // required per [MS-RDPBCGR] §2.2.14.1.5.
                                 debug!(
                                     sequence_number,
-                                    request_type,
-                                    "Received Auto-Detect Network Characteristics Result from server"
+                                    request_type, "Received Auto-Detect Network Characteristics Result from server"
                                 );
                                 Ok(Vec::new())
                             }
@@ -285,6 +366,14 @@ impl Processor {
             ironrdp_connector::legacy::IoChannelPdu::DeactivateAll(_) => Ok(vec![ProcessorOutput::DeactivateAll(
                 Box::new(self.connection_activation.reset_clone()),
             )]),
+            ironrdp_connector::legacy::IoChannelPdu::Redirection(redirection) => {
+                debug!(
+                    redir_flags = format_args!("{:#010x}", redirection.redir_flags),
+                    has_load_balance_info = redirection.load_balance_info.is_some(),
+                    "Received Server Redirection PDU"
+                );
+                Ok(vec![ProcessorOutput::Redirect(Box::new(redirection))])
+            }
         }
     }
 

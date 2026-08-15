@@ -17,16 +17,32 @@ jobs:
   corpus-download:
     name: Download corpus
     runs-on: ubuntu-latest
+    outputs:
+      corpus_available: ${{ steps.credentials.outputs.available }}
     env:
       AZURE_STORAGE_KEY: ${{ secrets.CORPUS_AZURE_STORAGE_KEY }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check corpus credentials
+        id: credentials
+        shell: bash
+        run: |
+          if [[ -n "${AZURE_STORAGE_KEY}" ]]; then
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+            echo "CORPUS_AZURE_STORAGE_KEY is not configured; skipping scheduled fuzzing."
+          fi
+
+      - if: steps.credentials.outputs.available == 'true'
+        uses: actions/checkout@v4
 
       - name: Download fuzzing corpus
+        if: steps.credentials.outputs.available == 'true'
         run: cargo xtask fuzz corpus-fetch -v
 
       - name: Save corpus
+        if: steps.credentials.outputs.available == 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -37,6 +53,7 @@ jobs:
   fuzz:
     name: Fuzzing ${{ matrix.target }}
     needs: [corpus-download]
+    if: needs['corpus-download'].outputs.corpus_available == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -108,7 +125,7 @@ jobs:
 
   corpus-merge:
     name: Corpus merge artifacts
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() && !cancelled() && needs.fuzz.result != 'skipped' }}
     needs: [fuzz]
     runs-on: ubuntu-latest
 
@@ -122,8 +139,12 @@ jobs:
 
   corpus-upload:
     name: Upload corpus
-    if: ${{ always() && !cancelled() }}
-    needs: [corpus-merge]
+    if: >-
+      ${{ always()
+          && !cancelled()
+          && needs['corpus-download'].outputs.corpus_available == 'true'
+          && needs['corpus-merge'].result == 'success' }}
+    needs: [corpus-download, corpus-merge]
     runs-on: ubuntu-latest
     env:
       AZURE_STORAGE_KEY: ${{ secrets.CORPUS_AZURE_STORAGE_KEY }}
@@ -157,7 +178,7 @@ jobs:
   notify:
     name: Notify failure
     if: ${{ always() && contains(needs.*.result, 'failure') && github.event_name == 'schedule' }}
-    needs: [fuzz]
+    needs: [corpus-download, fuzz, corpus-merge, corpus-upload]
     runs-on: ubuntu-latest
     env:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_ARCHITECTURE }}
@@ -166,6 +187,7 @@ jobs:
     steps:
       - name: Send slack notification
         id: slack
+        if: env.SLACK_WEBHOOK_URL != ''
         uses: slackapi/slack-github-action@v1.26.0
         with:
           payload: |

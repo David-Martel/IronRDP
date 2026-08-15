@@ -17,6 +17,7 @@ mod logon_extended;
 mod logon_info;
 
 pub use self::logon_extended::{
+    CLIENT_AUTO_RECONNECT_COOKIE_SIZE, ClientAutoReconnect, ENHANCED_SECURITY_CLIENT_RANDOM,
     LogonErrorNotificationData, LogonErrorNotificationDataErrorCode, LogonErrorNotificationType, LogonErrorsInfo,
     LogonExFlags, LogonInfoExtended, ServerAutoReconnect,
 };

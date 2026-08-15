@@ -286,6 +286,762 @@ Status: done.
 Refs: `crates/ironrdp-gateway/`.
 Status: done (scaffold only — no listener, RADIUS, or TLS implementation yet).
 
+46. Piecemeal upstream import pass (Devolutions/IronRDP master, fork was 139
+behind). Cherry-picked with `-x` where clean, file-level-adapted where the fork
+had reworked the area. All ported into `feat/gfx-early-capability-flag`. Full
+`cargo test --workspace` passes; `cargo build --release -p ironrdp-client`
+passes; none of the changed files produce any clippy finding (the fork's
+workspace `-D warnings` gate is pre-existingly red on unrelated crates —
+`ironrdp-client`, `ironrdp-gateway`, `ironrdp-rdpeusb`, `ffi`,
+`ironrdp-session/active_stage.rs`, `ironrdp-testsuite-extra` — base commit
+5b849c64 also fails clippy, independent of this work).
+Panic / correctness fixes:
+- #1293 (0dd7c94b) xcrush off-by-one forward-match panic — clean cherry-pick.
+- #1392 (d6990d81) propagate `#[track_caller]` through error constructors — clean.
+- #1256 (905a1486) rdpsnd Opus PCM alignment panic — adapted (fork reworked cpal;
+  kept the fork's decode-error counter + silent-teardown, adopted `Vec<i16>` alloc).
+- #1276 (6e847976) rdpsnd keep-newest-waves on overflow — adapted (fork moved the
+  dispatch into `session_driver.rs`; ported the drop-oldest semantics there).
+Connector / protocol correctness:
+- #1371 (a4fde9fc) stay in CapabilitiesExchange on activation DeactivateAll — core
+  cherry-pick; fork-deleted test module dropped.
+- #1254 (9cb5439b) skip ServerDeactivateAll during CapabilitiesExchange — the inner
+  half of the same fix, which the fork lacked; directly serves the GRD 46 handover
+  (GRD sends ServerDeactivateAll before DemandActive). Core ported; test dropped.
+- #1382 (3f96d002) set COMPRESSION_USED on FastPath update header — clean.
+- #1313 (a71567e3) cover BitmapCacheV3 in CapabilitySet encoder (fixes a reachable
+  `unreachable!()` panic) — core + testsuite-core test; fork's richer fuzz oracle kept.
+- #1231 (2fa7c648) advertise all colour depths + derive highColorDepth per
+  max_color_depth (modern Windows hosts reset 24bpp-only clients) — clean cherry-pick;
+  fits this branch's earlyCapabilityFlags theme.
+- Restored the upstream `connection_activation` test module (dropped by the fork)
+  so #1254/#1371 are covered: 3 tests exercise the ServerDeactivateAll path
+  (only adaptation was the fork's added `enable_graphics_pipeline` Config field).
+Graphics robustness:
+- #1298 (67f3c635) tolerate unknown EGFX capability versions — adapted (fork's
+  `try_from` only mapped one sentinel; broadened to any unrecognized version →
+  `CapabilitySet::Unknown`).
+- #1341 (ef20ea4e) decode RGBA QOI bitmaps instead of dropping the frame — clean.
+- #1344 (4e11a176) bound ZGFX compressor hash table — clean.
+Also: collapsed a pre-existing `collapsible_if` in the server credential-validator
+path (touched while porting #1276) into a let-chain.
+Deferred (too entangled with the fork's egfx/rfx/rdpeusb/dvc rework, or tracked
+separately):
+- #1305 (91ea46bd) RawCapabilitySet vs typed CapabilitySet split — 392-line breaking
+  rework of the fork's most-diverged file; its client benefit (tolerate unknown caps)
+  is already delivered by the #1298 adaptation.
+- Tier-4 features: clipboard file-copy (#1388/#1375/#1372, tracked as Track C item 9),
+  DVC accessors (#1368/#1358, breaking dvc changes), agent resize (#1401, ironrdp-agent
+  crate not present in fork).
+
+47. Full workspace clippy gate is now GREEN (2026-07-05, chore/tech worktree,
+commit `9f1966c3`). `cargo clippy --workspace --all-targets --features
+helper,__bench -- -D warnings` → "No issues found". The pre-existing red items
+(item 46 noted the gate was red on unrelated crates) are all resolved WITHOUT
+behavior changes: ironrdp-pdu ARC packet-size `expect` → infallible u32 wire
+literal; ironrdp-session x224 collapsible_if; ironrdp-client app.rs
+string_add/non_ascii, config.rs undocumented-unsafe + as_conversions (via
+`ptr::addr()` + `try_from`); ironrdp-gateway std→core, `from_str`→`from_toml_str`,
+merged inherent impls, `#[expect]` accept loop, tests' unused-dep/panic/anon-trait;
+ironrdp-testsuite-extra NonZeroUsize; ironrdp-rdpeusb unused import. Two LATENT
+COMPILE errors in the `ffi` crate (it had drifted behind the connector/session
+API) were also fixed: added `enable_graphics_pipeline: false` to the FFI connector
+Config builder and a `Redirect` arm to the FFI `ActiveStageOutputType` mapping.
+NOTE: the new `Redirect` variant on the diplomat `ActiveStageOutputType` enum may
+require .NET binding regeneration downstream (additive; out of the Rust gates).
+Gates: clippy clean; `cargo test --workspace` 1370 passed/3 ignored;
+`cargo build --release -p ironrdp-client` OK.
+
+48. Dirty-rect / no-H264 RemoteFX-Progressive path VISUALLY VALIDATED (2026-07-05,
+chore/tech worktree). Built `--no-default-features --features rustls,egfx` (no
+openh264 → AVC caps filtered → GRD falls back to RemoteFX Progressive, exercising
+the `progressive_framebuffers` dirty-rect crop path), connected to asuspro13
+`100.64.0.3:3389 -u damartel --egfx` with `IRONRDP_EGFX_DUMP` set. Result:
+"EGFX capabilities confirmed" + "First frame presented 1920x1080", no ERROR-level
+lines, no RFX decode failures. The dumped framebuffer is exactly 8,294,400 bytes
+(1920x1080x4 RGBA, `.dims` = 1920x1080) and, converted to PNG, shows a fully
+coherent GDM/Ubuntu login screen: top-bar clock + status icons, centered login
+box with the correct yellow selection highlight, "Not listed?", and the red
+Ubuntu logo bottom-centre — every element at its correct offset with correct
+colours (yellow/red/white all correct, so the RGBA channel order and sub-region
+blit offsets are right). No visual corruption from the dirty-rect changes. NOTE:
+`IRONRDP_EGFX_DUMP` is one-shot on the FIRST progressive update, so the dump is the
+accumulated framebuffer at first-frame time (sparse non-black on the dark login
+screen is expected, not a defect).
+
+## GRD render RESOLVED — root cause was a build-feature footgun, NOT a capability rejection (2026-07-04, later pass)
+
+**The "ERRINFO_BAD_CAPABILITIES / Confirm Active capability rejection" framing was
+a red herring.** There is no rejected capability. The handover failed because the
+test binaries were built WITHOUT the `egfx` feature.
+
+Root cause (proven with `ironrdp_dvc=trace`, live GRD 46.3 handover):
+- `cargo build --release -p ironrdp-client` does NOT enable `egfx` (client
+  `default = ["rustls"]`; `egfx = ["ironrdp-egfx"]`, `openh264 = ["egfx", ...]`).
+  The prebuilt "stable reference" and a plain release build are byte-identical
+  (10,224,640 bytes) — both featureless.
+- A featureless build still accepted `--egfx` and set the connector's
+  `enable_graphics_pipeline`, so the client advertised
+  `Microsoft::Windows::RDS::Graphics`. GRD's handover instance opened the RDPGFX
+  DVC; the client had NO registered listener (feature compiled out) and answered
+  the Create Request with `CreationStatus(0xC0000001)` = NO_LISTENER. GRD logged
+  `[RDP.RDPGFX] Failed to open channel (CreationStatus -1073741823). Terminating
+  session` and set ERRINFO_BAD_CAPABILITIES during teardown — which the client
+  saw as `read deactivation-reactivation sequence step / disconnect provider
+  ultimatum: UserRequested`. So the "cap rejection" was DVC teardown fallout.
+- The DVC trace shows it plainly: on the handover reconnect, `Graphics` →
+  `CreationStatus(3221225473)` (NO_LISTENER); `DisplayControl` →
+  `CreationStatus(0)` (OK). DisplayControl is registered unconditionally; EGFX is
+  gated behind `#[cfg(feature = "egfx")]`.
+
+Fix (committed):
+1. `fix(client): do not advertise Graphics Pipeline without the egfx feature`
+   (config.rs) — `enable_graphics_pipeline` / client `egfx` now derive from an
+   `egfx_enabled` value that is true only when EGFX is requested AND compiled in;
+   a featureless build warns and falls back to the classic bitmap path instead of
+   dead-ending the handover.
+
+RENDER VERIFIED (built with `--features openh264`): connecting
+`100.64.0.3:3389 -u damartel --egfx` completes the GRD 46.3 handover and renders
+a full 1920x1080 desktop on the first try. `IRONRDP_EGFX_DUMP` produced an
+8,294,400-byte (1920x1080x4) frame; converted to PNG and visually confirmed as
+the Ubuntu GDM greeter (clock "Jul 4 19:49", "David Martel" login field, "Not
+listed?", Ubuntu logo with correct orange/red RGB, top-right status icons). Note:
+this is the GDM greeter, not a post-login desktop, but it fully exercises the
+EGFX handover + progressive-decode pipeline. Server render node is healthy after
+the gdm→render/video group fix (no more ZINK "failed to choose pdev").
+
+dtm-work regression: PASS — classic Windows RDP path unaffected, first frame
+presented 1920x1080 (`-u david` and `-u davidmartel07@gmail.com` both connect).
+
+DECISION MADE (2026-07-04, gap 1): `openh264` is now a DEFAULT client feature.
+`crates/ironrdp-client/Cargo.toml` `default = ["rustls", "openh264"]` (openh264
+enables egfx transitively), so `cargo build --release -p ironrdp-client` renders
+GRD/H.264 servers out of the box. The classic bitmap/RFX path is unchanged: the
+connector only advertises the Graphics Pipeline when `--egfx` is passed AND the
+feature is compiled in (config.rs `egfx_enabled`), so a default build that is NOT
+given `--egfx` behaves exactly as before (dtm-work baseline unaffected). A
+patent/H.264-clean build is still available via
+`--no-default-features --features rustls`.
+
+H.264 (bundled-OpenH264) licensing consideration — DOCUMENTED, not resolved:
+`openh264 -> ironrdp-egfx/openh264-bundled` selects `openh264/source`, which
+COMPILES Cisco's OpenH264 from source rather than downloading Cisco's signed
+binary. Cisco's royalty-free H.264/AVC patent grant only covers *Cisco's own
+binary distribution* of OpenH264; a from-source build falls OUTSIDE that grant.
+Consequence: any party distributing this default-built artifact is responsible
+for its own H.264/AVC (MPEG-LA/Via LA pool) patent posture — either holding a
+license or accepting the risk. This is a distribution/legal decision, not a code
+bug. Packaging follow-ups that are now IMPLIED but deliberately NOT done in gap 1
+(left for the packaging owner): decide whether `build.ps1 -Mode package|publish`
+and `.github/workflows/windows-release.yml` ship the H.264 default or the
+`--no-default-features --features rustls` patent-clean portable class, and mark
+the class explicitly in artifact manifests. Scope of gap 1 was intentionally
+Cargo.toml default + this note + build/live validation only.
+
+## MERGED — three gap branches integrated into `feat/gfx-early-capability-flag` (2026-07-05)
+
+All three off-by-default gap features were merged into
+`feat/gfx-early-capability-flag` (base 60bee85a) in the main worktree,
+GPG-signed (damartel@umich.edu), and live-validated against real machines:
+
+- `gap/arc-reconnect` (199231a4) → merge commit **110a4edd** — RDP Auto-Reconnect
+  (ARC), `--auto-reconnect`, off by default.
+- `gap/egfx-dirtyrect` (eebd0f06) → merge commit **34121375** — EGFX dirty-rect +
+  `destination_rectangle`, `RdpOutputEvent::ImageRegion`; full-surface updates
+  still route through the shared full-frame `Image` path (invariant preserved).
+- `gap/avc444` (3c54736e) → merge commit **239ec5a9** — AVC444/AVC444v2 dual-stream
+  decode, `--avc444`, off by default. Merge HEAD of the branch: **239ec5a9**.
+
+Conflict resolution (all three features preserved):
+- `ironrdp-egfx/client.rs` — kept BOTH dirty-rect's `BitmapUpdate`
+  `surface_width`/`surface_height` (in `handle_uncompressed` signature +
+  construction) AND AVC444's `decode_avc444` dispatch; threaded
+  `surface_width`/`surface_height` into `decode_avc444` (new params) and its
+  `BitmapUpdate`, mirroring `decode_avc420`, and updated the WireToSurface1
+  call site.
+- `ironrdp-client/config.rs` — kept both `--auto-reconnect` and `--avc444`
+  flags/fields; both `default_value_t = false`.
+- `ironrdp-client/rdp.rs` — auto-merged (ARC / dirty-rect / AVC444 regions disjoint).
+
+Gates: `cargo test --workspace` = 1370 passed / 0 failed; `cargo build --release
+-p ironrdp-client` (default openh264) = exit 0; clippy clean on all merged/touched
+crates (0 new warnings; the 9 pre-existing app.rs/config.rs GetKeyboardLayout-area
+warnings are unchanged base debt, out of scope).
+
+Live validation (creds read from Windows Credential Manager via CredRead at
+runtime; no plaintext persisted):
+- **asuspro13** GRD (`--egfx`): journal shows `RDP.RDPGFX CapsAdvertise: Accepting
+  capability set … RDPGFX_CAPVERSION_81, AVC444: false, AVC420: true`. Render path
+  intact, no Aborting/BAD_CAPABILITIES/NO_LISTENER. Confirms AVC420 banked win +
+  AVC444 correctly OFF by default.
+- **dtm-work** (`-u david --egfx`): CredSSP/NLA auth succeeded; client rendered live
+  1920x1080 EGFX frames (WireToSurface1). `--auto-reconnect` also connects cleanly
+  (ARC cookie-capture path non-regressing).
+- **AVC444 negotiation CONFIRMED end-to-end on dtm-work** (Windows RDS Graphics
+  Pipeline): with `--avc444 --egfx`, client advertises V10.7 and dtm-work confirms
+  `EGFX capabilities confirmed avc420=true avc444=true`; client's dedicated OpenH264
+  chroma decoder initialized (`AVC444 enabled: …`). dtm-work already had
+  `HKLM\…\Terminal Services\AVC444ModePreferred = 1` (verified via WinRM) — **no
+  registry change was made, nothing to revert.** This is further than the AVC444
+  gap agent reached (GRD only ever advertised AVC420). HOWEVER, an actual
+  AVC444-coded frame decoding through `decode_avc444` was **not observed**: during
+  the brief window before david's active-console single-session state dropped the
+  connection (clean exit code 0, expected server-state), the server sent only empty
+  `StartFrame`/`EndFrame` markers with no `WireToSurface` content (nothing visually
+  changing on the locked/static console). Exercising `decode_avc444` needs an
+  interactive/changing dtm-work session (or a non-console RDS session), which cannot
+  be arranged without disrupting the operator's console.
+- NOT verified here: an actual AVC444 frame decode (negotiation ✓, frame content ✗ —
+  see above); a forced ARC drop/reconnect trigger; progressive dirty-rect visual
+  diff needs a `--no-default-features rustls,egfx` build (openh264 default drives
+  AVC420 full-frames).
+
+The follow-up designs below are retained for reference; the two banked wins
+(dtm-work classic RDP and asuspro13 GRD AVC420 render) survived the merge:
+
+- EGFX bounding-box (dirty-rect) delivery [prior gap 2 / Priority 2.1]. Status:
+  **IMPLEMENTED 2026-07-04 on branch `gap/egfx-dirtyrect` (off 60bee85a).** The
+  design below was followed. Summary of what shipped:
+    * `BitmapUpdate` (ironrdp-egfx `client.rs`) gained `surface_width` /
+      `surface_height` so the presenting handler can distinguish a full-surface
+      update from a sub-rect and size its own persistent framebuffer. All three
+      construction sites (`decode_avc420`, `handle_uncompressed`,
+      `handle_wire_to_surface2`) populate them.
+    * `handle_wire_to_surface2` now tracks the changed-tile bounding box while
+      compositing (min/max of `tile.x_idx/y_idx*64`, clipped to the surface),
+      then `crop_region()` crops just that bbox out of the persistent
+      `progressive_framebuffers[surface_id]` accumulator and delivers it as a
+      sub-rect `BitmapUpdate` (dest_rect = bbox, width/height = bbox size). The
+      accumulator STAYS in egfx (lifecycle tied to ResetGraphics/DeleteSurface);
+      the full clone-every-frame is gone.
+    * New parallel render event `RdpOutputEvent::ImageRegion { buffer, x, y, w, h,
+      surface_w, surface_h }` (rdp.rs). `EgfxRenderHandler::on_bitmap_updated`
+      routes full-surface updates (origin + surface-sized) to the UNCHANGED
+      `Image` path (buffer moved, byte-identical — dtm-work/AVC420 banked wins
+      untouched) and everything else to `ImageRegion`.
+    * `app.rs` keeps a persistent surface-sized `self.buffer`; `blit_image_region`
+      (re)allocates it to `surface_w*surface_h` opaque-black on size change, then
+      blits the region at (x,y) with hard clipping to surface bounds (a malformed
+      server rect cannot panic or OOB-write). The small region buffer is recycled
+      via the existing `RecycleFrameBuffer` channel.
+    * `destination_rectangle` is now HONORED for placement on both codecs: a
+      future AVC420 sub-rect update (GRD currently sends full-surface AVC420, so
+      it stays on the `Image` path) would also route to `ImageRegion` and be
+      placed at its offset instead of corrupting the frame to the top-left.
+  Validation: `cargo test --workspace` green; unit tests are the acceptance gate
+  (`crop_region_offset_subrect_is_byte_exact`,
+  `crop_region_then_blit_back_matches_full_frame_delivery` in egfx — offset region
+  x>0,y>0,w<W,h<H so source/dest strides differ; `blit_image_region_*` in
+  ironrdp-client covering placement, out-of-bounds clipping, and unchanged-pixel
+  preservation). Clippy clean on touched files. Release build (default openh264)
+  and the `--no-default-features --features rustls,egfx` (no-H264) build both
+  compile. DEFERRED live validation: a running GRD session on the no-H264 build
+  (progressive path) and a Windows AVC420-sub-rect host were NOT exercised (no
+  live GRD access this phase — comprehensive live validation is the dedicated
+  later phase). Original finding/design retained below for reference:
+
+  DEFERRED — not cleanly validatable under the new openh264 default. Key finding:
+  `handle_wire_to_surface2` (RemoteFX **Progressive**) is the code path that marks
+  the whole surface dirty and clones the full framebuffer each frame — but with
+  `openh264` now DEFAULT, GRD sends AVC420 via `WireToSurface1` and STOPS sending
+  progressive RFX, so `handle_wire_to_surface2` is not exercised against GRD in the
+  default build. Validating a progressive dirty-rect change therefore requires a
+  `--no-default-features --features rustls,egfx` build (no H.264) connected to GRD
+  (which then falls back to progressive RFX), OR a Windows host that sends
+  progressive. Concrete containment-first design when picked up:
+    1. Add a PARALLEL render event `RdpOutputEvent::ImageRegion { buffer, x, y, w,
+       h, surface_w, surface_h }` — do NOT modify the shared `RdpOutputEvent::Image`
+       full-frame path (that path carries BOTH banked wins; the naive sub-rect-in-
+       Image approach shrinks the frame to the top-left = corruption).
+    2. `app.rs` keeps its own PERSISTENT full-surface `self.buffer` (sized
+       surface_w*surface_h) and BLITS the sub-rect at (x,y) into it, then presents,
+       instead of `queue_image_buffer` swapping the whole buffer. Recycle small
+       sub-rect buffers back to egfx via the existing `RecycleFrameBuffer` channel.
+    3. `egfx/client.rs` computes the changed-tile bounding box (min/max of
+       `tile.x_idx/y_idx * 64`, clipped to surface) in `handle_wire_to_surface2`,
+       crops that rect out of `progressive_framebuffers[surface_id]`, and delivers
+       it as the ImageRegion. KEEP the accumulator in egfx — do NOT move
+       `progressive_framebuffers` to app.rs (its reset/delete lifecycle is tied to
+       ResetGraphics/DeleteSurface that app.rs cannot see).
+    4. Acceptance gate: dump both full-frame (pre) and dirty-rect (post) framebuffers
+       via `IRONRDP_EGFX_DUMP` on the no-openh264 build and diff to PNG — no visual
+       corruption vs the whole-surface delivery. dtm-work `Image` path stays
+       byte-identical by construction, so that banked win is untouchable.
+  NOTE: the AVC420 (`WireToSurface1`) path already delivers only `dest_rect`-sized
+  data, but the renderer ignores `destination_rectangle` and treats every update as
+  full-frame at origin (0,0) — see `rdp.rs::on_bitmap_updated` -> `RdpOutputEvent::
+  Image`. If GRD ever sends AVC420 sub-rect updates (it currently sends full-surface
+  frames), that path would ALSO need the ImageRegion offset treatment. Same event
+  design covers both codecs.
+
+- AVC444 dual-stream decode [prior gap 4 / Track B refinement].
+  Status: IMPLEMENTED (2026-07-04, branch `gap/avc444`), behind opt-in `--avc444`;
+  UNVERIFIED end-to-end (no AVC444-advertising peer — GRD advertised AVC420 only).
+  What shipped:
+    * `egfx/src/avc444.rs` — YUV444 reconstruction from the luma + chroma-aux
+      YUV420 views (FreeRDP-faithful `LumaToYUV444` / `ChromaV1ToYUV444` /
+      `ChromaV2ToYUV444`), + `yuv444_to_rgba` reusing the AVC420 path's exact
+      BT.601 coefficients. All plane reads/writes bounds-checked (panic-free).
+    * `egfx/src/decode.rs` — `Yuv420Frame` + `H264Decoder::decode_yuv` (default
+      `Err`); `OpenH264Decoder` packs decoder planes tightly.
+    * `egfx/src/client.rs::decode_avc444` — parses `Avc444BitmapStream`, decodes
+      luma via the primary H.264 context and chroma-aux via a SEPARATE context
+      (`h264_chroma_decoder`; the two sub-streams are independent H.264 sequences
+      and must not share DPB state), reconstructs, converts, crops, delivers a
+      `BitmapUpdate`. Only `LC == LUMA_AND_CHROMA` (two streams) is reconstructed;
+      luma-only / chroma-only partial updates are warned + skipped (would need a
+      persistent per-surface YUV444 framebuffer — deliberately out of scope).
+    * `ironrdp-client`: `--avc444` CLI flag + `Config::avc444`; when set,
+      `EgfxRenderHandler::capabilities` prepends V10.7 and a dedicated OpenH264
+      chroma decoder is attached. Default is unchanged (V8.1/AVC420 only).
+  Validation: 15 unit tests — 10 assert reconstruction placement against the
+  spec geometry directly (not via a round-trip that a mis-transcribed split
+  could mask) + RGBA conversion + panic-free on truncated aux; 5 cover the
+  `Avc444BitmapStream` parse (LC round-trips for LUMA_AND_CHROMA / LUMA / CHROMA
+  and rejection of reserved-encoding and zero-length-LUMA_AND_CHROMA inputs). v2 (`Avc444v2`) is
+  implemented to spec geometry but has NO round-trip/peer validation (FreeRDP
+  ships no v2 split reference). Live-validate by flipping `--avc444` against a
+  Windows RDS host (more reliable AVC444 peer than GRD) and visually confirming.
+  Historical context (why it was deferred):
+  Previously the `Avc444|Avc444v2` arm in `egfx/client.rs::handle_wire_to_surface1`
+  forwarded to `on_unhandled_pdu`, and `rdp.rs::EgfxRenderHandler::capabilities`
+  deliberately capped advertisement at V8.1/AVC420 so servers never select AVC444.
+  Containment-first design: implement dual-stream decode (parse the AVC444 bitmap
+  stream = an `LC` field + up to two `Avc420BitmapStream`s: the main/luma view and
+  the chroma-auxiliary view per [MS-RDPEGFX] 2.2.4.4/2.2.4.5; decode BOTH via the
+  existing `openh264` AVC420 path, then reconstruct YUV444 from the two YUV420
+  planes and convert to RGBA) BEHIND AN OPT-IN FLAG (mirror `--network-autodetect`:
+  add `Config::avc444` + `--avc444`, and only re-raise `capabilities()` to include
+  V10.7/AVC444 when the flag is set). NEVER make AVC444 default — a buggy dual-stream
+  decode reachable by default would break the banked GRD render. Live-validate by
+  flipping the flag against GRD/Windows and visually confirming the frame; keep the
+  default (V8.1/AVC420) advertisement so the banked render is never at risk. Note
+  GRD's AVC444 encode support is unconfirmed (its handover instance advertised only
+  AVC420 acceptance in these runs); a Windows RDS host is the more reliable AVC444
+  peer for validation.
+
+- Reconnect-into-existing-session + CredSSP InvalidToken handover [prior gap 5].
+  Status: (a) RDP auto-reconnect (ARC) — **IMPLEMENTED** 2026-07-04 (branch
+  `gap/arc-reconnect`, off 60bee85a), see "ARC auto-reconnect IMPLEMENTED" section
+  below. (b) CredSSP InvalidToken retry — still DEFERRED. Two distinct pieces:
+  (a) Reconnect-into-existing-session is NOT the same as the GRD handover redirect
+      (that one — reconnect carrying LoadBalanceInfo + LB_USERNAME/LB_PASSWORD as an
+      X.224 routing token — is already RESOLVED, see Track B item 0). This is RDP
+      *auto-reconnect* ([MS-RDPBCGR] 2.2.4): the server sends a Server Auto-Reconnect
+      Cookie (ARC) in the Save Session Info PDU; on an unexpected drop the client
+      reconnects sending the ARC_CS_PRIVATE_PACKET (Client Auto-Reconnect Packet) so
+      the server re-attaches the existing session instead of starting a new one. The
+      client currently sends `reconnect_cookie: None` (confirmed in connect logs) and
+      discards SaveSessionInfo (`x224/mod.rs` logs+drops it). Concrete next step:
+      capture the ARC cookie from `ShareDataPdu::SaveSessionInfo` (LogonInfoExtended
+      -> ServerAutoReconnect), store it on the session/config, and populate
+      `reconnect_cookie` in `ExtendedClientOptionalInfo` on the reconnect attempt in
+      `RdpClient::run`'s reconnect loop. Regression-safe: default `None` preserves
+      today's behavior. CORRECTION (2026-07-05, see "Upstream import re-scan"
+      section): "populate `reconnect_cookie`" is NOT a copy of `random_bits` — the
+      client cookie's SecurityVerifier = HMAC-MD5(ArcRandomBits, ClientRandom) per
+      [MS-RDPBCGR] 5.5 (crypto derivation). Upstream also only TODOs this
+      (`rdp.rs:774 TODO(#271)`), so there is no import; it is from-scratch and gate
+      it behind an opt-in `--auto-reconnect` flag rather than a bare default `None`.
+  (b) CredSSP `InvalidToken` (nstatus 0xc00700ea) on the GRD handover reconnect is a
+      FLAKY, server-side/environment auth race (winpr NTLM SAM not ready vs the
+      client's NTLMSSP), present at both old and new commits and not an import/client
+      regression. It is NOT the NTLM-SAM *username/password* mismatch (that was fixed
+      by sending LB_USERNAME/LB_PASSWORD as UTF-16LE). Concrete next step: it is
+      unreproducible-on-demand from the client; if it must be chased, add a bounded
+      CredSSP retry on `InvalidToken` during the handover reconnect ONLY (do not
+      touch the initial-connect CredSSP path, which is the dtm-work banked win), and
+      confirm against a freshly-restarted GRD where the handover SAM is warm.
+      SCOPE SHARPENED (2026-07-05, chore/tech worktree, informed by the audio-on-
+      handover investigation above): "the handover reconnect" that re-runs CredSSP is
+      the **ServerRedirectionPdu redirect** path, i.e. the `connect()` /
+      `connect_ws()` call in `RdpClient::run`'s loop taken AFTER a
+      `RdpControlFlow::Redirect` set `request_data` (a full new connection → full new
+      CredSSP handshake). The asuspro13 GRD handover observed in these runs is instead
+      an IN-SESSION deactivation-reactivation, which re-sends only Demand/Confirm
+      Active and NEVER re-runs CredSSP — so it is NOT a target for this retry. Bounded
+      design: thread a "this is a redirect reconnect" signal (e.g. `redirect_count > 0`
+      captured before the loop's `connect()`) so a small (1-2 attempt, short-backoff)
+      retry wraps ONLY the CredSSP sequence of a redirect reconnect; the initial
+      connect and the resize/ARC reconnects keep today's no-retry behavior verbatim.
+      NOT IMPLEMENTED here: the redirect-reconnect CredSSP path does not fire against
+      asuspro13's (reactivation-style) handover, so the change would be unvalidatable
+      live in this environment and could only regress — deferred until a genuine
+      ServerRedirectionPdu redirect peer (or a warm-SAM GRD that redirects) is
+      available to validate against.
+
+## Upstream import re-scan for the deferred gaps (2026-07-05)
+
+Targeted re-scan of `master..upstream/master` (139 commits, upstream HEAD
+069786c9) specifically to import commits that resolve the deferred gaps above.
+**Headline: only gap 5 (robustness) was closable by import. The premise that
+upstream already implements AVC444 decode (gap "1"/AVC444) and the ARC
+reconnect-cookie wiring (gap "5"/reconnect) is FALSE — upstream stubs/TODOs both,
+so there is nothing to cherry-pick for them.** Primary-source evidence:
+
+- AVC444 dual-stream decode: **no upstream source exists.**
+  `upstream/master crates/ironrdp-egfx/src/client.rs:720` is byte-for-intent
+  identical to the fork — `Codec1Type::Avc444 | Codec1Type::Avc444v2 => { debug!(
+  "AVC444 codec not yet implemented, forwarding to handler") }`. Upstream ships
+  the `Avc444BitmapStream` PDU parser (`pdu/avc.rs`) but NOT the luma+chroma-aux
+  → YUV444 decode. Remains DEFERRED and from-scratch; additionally UNVERIFIABLE in
+  this environment (GRD's handover instance advertised AVC420 acceptance only, so
+  there is no AVC444 peer to visually validate against). Keeping it deferred is
+  correct — a from-scratch dual-stream decoder reachable by default would threaten
+  the banked GRD render; it must stay behind the opt-in `--avc444` flag if ever
+  built. Design in the AVC444 bullet above still stands.
+
+- ARC auto-reconnect cookie: **no upstream source exists → IMPLEMENTED from
+  scratch 2026-07-04** (branch `gap/arc-reconnect`; see the dedicated
+  "ARC auto-reconnect IMPLEMENTED" section below for the full write-up).
+  `upstream/master crates/ironrdp-client/src/rdp.rs:774` is a bare
+  `// TODO(#271): use the "auto-reconnect cookie"`. Both fork and upstream have the
+  PDU infrastructure (`client_info.rs` `reconnect_cookie: Option<[u8;28]>` +
+  `ExtendedClientOptionalInfo` builder; `session_info/logon_extended.rs`
+  `ServerAutoReconnect { logon_id, random_bits:[u8;16] }`), but neither wires
+  capture→use. **Correction to the prior gap-5(a) note:** populating
+  `reconnect_cookie` is NOT a copy of `random_bits`. The client cookie's 16-byte
+  SecurityVerifier = HMAC-MD5(ArcRandomBits, ClientRandom) per [MS-RDPBCGR] 5.5 —
+  it is a crypto derivation, not a memcpy. So the "just store + populate" framing
+  understated it. DEFERRED (from-scratch, and cannot observe a single successful
+  reconnect round-trip here — no reproducible ARC-issuing unexpected drop; GRD's
+  redirect is a different, already-resolved mechanism). If picked up: (1) confirm
+  against [MS-RDPBCGR] 5.5 that under Enhanced (TLS/CredSSP) security ClientRandom
+  is 32 zero bytes so the verifier is deterministic and unit-testable against a
+  fixed vector; (2) gate behind an opt-in `--auto-reconnect` flag (mirror
+  `--avc444`/`--network-autodetect`) so the banked resize-reconnect path stays
+  byte-identical by default — safer than a bare `default None`. A capture-only
+  half was rejected: adding `ProcessorOutput`/`ActiveStageOutput` variants across
+  two crates for a value that is stored and never read is dead plumbing.
+
+- EGFX destination_rectangle / dirty-rect (gap "2"): the relevant upstream commits
+  (#1238/#1246 exclusive-bounds rects, #1197 progressive decode/integration) are
+  egfx-crate *correctness*, not the fork's deficit. The fork's deficit — renderer
+  ignores `destination_rectangle` and full-clones the surface — lives in the fork's
+  own rewritten `app.rs`/`rdp.rs`, so it was from-scratch (design in the dirty-rect
+  bullet above). **RESOLVED 2026-07-04 on `gap/egfx-dirtyrect`** — implemented
+  from scratch per that design (parallel `ImageRegion` event + persistent app-side
+  framebuffer + egfx bbox crop; `destination_rectangle` honored on both codecs).
+  Unit-tested; live progressive validation on a no-H264 GRD build deferred to the
+  dedicated live-validation phase.
+
+- Connect-time / in-session network auto-detect (gap "4"): upstream #1178
+  (4dcad099) handles the *share-data-framed* `ShareDataPdu::AutoDetectReq`. The
+  fork does not have that arm, but it independently handles the framing GRD
+  actually uses — the *message-channel / security-header-framed* auto-detect
+  request (`connect_time_autodetect` + `x224::process_unrouted_channel`, commit
+  61af5a77). Crucially, #1178 does NOT address gap 4's real blocker (suppressing
+  re-advertisement of `SUPPORT_NET_CHAR_AUTODETECT` on the GRD handover reconnect,
+  which tears the handover down) — upstream has no such suppression. So gap 4's
+  importable part was already delivered by the fork; the remaining blocker has no
+  upstream fix. `--network-autodetect` stays opt-in/off by default. #1178 SKIPPED
+  (different framing than GRD, not the blocker, and would conflict with the fork's
+  reworked `active_stage.rs`/`x224` while adding always-on autodetect the fork
+  deliberately gated).
+
+- Gap 5 (robustness) — IMPORTED: **#1236 (78effb3f)** `fix(connector): surface
+  actual PDU type when an unexpected Share Control PDU arrives`. Replaces opaque
+  "unexpected Share Control Pdu" errors in `legacy.rs` (`decode_share_data`,
+  `decode_io_channel`) and `connection_activation.rs` CapabilitiesExchange with
+  `reason_err!` messages naming the actual PDU via `as_short_name()` — improves
+  the exact diagnostic surface the fork hit while root-causing the GRD handover
+  BadCapabilities teardown. ADAPTED: kept the fork's `ServerRedirect` arm in
+  `decode_io_channel`; `connection_activation.rs` auto-merged preserving the fork's
+  interleaved Set-Error-Info diagnostic. Gate results: `cargo test --workspace`
+  1348 passed / 0 failed (baseline held), `cargo build --release -p ironrdp-client`
+  (default rustls+openh264) clean, clippy 0 findings on both touched files.
+  dtm-work live insurance (honest framing): TCP+TLS+CredSSP/NLA auth SUCCEEDED
+  with a runtime-read Credential-Manager credential (generic `TERMSRV/dtm-work.
+  radius.dtmventures.com`, 48-byte blob read via CredRead at runtime, never
+  persisted) — the connect/auth path #1236 sits on is intact. **First-frame
+  present was NOT reproduced this session** (documented baseline was "connect +
+  first frame 1920x1080, session held"), so this run is BELOW baseline: the
+  session hit `[read frame]` `ConnectionReset` **WSA 10054 = "existing connection
+  forcibly closed by the *remote* host"** right after auth, before any frame. This
+  reproduced identically on a single clean run after a 60s half-open drain (not a
+  rapid-reconnect artifact), so the cause is a dtm-work server-state condition
+  (suspected active single-session / post-NLA reject) — suspected, not confirmed.
+  It is provably NOT a #1236 regression: 10054 is remote-initiated (the server
+  closed its socket), and #1236 changed only error-arm *strings* in match arms
+  that do not execute on a successful connect (the `Ok` arms of `decode_io_channel`
+  are byte-identical). asuspro13 GRD render was NOT attempted — #1236 is connector
+  error-text and cannot reach the EGFX render path, so it is structurally
+  irrelevant to that banked win.
+
+- Already-present / no-op: **#1395 (368fe8e6)** `don't require CONTEXT block on
+  every progressive frame` is ALREADY in the fork (`progressive.rs:835-850`,
+  same fix + same GNOME-Remote-Desktop rationale comment) — NOT re-imported.
+
+Intentionally SKIPPED (high-value but out-of-scope/entangled/unverifiable):
+- #1178 (session auto-detect) — see gap-4 note above.
+- #1132 (93833802, slow-path graphics + pointer): real feature but a 480-line
+  rewrite of `fast_path.rs`, which the fork already reworked (item 27
+  reactivation fix); heavy conflict, and both banked targets use the fast-path,
+  not slow-path, so no observable benefit. SKIPPED.
+- #1174 (059ca902, ClearCodec bitmap codec): from-scratch codec; no banked target
+  negotiates ClearCodec (GRD=AVC420, dtm-work=bitmap/RFX). SKIPPED.
+- #1305 (91ea46bd, RawCapabilitySet split): already dispositioned as deferred in
+  item 46 (392-line breaking rework of the fork's most-diverged egfx file; client
+  benefit already delivered by the #1298 adaptation). Still SKIPPED.
+
+## ARC auto-reconnect IMPLEMENTED (2026-07-04, branch `gap/arc-reconnect` off 60bee85a)
+
+Closes the importable half of gap 5(a). RDP Auto-Reconnect per [MS-RDPBCGR] 2.2.4
+/ 5.5, opt-in behind `--auto-reconnect` (default OFF → default connect + drop
+paths byte-identical). Capture and use are wired together (no dead plumbing).
+
+**1. Capture (ARC_SC_PRIVATE_PACKET).** The Save Session Info PDU is no longer
+just logged+dropped: `x224::Processor` (`crates/ironrdp-session/src/x224/mod.rs`)
+now stores `Option<ServerAutoReconnect>`; the `SaveSessionInfo` handler pulls
+`InfoData::LogonExtended -> auto_reconnect` and caches it. `process_io_channel`
+became `&mut self`; output is unchanged (`Ok(Vec::new())`), so the session layer
+stays flag-agnostic and behaviourally transparent. `ActiveStage::reconnect_cookie()`
+exposes it. `run_active_session` (`session_driver.rs`) takes a
+`&mut Option<ServerAutoReconnect>` out-param and syncs the captured cookie right
+after each `process_server_frame` **before** propagating a processing error, so a
+later unexpected drop can still use a cookie captured earlier this session.
+
+**2. Derivation (ARC_CS_PRIVATE_PACKET).** New in
+`crates/ironrdp-pdu/src/rdp/session_info/logon_extended.rs`: `ClientAutoReconnect
+{ logon_id, security_verifier }` with `from_server(server, client_random)` →
+`SecurityVerifier = HMAC-MD5(ArcRandomBits, ClientRandom)` (the crypto derivation,
+NOT a copy of `random_bits`). `to_bytes()` serializes the 28-byte packet
+cbLen(4)=28 / Version(4)=1 / LogonId(4) / SecurityVerifier(16), all LE.
+HMAC-MD5 is implemented directly over the crate's existing `md-5 0.10` primitive
+(RFC 2104; 64-byte block, ipad/opad) — deliberately NOT the `hmac` crate, whose
+lock version (0.13-rc, digest 0.11) mismatches pdu's `md-5 0.10`/digest 0.10 and
+would churn Cargo.lock.
+
+**Spec ambiguity resolved (the crux fact):** under Enhanced RDP Security
+(TLS/CredSSP/NLA — the dtm-work path) `ClientRandom` is 32 **zero** bytes per
+[MS-RDPBCGR] 5.5; the real client random is only fed to the verifier under
+Standard RDP Security (`PROTOCOL_RDP`). This matches FreeRDP's
+`rdp_compute_client_auto_reconnect_cookie` (zero-inits the buffer; copies real
+bytes only when `SelectedProtocol == PROTOCOL_RDP`). Exposed as
+`ENHANCED_SECURITY_CLIENT_RANDOM` + `from_server_enhanced_security()`. Structured
+as a parameter, not an assertion, so a wrong assumption would be a one-line fix
+and the KAT still tests pure HMAC. NOTE: only validated by unit tests — a live
+Standard-Security peer was not exercised, so the non-zero-client-random branch is
+correct-by-construction but unproven on the wire.
+
+**3. Use / gating.** `connector::Config` gains `reconnect_cookie: Option<[u8;28]>`
+(default None → `create_client_info_pdu` builder is byte-identical; typestate
+builder handled via a `match` so both arms `.build()`). Client `Config` gains
+`auto_reconnect: bool` from `--auto-reconnect`. `RdpClient::run` (`rdp.rs`): on an
+unexpected `Err(_)` drop, if `auto_reconnect && arc_cookie.is_some() && attempts <
+MAX_AUTO_RECONNECTS(20)`, it derives the client cookie, sets
+`connector.reconnect_cookie`, and reconnects; the cookie is one-shot (cleared
+right after `connect()` consumes it into the info PDU). The budget resets whenever
+a session reaches full logon (captures a cookie), so genuine long-lived sessions
+aren't starved. Guard is naturally safe for the documented dtm-work post-auth WSA
+10054: that drop happens before SaveSessionInfo, so no cookie is captured → no
+auto-reconnect loop; and resize/redirect (banked GRD handover) paths are untouched.
+
+**Tests / gates:** 6 new unit tests in `logon_extended.rs::arc_tests` — HMAC-MD5
+against RFC 2202 vectors 1 & 2 (independent KATs), ARC verifier KAT (random_bits
+1..16 + zero client-random → `894025a9…261c`, computed independently in Python),
+a not-a-copy-of-random-bits regression guard, and the 28-byte wire-layout check.
+ARC_SC parse/encode was already covered by the existing `session_info/tests.rs`
+`LOGON_EXTENDED` fixtures. Gates: see report at end / commit message.
+
+Deferred still: gap 5(b) CredSSP `InvalidToken` handover retry (server-side/env
+race, unreproducible on demand). Live ARC round-trip validation (needs a
+reproducible ARC-issuing unexpected drop; GRD's redirect is a different, already-
+resolved mechanism) is a later dedicated phase — unit tests + build are the bar here.
+
+## Live smoke-test findings (2026-07-04, Windows -> asuspro13 GRD 46.3 + dtm-work)
+
+Evidence-based QA pass against both live targets with a fresh `-p ironrdp-client`
+release build. Binaries compared: `5b849c64` (last "render worked" commit) vs
+current `HEAD` (0cf7a36a, post 16-commit upstream import).
+
+1. GRD render regression: NOT caused by the import (root-caused).
+Claim under test: "W->L render rendered a full Ubuntu desktop at 5b849c64, broke
+after the import." Result: **both commits fail identically** against the same
+live GRD, so the import did not regress render.
+- 4 trials each (GRD restarted between): 5b849c64 = 4/4 DEACTIVATE_FAIL; HEAD =
+  3/4 DEACTIVATE_FAIL + 1/4 CREDSSP_FAIL. Same error string, same flow.
+- Confirmed root cause (HEAD, `ironrdp_connector=trace`): the session-handover
+  reconnect passes CredSSP, confirms active, then GRD's handover instance runs a
+  Deactivation-Reactivation and sends `ServerSetErrorInfo(RdpSpecificCode(
+  BadCapabilities))`. The session-layer reactivation loop
+  (`ConnectionActivationSequence`, `connection_activation.rs` CapabilitiesExchange)
+  only expected ServerDeactivateAll / ServerDemandActive, so it aborted with the
+  misleading `unexpected Share Control Pdu (expected ServerDemandActive)`.
+- #1254/#1371 do NOT cause this: they fixed the *connector-initial* DeactivateAll
+  handling; 5b849c64 lacks them and fails the same way. **Do not revert them** —
+  reverting cannot restore render and loses the DeactivateAll robustness.
+- Fix applied (this pass): the reactivation CapabilitiesExchange now treats an
+  interleaved Set Error Info PDU as a diagnostic notification (logs the actual
+  code, e.g. BadCapabilities, at warn) and keeps reading for ServerDemandActive
+  instead of aborting — protocol-correct per [MS-RDPBCGR] 2.2.5.1. dtm-work
+  baseline unaffected; 666 connector/testsuite tests pass.
+- VERIFIED (after full system+user GRD restart): the fix fires and now logs the
+  real reason — `error_info=[RDP specific code]: The capabilities received from
+  the client in the Confirm Active PDU were not accepted by the server` — then,
+  instead of sending a Server Demand Active, GRD's handover instance issues an
+  MCS Disconnect Provider Ultimatum (UserRequested) and tears the connection
+  down. So **render is NOT restorable client-side by this change**: GRD's
+  handover/user-session instance genuinely rejects our Confirm Active
+  capabilities (BadCapabilities). The fix's value is truthful diagnostics +
+  protocol-correct continuation, not render restoration.
+- Why the caps are now rejected (best current hypothesis, server-side): the
+  headless GNOME rendering backend is degraded — the daemon logs `Cannot load
+  libcuda.so.1` / `libnvidia-encode.so.1` and (per earlier sessions) ZINK/EGL
+  "failed to choose pdev". A handover instance that cannot bring up its
+  encode/render pipeline will reject the client's graphics capabilities. The
+  client Confirm Active capability set is byte-identical between 5b849c64 and
+  HEAD, so this is not a client regression.
+- Concrete next step to close the render gap: on a freshly-booted asuspro13 with
+  a healthy GRD graphics backend (verify no ZINK "failed to choose pdev" and a
+  working render node), retry and capture a framebuffer dump. If it still
+  BadCapabilities-rejects, enable FreeRDP verbose capability logging server-side
+  (`WLOG_LEVEL=TRACE` on the handover instance) to identify exactly which
+  capability set GRD refuses, then adjust the client Confirm Active caps to match
+  what GRD's handover instance supports.
+- Second, independent handover failure mode: CredSSP `InvalidToken`
+  (nstatus 0xc00700ea) in the pub_key_auth step = handover NTLM SAM auth mismatch
+  (LB_PASSWORD decode vs stored NTOWFv1, or SAM-not-ready race). Flaky, present at
+  both commits. Server-side / environment; not an import regression.
+
+2. Audio output disabled by GRD due to missing network-autodetect advertisement.
+GRD logs, every connection: `[RDP] Client does not support autodetecting network
+characteristics. Disabling audio output redirection`. FreeRDP-based servers gate
+rdpsnd on the client's `RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT` (0x0080) early-cap
+flag, which the connector does not advertise (`connection.rs`
+`create_gcc_blocks`). So the rdpsnd panic/underrun fixes (#1256/#1276, cpal
+`play()`) cannot matter on GRD — audio is never enabled server-side.
+- Naive fix (advertise the flag) BREAKS connections: with the flag set, GRD sends
+  a connect-time Auto-Detect Request PDU that the connector's
+  `ConnectTimeAutoDetection` state discards without consuming, desyncing
+  LicensingExchange -> `decode during LicenseExchangeState::NewLicenseRequest ...
+  invalid security header flags`. Reproduced live against GRD; reverted.
+  (dtm-work happened to survive because Windows did not send connect-time
+  auto-detect in that idle window — so whether the desync fires is
+  server-dependent, making the flag unsafe to advertise without the handler.)
+- Real fix — IMPLEMENTED (opt-in), 2026-07-04. A content-dispatching connect-time
+  auto-detect handler now exists and is gated behind an opt-in config flag
+  (`Config::network_autodetect`, client `--network-autodetect`):
+  - new `connect_time_autodetect` module: classify a connect-time I/O-channel PDU
+    by its `BasicSecurityHeader` (AUTODETECT_REQ vs anything else — this is the
+    *security-header* framing used at connect time, distinct from the in-session
+    share-data `ShareDataPdu::AutoDetectReq` framing) and build the security-header
+    -framed Auto-Detect Response. Answers RTT Measure Request (RTT Response) and
+    connect-time Bandwidth Measure Stop (Bandwidth Measure Results,
+    byte_count = Stop payload length, nominal 1 ms delta).
+  - `ConnectTimeAutoDetection` connector state: reads the next PDU ONLY when the
+    flag is set; answers auto-detect requests and loops; feeds the first
+    non-auto-detect PDU (the Licensing request) forward to `LicenseExchangeSequence`
+    (mirroring the LicensingExchange terminal check so a single-PDU licensing
+    exchange advances instead of being stepped twice).
+  - Safe by construction: with the flag OFF (default) the GCC blocks are
+    byte-identical and the state keeps its historical immediate passthrough
+    (`next_pdu_hint = None`), so the standard connect path — dtm-work included — is
+    unchanged. 5 connector unit tests cover classify/respond/passthrough/framing.
+  - VALIDATED (live): dtm-work `--network-autodetect` connects + first frame
+    presented 1920x1080 (feed-forward path, no auto-detect fired — the exact case
+    that used to desync). GRD `--network-autodetect`: the connect-time auto-detect
+    now COMPLETES — system-daemon path answered 10 RTT requests + received
+    NetworkCharacteristics; handover path answered Bandwidth Start/Stop. No more
+    LicensingExchange desync.
+  - SERVER-SIDE AUDIO ENABLE — PROVEN (live A/B, 2026-07-04): with the flag OFF,
+    GRD logs every connection `[RDP] Client does not support autodetecting network
+    characteristics. Disabling audio output redirection`. With `--network-autodetect`
+    that line is GONE from the GRD journal — the connect-time handshake flips GRD's
+    server-side gate and it no longer disables audio output redirection. This is the
+    exact behaviour gap 4 targeted; the negotiation half is done and verified.
+  - CHANNEL-0 PDU DECODED + ROUTED (gap 3, RESOLVED 2026-07-04): the 10 head bytes
+    `[0, 16, 0, 0, 6, 0, 11, 0, 1, 0]` are NOT a Share Control / MCS PDU. bytes[0..2]
+    = `0x1000` LE = the `flags` field of a `BasicSecurityHeader` = `AUTODETECT_REQ`
+    (RSP is `0x2000`); the remaining `[06 00 0B 00 01 00]` is the auto-detect request
+    header (headerLength=6, seq=0x000B, RTT request). So GRD sends *continuous
+    (in-session)* network auto-detect requests on the MCS **message channel** (which
+    the IronRDP client never joins — GCC `message_channel: None`), so they surface in
+    `x224/mod.rs` on an unrecognized channel decoded as `0`, framed with a
+    `BasicSecurityHeader` (NOT a Share Data PDU, so the existing in-session
+    `ShareDataPdu::AutoDetectReq` handler never sees them).
+    Fix (committed): `x224::Processor::process` now routes unrecognized channels to
+    `process_unrouted_channel`, which reuses the connector's connect-time responder
+    (`connect_time_autodetect::in_session_autodetect_response`) to answer the
+    security-header-framed auto-detect request, and TOLERATES (logs + drops) any other
+    channel-`0` traffic instead of fatally aborting. Non-zero unknown channels keep
+    the hard error. Exposed `pub mod connect_time_autodetect` +
+    `pub struct ConnectTimeAutoDetectRsp` + `pub fn in_session_autodetect_response`.
+    VALIDATED live: the `[X224] unexpected channel received: ID 0` fatal error is GONE
+    (client log: "Answering in-session (message-channel) Auto-Detect Request
+    channel_id=0"; unexpectedChannel count 2 -> 0). dtm-work regression PASS with the
+    flag on (session-rendering, 76 frames) and off (67 frames).
+  - DEEPER BLOCKER remains (why `network_autodetect` STILL stays OFF by default):
+    even with channel 0 handled, `--network-autodetect` against GRD now fails on the
+    HANDOVER reconnect — GRD's handover (FreeRDP) instance runs a
+    deactivation-reactivation and sends an MCS Disconnect Provider Ultimatum
+    (UserRequested) ~20 ms after the connection re-establishes, so no frame renders
+    (client error: `[read deactivation-reactivation sequence step] ... received
+    disconnect provider ultimatum: UserRequested`). Proven NOT to be the channel-0
+    handling: a controlled A/B on a freshly-restarted GRD shows `--egfx` WITHOUT
+    autodetect renders (26 frames) while `--egfx --network-autodetect` tears down, and
+    a tolerate-only build (channel-0 request acknowledged but NOT answered) tears down
+    identically. So the trigger is **advertising `SUPPORT_NET_CHAR_AUTODETECT` on the
+    handover reconnect itself** (the handover FreeRDP instance's connect-time
+    auto-detect / reactivation flow), not the message-channel response. This is a
+    GRD-handover-specific incompatibility that needs its own investigation (likely: do
+    NOT re-advertise autodetect on the redirected reconnect, or make the reactivation
+    sequence tolerate the handover instance's post-autodetect PDU ordering). Note the
+    channel-0 response is currently sent on the I/O channel (the client never joined a
+    message channel to reply on); harmless for dtm-work and neutral for the GRD
+    teardown, but revisit if a message-channel reply is ever required.
+  - NET (gap 3): the literal ask — decode + route/tolerate MCS channel 0 — is DONE,
+    tested, and safe (all changes gated behind the opt-in `--network-autodetect`;
+    default path byte-identical, dtm-work + GRD render unaffected). Server-side audio
+    ENABLE is proven (audio-disable journal line gone with the flag). `network_autodetect`
+    stays OFF by default per the "else leave off + document" fallback, because full
+    GRD audio needs the deeper handover-reactivation blocker above resolved first.
+- Audio playback itself remains unconfirmable headlessly (no output device to
+  hear).
+- HANDOVER-RECONNECT HYPOTHESIS DISPROVEN (2026-07-05, chore/tech worktree). The
+  "advertise autodetect on the INITIAL connect only, not the redirect/handover
+  reconnect" hypothesis was implemented (suppress `network_autodetect` on the
+  `RdpControlFlow::Redirect` arm in `rdp.rs`) and live-validated against asuspro13
+  — then REVERTED (commit `b1bc5f00` reverts `1a1f2d04`) because the premise is
+  false for this server:
+  - asuspro13's GRD handover is an IN-SESSION deactivation-reactivation, NOT a
+    Server Redirection PDU redirect. Proven with `ironrdp_connector=trace`: no
+    `RdpControlFlow::Redirect` fires; the log shows only "Received Server Deactivate
+    All" → `handle_deactivation_reactivation`. `ConnectionActivationSequence` starts
+    at `CapabilitiesExchange` and re-sends Demand/Confirm Active ONLY — it never
+    re-emits the GCC `ClientCoreData` early-capability flags. So
+    `SUPPORT_NET_CHAR_AUTODETECT` is advertised exactly ONCE (initial GCC); there is
+    no reconnect advertisement to suppress, and the suppression point is never
+    reached on this handover. Teardown persisted unchanged with the fix in place.
+  - A/B, fresh GRD restart per run (system + `--user` unit), `--egfx`:
+    - WITH `--network-autodetect`: client "received disconnect provider ultimatum:
+      UserRequested" during the reactivation, 0 frames rendered. GRD system journal:
+      "[DaemonSystem] RDP client disconnected during the handover" +
+      "[DaemonSystem] Aborting handover, removing remote client".
+    - WITHOUT: "First frame presented to the window width=1920 height=1080" + EGFX
+      frames flowing (frame_id=2+), session held the full 22 s. GRD journal:
+      "[RDP] Client does not support autodetecting network characteristics.
+      Disabling audio output redirection".
+  - CONCLUSION: on asuspro13 connect-time autodetect and the handover are mutually
+    exclusive — advertising it at the initial GCC makes the server ABORT the
+    handover (no session at all), so audio cannot be had that way; not advertising
+    it gives a session but no audio. The teardown is a server-side handover abort
+    keyed on the single initial advertisement, not on any re-advertisement. Item
+    status: ADVANCED (root-caused) / DEFERRED (not fixed). Banked no-autodetect GRD
+    render confirmed intact (regression check).
+  - REMAINING LEAD (not chased this session): "tolerate-only channel-0 also tears
+    down" does NOT rule out ANSWERING in-session autodetect on the MCS *message
+    channel* (the client currently replies on the I/O channel because it never
+    joined a message channel). Tolerate-only != reply-on-correct-channel. Next
+    step: join the message channel to reply, and instrument GRD's user-session
+    FreeRDP instance (`WLOG_LEVEL=TRACE`) to see what it expects post-handover.
+
+3. dtm-work (standard Windows RDP) baseline: WORKS. NLA/HYBRID_EX via Credential
+Manager, connect + first frame presented 1920x1080, session held. The `-d
+<machine>` "trips IronRDP" claim did NOT reproduce on the fresh binary (`-u david
+-d dtm-work` connected and held) — workaround appears no longer needed.
+
 ## Immediate next batch
 
 This is the next concrete implementation queue, not a wish list.
@@ -513,6 +1269,93 @@ Do next: wait for sspi stable release, then port NtlmConfig server mode.
 Effort: small (once unblocked).
 
 ### Track B: Graphics acceleration pipeline
+
+0. gnome-remote-desktop 46 session-handover redirection (PRIMARY BLOCKER to
+pixels against GRD; supersedes the earlier "EGFX version=0" framing, which was
+a benign warning — GRD/FreeRDP advertises General capset protocolVersion=0).
+Status: partially done (commit "feat(session): handle RDP Server Redirection
+PDU (GRD 46 handover)").
+What was found: GRD 46's *system* daemon authenticates the initial connection
+(NLA/CredSSP, damartel PAM password, from Windows Credential Manager
+`TERMSRV/100.64.0.3`), reaches finalization, then sends a Standard RDP Server
+Redirection PDU (`PDUTYPE_SERVER_REDIR_PKT`=0xA, [MS-RDPBCGR] 2.2.13.1.1) to
+hand the client over to the spawned user session. Journal: `[RDP] Sending
+server redirection` / `[DaemonSystem] ... handover`. GRD's RedirFlags =
+`0x0001C016` = LB_LOAD_BALANCE_INFO | LB_USERNAME | LB_PASSWORD |
+LB_PASSWORD_IS_PK_ENCRYPTED | LB_REDIRECTION_GUID | LB_TARGET_CERTIFICATE, with
+NO target net address (reconnect to same host:port). The routing token
+(LoadBalanceInfo) is 25 bytes.
+Done: parse the redirection PDU, thread it up (ProcessorOutput/ActiveStageOutput
+::Redirect), and reconnect carrying the LoadBalanceInfo verbatim as an X.224
+routing token (NegoRequestData::Raw). The reconnect's negotiation IS accepted
+by GRD (HYBRID confirmed, TLS upgrades).
+Also done: the reconnect now switches to the redirection-provided credentials
+(LB_USERNAME / LB_PASSWORD) instead of the original login, because GRD's
+handover instance authenticates against a private winpr NTLM SAM, not PAM.
+Server-side proof (user-session journal, `org.gnome.RemoteDesktop.Handover`):
+`[com.winpr.sspi.NTLM] ntlm_fetch_ntlm_v2_hash: Could not find user in SAM
+database` when the original `damartel` username was sent. The redirection
+LB_USERNAME is a random per-handover cookie (e.g. "`@%PG..."), and LB_PASSWORD
+has PASSWORD_IS_PK_ENCRYPTED set.
+
+HANDOVER NOW COMPLETES (resolved). The earlier "PK-encrypted password"
+theory was WRONG — confirmed by reading the GRD 46.3 source:
+- grd-session-rdp.c `grd_session_rdp_send_server_redirection` sets
+  LB_PASSWORD_IS_PK_ENCRYPTED but sends the password as *plaintext UTF-16LE*
+  (`get_utf16_string(password)`); it never encrypts. The flag is cosmetic.
+- grd-rdp-sam.c `create_sam_string` stores NTOWFv1(password) for `username`
+  in the handover instance's winpr NTLM SAM.
+So the client must reconnect with username=LB_USERNAME and password=LB_PASSWORD
+decoded as UTF-16LE (regardless of the PK flag), plus the LoadBalanceInfo as an
+X.224 routing token. The routing token is literally `Cookie: msts=<n>\r\n`
+(CRLF-terminated; GRD peeks for 0x0D0A in grd-rdp-routing-token.c), sent
+verbatim via NegoRequestData::Raw.
+Verified end-to-end against GRD 46.3 on asuspro13: no more "Could not find
+user in SAM"; the handover connection authenticates, and the EGFX pipeline
+establishes — caps confirmed (AVC420), surface created 1920x1080 + mapped,
+StartFrame/EndFrame frames flowing. Reproduced across multiple runs.
+NOTE: GRD's handover subsystem is flaky server-side (ZINK/EGL "failed to
+choose pdev" on the headless GNOME; the handover instance sometimes fails to
+start / stops sending redirections until `systemctl [--user] restart
+gnome-remote-desktop.service`). This is an asuspro13 environment issue, not a
+client bug.
+
+VISIBLE PIXELS — DONE (2026-07-04). GRD sends graphics via the RemoteFX
+**Progressive** codec inside RDPGFX_WIRE_TO_SURFACE_PDU_2. `WireToSurface2` is
+now decoded and composited, and a full 1920x1080 desktop renders from live
+GRD 46.3 (100.64.0.3).
+
+PORTED (not reimplemented) from upstream — the fork was 139 commits behind and
+upstream already had this exact capability. Straight file adds + module
+registration (the fork reworked egfx/rfx, so a whole-commit cherry-pick would
+conflict on server.rs, which is server-side and not needed for client decode):
+- `crates/ironrdp-pdu/src/codecs/rfx/progressive.rs` — progressive block-stream
+  parser (SYNC/CONTEXT/FRAME/REGION/TILE_SIMPLE|FIRST|UPGRADE). From #1196
+  (49099f0c), final form from #1197 (a142799d). Registered `pub mod progressive`.
+- `crates/ironrdp-graphics/src/{dwt_extrapolate,srl}.rs` — reduce-extrapolate DWT
+  + SRL primitives for progressive refinement. From #1196.
+- `crates/ironrdp-graphics/src/progressive.rs` — `ProgressiveDecoder` with
+  per-`codec_context_id` tile state; SIMPLE full-quality **and** FIRST/UPGRADE
+  refinement. From #1197. Adapted `alloc::collections` -> `std::collections`
+  (fork's ironrdp-graphics is std, not no_std+alloc like upstream).
+- Applied the #1395 (368fe8e6) fix: GNOME Remote Desktop omits the CONTEXT
+  block on every frame after the first; cache `use_reduce_extrapolate` per
+  context so later frames don't fail with `MissingBlock("CONTEXT")` (this fix
+  is load-bearing — without it only the coarse first frame renders).
+- Wired into `GraphicsPipelineClient::handle_wire_to_surface2`: decode tiles ->
+  blit into a persistent per-surface RGBA framebuffer -> deliver the full
+  framebuffer via `on_bitmap_updated` (renderer Image path is full-frame).
+  Progressive state reset on ResetGraphics; context freed on
+  DeleteEncodingContext. Skipped the upstream server.rs encode changes.
+Evidence: first frame composited **510 tiles** (full 1920x1080), dumped and
+visually verified as the Ubuntu GDM login screen (clock, user field, Ubuntu
+logo; all RGB channels correct). Subsequent 1-tile incremental frames decoded
+with no CONTEXT block and no errors; session stayed up. Diagnostic dump gated
+behind `IRONRDP_EGFX_DUMP=<path>` (writes raw RGBA + a `.dims` sidecar).
+Remaining refinement:
+- AVC444 dual-stream decode for WireToSurface1 (re-enable V10.7 vs Windows).
+- FIRST/UPGRADE tiles are ported and available but not yet exercised against a
+  server that sends them (GRD used SIMPLE only in these runs).
 
 4. ~~Enable H.264 decode in the native client EGFX pipeline.~~ Done.
 `EgfxRenderHandler` replaces `LoggingEgfxHandler`, `openh264` feature gates decoder.

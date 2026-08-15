@@ -168,7 +168,10 @@ impl TryFrom<u16> for UrbFunction {
             54 => Ok(CloseStaticStreams),
             55 => Ok(BulkOrInterruptTransferUsingChainedMdl),
             56 => Ok(IsochTransferUsingChainedMdl),
-            _ => Err(unsupported_value_err!("UrbFunction", format!("unsupported value: {value}"))),
+            _ => Err(unsupported_value_err!(
+                "UrbFunction",
+                format!("unsupported value: {value}")
+            )),
         }
     }
 }

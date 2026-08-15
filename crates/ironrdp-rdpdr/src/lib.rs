@@ -240,4 +240,3 @@ impl SvcProcessor for Rdpdr {
 }
 
 impl SvcClientProcessor for Rdpdr {}
-

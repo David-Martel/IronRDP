@@ -2,6 +2,7 @@
 
 use core::num::ParseIntError;
 use core::str::FromStr;
+use core::time::Duration;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -78,6 +79,27 @@ pub struct Config {
     /// received from the server. This is useful for observing whether the server switches
     /// from bitmap updates to EGFX traffic. Requires the `egfx` feature flag.
     pub egfx: bool,
+
+    /// Enable RDP auto-reconnect: capture the server auto-reconnect cookie and,
+    /// on an unexpected drop, attempt a bounded reconnect carrying the derived
+    /// client cookie ([MS-RDPBCGR] 2.2.4). Off by default.
+    pub auto_reconnect: bool,
+
+    /// Opt in to AVC444/AVC444v2 dual-stream H.264 (4:4:4) EGFX decode.
+    ///
+    /// When enabled (and `egfx` + `openh264` are available), the client advertises
+    /// V10.7 so the server may select AVC444, and reconstructs YUV 4:4:4 from the
+    /// luma + chroma-auxiliary sub-streams. Default is off: the client advertises
+    /// AVC420 (V8.1) only, so a server never selects AVC444 and the AVC420 render
+    /// path is untouched. Experimental and not validated end-to-end.
+    pub avc444: bool,
+
+    /// Interval of input inactivity after which a fake mouse-move event is injected
+    /// to prevent the remote session from locking (`--prevent-session-lock`, minutes).
+    ///
+    /// `None` (the default) never injects synthetic input, so an idle session locks
+    /// per the server's own policy.
+    pub fake_events_interval: Option<Duration>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -172,12 +194,16 @@ fn parse_hex(input: &str) -> Result<u32, ParseIntError> {
 fn detect_keyboard_layout() -> u32 {
     #[cfg(windows)]
     {
-        // SAFETY: GetKeyboardLayout(0) queries the layout of the calling thread.
-        // It always returns a valid HKL (null means no layout, treated as 0 here).
-        // The low 16 bits of the pointer-sized HKL value are the language identifier.
         use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+        // SAFETY: `GetKeyboardLayout(0)` queries the keyboard layout of the calling
+        // thread. It has no preconditions and always returns a valid `HKL` handle
+        // (a null handle simply means "no layout", which the mask below reduces to 0).
         let hkl = unsafe { GetKeyboardLayout(0) };
-        (hkl.0 as usize as u32) & 0xFFFF
+        // The low 16 bits of the pointer-sized `HKL` are the language identifier that
+        // RDP uses as the keyboard layout code. Read the pointer's address without a
+        // lossy `as` cast, mask to 16 bits (so the value always fits in `u32`), then
+        // convert infallibly.
+        u32::try_from(hkl.0.addr() & 0xFFFF).unwrap_or(0)
     }
     #[cfg(not(windows))]
     {
@@ -367,6 +393,29 @@ struct Args {
     #[clap(long, requires("width"))]
     height: Option<u16>,
 
+    /// Desired desktop width for the RDP session.
+    ///
+    /// Populates the same `desktopwidth` property an `.rdp` file would, so it only takes
+    /// effect when `--width`/`--height` are not given.
+    #[clap(long, requires("desktop_height"), value_parser = clap::value_parser!(u16).range(1..=8192))]
+    desktop_width: Option<u16>,
+
+    /// Desired desktop height for the RDP session.
+    ///
+    /// Populates the same `desktopheight` property an `.rdp` file would, so it only takes
+    /// effect when `--width`/`--height` are not given.
+    #[clap(long, requires("desktop_width"), value_parser = clap::value_parser!(u16).range(1..=8192))]
+    desktop_height: Option<u16>,
+
+    /// Scaling factor for desktop applications, as a percentage (100 to 500).
+    #[clap(long, value_parser = clap::value_parser!(u32).range(100..=500))]
+    scale_desktop: Option<u32>,
+
+    /// Prevents session locking by injecting fake mouse movement events when the connection
+    /// is idle (interval in minutes).
+    #[clap(long)]
+    prevent_session_lock: Option<u32>,
+
     /// Ignore mouse pointer messages sent by the server. Increases performance when enabled, as the
     /// client could skip costly software rendering of the pointer with alpha blending
     #[clap(long)]
@@ -452,6 +501,37 @@ struct Args {
     /// may switch from bitmap updates to EGFX traffic. Requires the `egfx` feature.
     #[clap(long, default_value_t = false)]
     egfx: bool,
+
+    /// Opt in to experimental AVC444/AVC444v2 dual-stream H.264 (4:4:4) EGFX decode.
+    ///
+    /// Advertises EGFX V10.7 so the server may select AVC444 and reconstructs YUV
+    /// 4:4:4 from the luma + chroma sub-streams. Requires `--egfx` and the
+    /// `openh264` feature. Off by default (AVC420-only advertisement) so the
+    /// working AVC420 render path is never affected; not validated end-to-end.
+    #[clap(long, default_value_t = false)]
+    avc444: bool,
+
+    /// Advertise connect-time network auto-detection (RNS_UD_CS_SUPPORT_NET_CHAR_AUTODETECT)
+    /// and answer the server's RTT/bandwidth measurement requests.
+    ///
+    /// FreeRDP-based servers (e.g. gnome-remote-desktop) gate audio-output redirection on
+    /// this flag. Opt-in because it changes the connect-time handshake; the connector
+    /// consumes and answers the server's Auto-Detect Request sequence so Licensing stays
+    /// in sync.
+    #[clap(long, default_value_t = false)]
+    network_autodetect: bool,
+
+    /// Enable RDP auto-reconnect ([MS-RDPBCGR] 2.2.4).
+    ///
+    /// When set, the client captures the server-issued auto-reconnect cookie
+    /// (Save Session Info PDU) and, on an unexpected connection drop, attempts a
+    /// bounded reconnect that sends the derived client auto-reconnect cookie so
+    /// the server re-attaches the existing session instead of starting a new one.
+    ///
+    /// Opt-in: with the flag off (default) the connect path and drop behaviour
+    /// are byte-for-byte unchanged.
+    #[clap(long, default_value_t = false)]
+    auto_reconnect: bool,
 
     /// Keyboard layout code sent to the server (e.g., 0x00000409 for US English).
     ///
@@ -590,6 +670,15 @@ impl Config {
             None
         };
 
+        // `--desktop-width`/`--desktop-height` seed the same properties an `.rdp` file would,
+        // so they fall in behind `--width`/`--height` in `resolve_desktop_size` below.
+        if let Some(width) = args.desktop_width {
+            properties.insert("desktopwidth", i64::from(width));
+        }
+        if let Some(height) = args.desktop_height {
+            properties.insert("desktopheight", i64::from(height));
+        }
+
         let desktop_size = resolve_desktop_size(
             args.width,
             args.height,
@@ -597,14 +686,49 @@ impl Config {
             properties.desktop_height(),
         )?;
 
+        // Make a duration from the cmdline argument (minutes).
+        let fake_events_interval = args
+            .prevent_session_lock
+            .map(|v| Duration::from_secs(u64::from(v) * 60));
+
         let keyboard_layout = match args.keyboard_layout {
             Some(layout) => layout,
             None => {
                 let detected = detect_keyboard_layout();
                 if detected != 0 {
-                    tracing::debug!(keyboard_layout = format_args!("0x{detected:08X}"), "Auto-detected keyboard layout");
+                    tracing::debug!(
+                        keyboard_layout = format_args!("0x{detected:08X}"),
+                        "Auto-detected keyboard layout"
+                    );
                 }
                 detected
+            }
+        };
+
+        // Only enable EGFX when it is both requested (`--egfx`) and compiled in.
+        // Advertising Graphics Pipeline support without the `egfx` feature is a
+        // footgun: the server (e.g. gnome-remote-desktop 46) then opens the
+        // `Microsoft::Windows::RDS::Graphics` DVC, but the client has no listener
+        // registered for it and answers the Create Request with NO_LISTENER
+        // (0xC0000001). GRD's handover instance treats that as fatal and tears the
+        // session down (surfacing as ERRINFO_BAD_CAPABILITIES), so a build without
+        // the feature would dead-end the handover instead of falling back to the
+        // classic bitmap path.
+        let egfx_enabled = {
+            #[cfg(feature = "egfx")]
+            {
+                args.egfx
+            }
+            #[cfg(not(feature = "egfx"))]
+            {
+                if args.egfx {
+                    tracing::warn!(
+                        "--egfx was requested but this binary was built without the `egfx` \
+                         feature; ignoring it and not advertising Graphics Pipeline support. \
+                         Rebuild with `--features openh264` (or `egfx`) to enable EGFX."
+                    );
+                }
+                false
             }
         };
 
@@ -620,8 +744,12 @@ impl Config {
             ime_file_name: args.ime_file_name,
             dig_product_id: args.dig_product_id,
             desktop_size,
-            desktop_scale_factor: 0, // Default to 0 per FreeRDP
+            desktop_scale_factor: args.scale_desktop.unwrap_or(0), // Default to 0 per FreeRDP
             bitmap: Some(bitmap),
+            // Advertise Graphics Pipeline support when EGFX is requested, so EGFX-only
+            // servers (e.g. gnome-remote-desktop 46+) accept the connection.
+            enable_graphics_pipeline: egfx_enabled,
+            network_autodetect: args.network_autodetect,
             client_build: semver::Version::parse(crate::version::VERSION)
                 .map_or(0, |v| v.major * 100 + v.minor * 10 + v.patch)
                 .pipe(u32::try_from)
@@ -640,6 +768,9 @@ impl Config {
             },
             hardware_id: None,
             license_cache: None,
+            // Set per reconnect attempt by the auto-reconnect path; None keeps
+            // the initial connect byte-identical.
+            reconnect_cookie: None,
             enable_server_pointer: !args.no_server_pointer,
             autologon: args.autologon,
             enable_audio_playback: true,
@@ -668,7 +799,10 @@ impl Config {
             dvc_pipe_proxies: args.dvc_proxy,
             #[cfg(windows)]
             dvc_plugins: args.dvc_plugin,
-            egfx: args.egfx,
+            egfx: egfx_enabled,
+            auto_reconnect: args.auto_reconnect,
+            avc444: args.avc444,
+            fake_events_interval,
         })
     }
 }
@@ -747,5 +881,53 @@ mod tests {
             .expect("multitransport CLI parse");
 
         assert_eq!(args.multitransport, MultitransportMode::PreferLossy);
+    }
+
+    #[test]
+    fn cli_parser_accepts_desktop_width_and_height() {
+        let args = Args::try_parse_from([
+            "ironrdp-client",
+            "server.example",
+            "--desktop-width",
+            "1600",
+            "--desktop-height",
+            "900",
+        ])
+        .expect("desktop-width/height CLI parse");
+
+        assert_eq!(args.desktop_width, Some(1600));
+        assert_eq!(args.desktop_height, Some(900));
+    }
+
+    #[test]
+    fn cli_parser_rejects_lone_desktop_width() {
+        let error = Args::try_parse_from(["ironrdp-client", "server.example", "--desktop-width", "1600"])
+            .expect_err("desktop-width without desktop-height must fail");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn cli_parser_accepts_scale_desktop() {
+        let args = Args::try_parse_from(["ironrdp-client", "server.example", "--scale-desktop", "150"])
+            .expect("scale-desktop CLI parse");
+
+        assert_eq!(args.scale_desktop, Some(150));
+    }
+
+    #[test]
+    fn cli_parser_rejects_out_of_range_scale_desktop() {
+        let error = Args::try_parse_from(["ironrdp-client", "server.example", "--scale-desktop", "50"])
+            .expect_err("scale-desktop below 100 must fail");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn cli_parser_accepts_prevent_session_lock() {
+        let args = Args::try_parse_from(["ironrdp-client", "server.example", "--prevent-session-lock", "5"])
+            .expect("prevent-session-lock CLI parse");
+
+        assert_eq!(args.prevent_session_lock, Some(5));
     }
 }

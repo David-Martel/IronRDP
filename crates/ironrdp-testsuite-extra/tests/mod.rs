@@ -445,16 +445,13 @@ where
 /// cleanly. The client side should drain to EOF without errors.
 #[tokio::test]
 async fn test_graceful_disconnect() {
-    client_server_with_ev_inner(
-        default_client_config(),
-        |stage, framed, _display_tx, ev| async move {
-            // Ask the server to quit while we are in the active-session phase.
-            // The server's client_loop will see the Quit event and return RunState::Disconnect.
-            ev.send(ServerEvent::Quit("test graceful disconnect".into()))
-                .expect("send Quit");
-            (stage, framed)
-        },
-    )
+    client_server_with_ev_inner(default_client_config(), |stage, framed, _display_tx, ev| async move {
+        // Ask the server to quit while we are in the active-session phase.
+        // The server's client_loop will see the Quit event and return RunState::Disconnect.
+        ev.send(ServerEvent::Quit("test graceful disconnect".into()))
+            .expect("send Quit");
+        (stage, framed)
+    })
     .await;
 }
 
@@ -465,15 +462,12 @@ async fn test_graceful_disconnect() {
 /// should both wind down cleanly without any unwrap panic or error.
 #[tokio::test]
 async fn test_server_display_write_failure() {
-    client_server(
-        default_client_config(),
-        |stage, framed, display_tx| async move {
-            // Dropping the sender closes the display channel.  The server observes Ok(None) from
-            // next_update and disconnects the session gracefully.
-            drop(display_tx);
-            (stage, framed)
-        },
-    )
+    client_server(default_client_config(), |stage, framed, display_tx| async move {
+        // Dropping the sender closes the display channel.  The server observes Ok(None) from
+        // next_update and disconnects the session gracefully.
+        drop(display_tx);
+        (stage, framed)
+    })
     .await;
 }
 
@@ -508,22 +502,17 @@ async fn test_double_reactivation() {
                 ActiveStageOutput::DeactivateAll(mut connection_activation) => {
                     let mut buf = pdu::WriteBuf::new();
                     'seq: loop {
-                        let written = ironrdp_async::single_sequence_step_read(
-                            framed,
-                            &mut *connection_activation,
-                            &mut buf,
-                        )
-                        .await
-                        .map_err(|e| session::custom_err!("read deactivation-reactivation sequence step", e))
-                        .unwrap();
+                        let written =
+                            ironrdp_async::single_sequence_step_read(framed, &mut *connection_activation, &mut buf)
+                                .await
+                                .map_err(|e| session::custom_err!("read deactivation-reactivation sequence step", e))
+                                .unwrap();
 
                         if written.size().is_some() {
                             framed
                                 .write_all(buf.filled())
                                 .await
-                                .map_err(|e| {
-                                    session::custom_err!("write deactivation-reactivation sequence step", e)
-                                })
+                                .map_err(|e| session::custom_err!("write deactivation-reactivation sequence step", e))
                                 .unwrap();
                         }
 
@@ -596,31 +585,27 @@ async fn test_double_reactivation() {
 /// client never completes RDP negotiation.
 #[tokio::test]
 async fn test_single_session_rejection() {
-    client_server_with_ev_inner(
-        default_client_config(),
-        |stage, framed, _display_tx, ev| async move {
-            // --- obtain the server's listen address from within the session callback ---
-            let (addr_tx, addr_rx) = oneshot::channel();
-            ev.send(ServerEvent::GetLocalAddr(addr_tx))
-                .expect("send GetLocalAddr");
-            // The server is currently inside run_connection, so the event will be
-            // processed only after run_connection returns and run() loops back.  We
-            // cannot await addr_rx here because the server loop is blocked; instead
-            // we connect speculatively to the well-known loopback:0 port.
-            //
-            // Strategy: record the addr for post-session validation via a background
-            // task that connects after we signal the server to quit.
-            drop(addr_rx);
+    client_server_with_ev_inner(default_client_config(), |stage, framed, _display_tx, ev| async move {
+        // --- obtain the server's listen address from within the session callback ---
+        let (addr_tx, addr_rx) = oneshot::channel();
+        ev.send(ServerEvent::GetLocalAddr(addr_tx)).expect("send GetLocalAddr");
+        // The server is currently inside run_connection, so the event will be
+        // processed only after run_connection returns and run() loops back.  We
+        // cannot await addr_rx here because the server loop is blocked; instead
+        // we connect speculatively to the well-known loopback:0 port.
+        //
+        // Strategy: record the addr for post-session validation via a background
+        // task that connects after we signal the server to quit.
+        drop(addr_rx);
 
-            // Signal the server to quit. This event is queued and will be processed
-            // after run_connection returns (i.e., after this callback returns).
-            ev.send(ServerEvent::Quit("single-session test".into()))
-                .expect("send Quit");
+        // Signal the server to quit. This event is queued and will be processed
+        // after run_connection returns (i.e., after this callback returns).
+        ev.send(ServerEvent::Quit("single-session test".into()))
+            .expect("send Quit");
 
-            // Return immediately; the first session ends here.
-            (stage, framed)
-        },
-    )
+        // Return immediately; the first session ends here.
+        (stage, framed)
+    })
     .await;
 
     // If we reach here the server exited cleanly — the single-session contract
@@ -645,14 +630,10 @@ async fn run_reactivation_sequence(
         ActiveStageOutput::DeactivateAll(mut connection_activation) => {
             let mut buf = pdu::WriteBuf::new();
             'seq: loop {
-                let written = ironrdp_async::single_sequence_step_read(
-                    framed,
-                    &mut *connection_activation,
-                    &mut buf,
-                )
-                .await
-                .map_err(|e| session::custom_err!("read deactivation-reactivation sequence step", e))
-                .unwrap();
+                let written = ironrdp_async::single_sequence_step_read(framed, &mut *connection_activation, &mut buf)
+                    .await
+                    .map_err(|e| session::custom_err!("read deactivation-reactivation sequence step", e))
+                    .unwrap();
 
                 if written.size().is_some() {
                     framed
@@ -705,8 +686,8 @@ async fn run_reactivation_sequence(
 /// without error.
 #[tokio::test]
 async fn test_decompressor_regression() {
-    use core::num::{NonZeroU16, NonZeroUsize};
     use bytes::Bytes;
+    use core::num::{NonZeroU16, NonZeroUsize};
 
     let client_config = default_client_config();
     let mut image = DecodedImage::new(
@@ -734,10 +715,8 @@ async fn test_decompressor_regression() {
         let bytes_per_pixel: usize = PixelFormat::RgbA32.bytes_per_pixel().into();
         let stride = NonZeroUsize::new(usize::from(width.get()) * bytes_per_pixel).unwrap();
         // Solid red RGBA pixels.
-        let pixel_data: Vec<u8> = (0..usize::from(height.get()))
-            .flat_map(|_| {
-                (0..usize::from(width.get())).flat_map(|_| [0xFFu8, 0x00, 0x00, 0xFF])
-            })
+        let pixel_data: Vec<u8> = (0..NonZeroUsize::from(height).get())
+            .flat_map(|_| (0..NonZeroUsize::from(width).get()).flat_map(|_| [0xFFu8, 0x00, 0x00, 0xFF]))
             .collect();
 
         display_tx
@@ -757,12 +736,13 @@ async fn test_decompressor_regression() {
         // `Err` from `stage.process()`, which we turn into a test panic.
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
-            let read_result =
-                tokio::time::timeout(Duration::from_millis(50), framed.read_pdu()).await;
+            let read_result = tokio::time::timeout(Duration::from_millis(50), framed.read_pdu()).await;
             let Ok(Ok((action, frame))) = read_result else {
                 continue;
             };
-            let outputs = stage.process(&mut image, action, &frame).expect("bitmap PDU must decode after reactivation");
+            let outputs = stage
+                .process(&mut image, action, &frame)
+                .expect("bitmap PDU must decode after reactivation");
             for output in outputs {
                 if let ActiveStageOutput::ResponseFrame(f) = output {
                     framed.write_all(&f).await.expect("write response frame");
@@ -802,6 +782,9 @@ fn default_client_config() -> connector::Config {
         keyboard_functional_keys_count: 12,
         ime_file_name: "".into(),
         bitmap: None,
+        enable_graphics_pipeline: false,
+        network_autodetect: false,
+        reconnect_cookie: None,
         dig_product_id: "".into(),
         // NOTE: hardcode this value like in freerdp
         // https://github.com/FreeRDP/FreeRDP/blob/4e24b966c86fdf494a782f0dfcfc43a057a2ea60/libfreerdp/core/settings.c#LL49C34-L49C70

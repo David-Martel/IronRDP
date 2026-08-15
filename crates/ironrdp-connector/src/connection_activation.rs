@@ -5,7 +5,8 @@ use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
 use tracing::{debug, warn};
 
 use crate::{
-    Config, ConnectionFinalizationSequence, ConnectorResult, DesktopSize, Sequence, State, Written, general_err, legacy,
+    Config, ConnectionFinalizationSequence, ConnectorResult, DesktopSize, Sequence, State, Written, general_err,
+    legacy, reason_err,
 };
 
 /// Represents the Capability Exchange and Connection Finalization phases
@@ -117,13 +118,58 @@ impl Sequence for ConnectionActivationSequence {
                     );
                 }
 
+                // Some servers (e.g. GNOME Remote Desktop) send a ServerDeactivateAll PDU
+                // before ServerDemandActive as part of a Deactivation-Reactivation Sequence
+                // (MS-RDPBCGR §1.3.1.3). Skip it and stay in the same state to wait for
+                // the actual DemandActive PDU.
+                //
+                // The decoded PDU is intentionally discarded: the DeactivateAll body carries
+                // no payload we need during initial activation.
+                if matches!(
+                    share_control_ctx.pdu,
+                    rdp::headers::ShareControlPdu::ServerDeactivateAll(_)
+                ) {
+                    debug!(
+                        "Skipping Server Deactivate All PDU received during Capabilities Exchange, awaiting Server Demand Active"
+                    );
+                    self.state = ConnectionActivationState::CapabilitiesExchange {
+                        io_channel_id,
+                        user_channel_id,
+                    };
+                    return Ok(Written::Nothing);
+                }
+
+                // A server may interleave a Set Error Info PDU (carried as a Share Data PDU)
+                // during a Deactivation-Reactivation Sequence — e.g. gnome-remote-desktop's
+                // session-handover instance emits ServerSetErrorInfo(BadCapabilities) after
+                // the client's Confirm Active. Treat it as a diagnostic notification, not a
+                // fatal decode failure: log the specific code and keep reading for the Server
+                // Demand Active PDU. If the server does intend to tear the connection down it
+                // will close the transport, surfacing an honest transport error instead of the
+                // misleading "unexpected Share Control Pdu (expected ServerDemandActive)".
+                if let rdp::headers::ShareControlPdu::Data(ref share_data) = share_control_ctx.pdu
+                    && let rdp::headers::ShareDataPdu::ServerSetErrorInfo(ref err) = share_data.share_data_pdu
+                {
+                    warn!(
+                        error_info = %err.0.description(),
+                        "Received Set Error Info PDU during Capabilities Exchange; continuing to await Server Demand Active"
+                    );
+                    self.state = ConnectionActivationState::CapabilitiesExchange {
+                        io_channel_id,
+                        user_channel_id,
+                    };
+                    return Ok(Written::Nothing);
+                }
+
                 let capability_sets = if let rdp::headers::ShareControlPdu::ServerDemandActive(server_demand_active) =
                     share_control_ctx.pdu
                 {
                     server_demand_active.pdu.capability_sets
                 } else {
-                    return Err(general_err!(
-                        "unexpected Share Control Pdu (expected ServerDemandActive)",
+                    return Err(reason_err!(
+                        "ConnectionActivation::CapabilitiesExchange",
+                        "unexpected Share Control PDU during capabilities exchange: got {} (expected Server Demand Active PDU)",
+                        share_control_ctx.pdu.as_short_name(),
                     ));
                 };
 

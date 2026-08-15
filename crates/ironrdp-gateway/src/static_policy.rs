@@ -2,7 +2,7 @@
 //!
 //! See [`StaticFilePolicy`] for the full format description.
 
-use std::future;
+use core::future;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
@@ -99,7 +99,7 @@ struct PolicyRule {
 /// ```rust
 /// use ironrdp_gateway::static_policy::StaticFilePolicy;
 ///
-/// let policy = StaticFilePolicy::from_str(r#"
+/// let policy = StaticFilePolicy::from_toml_str(r#"
 /// [[rules]]
 /// principal = "alice"
 /// hosts = ["10.0.0.1:3389"]
@@ -116,9 +116,8 @@ impl StaticFilePolicy {
     ///
     /// Returns an error if the file cannot be read or the TOML is malformed.
     pub fn from_file(path: &Path) -> Result<Self> {
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("read policy file {}", path.display()))?;
-        Self::from_str(&raw).with_context(|| format!("parse policy file {}", path.display()))
+        let raw = std::fs::read_to_string(path).with_context(|| format!("read policy file {}", path.display()))?;
+        Self::from_toml_str(&raw).with_context(|| format!("parse policy file {}", path.display()))
     }
 
     /// Parse a `StaticFilePolicy` from a TOML string.
@@ -137,9 +136,12 @@ impl StaticFilePolicy {
     /// principal = "*"
     /// hosts = ["10.0.0.5:3389"]
     /// "#;
-    /// let policy = StaticFilePolicy::from_str(toml).unwrap();
+    /// let policy = StaticFilePolicy::from_toml_str(toml).unwrap();
     /// ```
-    pub fn from_str(toml: &str) -> Result<Self> {
+    ///
+    /// Named `from_toml_str` rather than `from_str` so it is not confused with the
+    /// [`core::str::FromStr`] trait method (whose signature it does not match).
+    pub fn from_toml_str(toml: &str) -> Result<Self> {
         let doc: PolicyFile = toml::from_str(toml).context("deserialize policy TOML")?;
         let rules = doc
             .rules
@@ -150,6 +152,22 @@ impl StaticFilePolicy {
             })
             .collect();
         Ok(Self { rules })
+    }
+
+    /// Pure sync evaluation — separated so it can be unit-tested without futures.
+    fn evaluate(&self, principal: &str, target_host: &str, target_port: u16) -> AuthzDecision {
+        for rule in &self.rules {
+            let principal_match = rule.principal == "*" || rule.principal == principal;
+            if !principal_match {
+                continue;
+            }
+            for pattern in &rule.hosts {
+                if pattern.matches(target_host, target_port) {
+                    return AuthzDecision::Allow;
+                }
+            }
+        }
+        AuthzDecision::Deny
     }
 }
 
@@ -165,24 +183,6 @@ impl GatewayPolicy for StaticFilePolicy {
     ) -> impl Future<Output = Result<AuthzDecision>> + Send {
         let decision = self.evaluate(&identity.principal, &target.host, target.port);
         future::ready(Ok(decision))
-    }
-}
-
-impl StaticFilePolicy {
-    /// Pure sync evaluation — separated so it can be unit-tested without futures.
-    fn evaluate(&self, principal: &str, target_host: &str, target_port: u16) -> AuthzDecision {
-        for rule in &self.rules {
-            let principal_match = rule.principal == "*" || rule.principal == principal;
-            if !principal_match {
-                continue;
-            }
-            for pattern in &rule.hosts {
-                if pattern.matches(target_host, target_port) {
-                    return AuthzDecision::Allow;
-                }
-            }
-        }
-        AuthzDecision::Deny
     }
 }
 
@@ -203,13 +203,13 @@ impl StaticFilePolicy {
 /// other standard host name would share that prefix.  Callers that want
 /// port-specific exact matching should write `"myhost.internal:3389"` instead.
 fn parse_host_pattern(entry: String) -> HostPattern {
-    if let Some((host, port_str)) = entry.rsplit_once(':') {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return HostPattern::Exact {
-                host: host.to_owned(),
-                port,
-            };
-        }
+    if let Some((host, port_str)) = entry.rsplit_once(':')
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        return HostPattern::Exact {
+            host: host.to_owned(),
+            port,
+        };
     }
     // No valid port — treat the whole string as a prefix.
     HostPattern::Prefix(entry)

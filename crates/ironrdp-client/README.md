@@ -48,7 +48,13 @@ ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD> --width 16
 ```
 
 If you provide an `.rdp` file, `desktopwidth` and `desktopheight` are now used as the initial
-desktop request when explicit CLI sizing is not supplied.
+desktop request when explicit CLI sizing is not supplied. `--desktop-width`/`--desktop-height`
+populate those same properties from the command line, so the precedence is: `--width`/`--height`,
+then `--desktop-width`/`--desktop-height`, then the `.rdp` file, then a `1920x1080` default.
+
+For HiDPI/4K displays, `--scale-desktop <100-500>` sets the initial RDP desktop scale factor
+(percentage), and `--prevent-session-lock <minutes>` injects a fake mouse-move event after the
+given idle period to stop the remote session from locking, similar to FreeRDP's equivalent options.
 
 For multitransport protocol testing, the Windows-native client can advertise optional UDP
 capability:

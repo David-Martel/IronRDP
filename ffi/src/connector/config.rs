@@ -209,11 +209,17 @@ pub mod ffi {
                 request_data: None,
                 compression_type: None,
                 pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
+                // The FFI/.NET surface does not wire up an RDPEGFX channel servicer, so
+                // keep the Graphics Pipeline capability un-advertised to avoid blank
+                // sessions against EGFX-only servers (see `Config::enable_graphics_pipeline`).
+                enable_graphics_pipeline: false,
                 multitransport_flags: None,
                 performance_flags: self.performance_flags.ok_or("performance flag is missing")?,
                 desktop_scale_factor: 0,
                 hardware_id: None,
                 license_cache: None,
+                network_autodetect: false,
+                reconnect_cookie: None,
                 timezone_info: self.timezone_info.clone().unwrap_or_default(),
                 alternate_shell: String::new(),
                 work_dir: String::new(),

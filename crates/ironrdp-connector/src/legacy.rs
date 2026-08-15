@@ -6,7 +6,7 @@ use ironrdp_pdu::rdp::headers::{BASIC_SECURITY_HEADER_SIZE, BasicSecurityHeaderF
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::x224::X224;
 
-use crate::{ConnectorError, ConnectorErrorExt as _, ConnectorResult, general_err, reason_err};
+use crate::{ConnectorError, ConnectorErrorExt as _, ConnectorResult, reason_err};
 
 pub fn encode_send_data_request<T>(
     initiator_id: u16,
@@ -149,8 +149,10 @@ pub fn decode_share_data(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<Shar
     let ctx = decode_share_control(ctx)?;
 
     let rdp::headers::ShareControlPdu::Data(share_data_header) = ctx.pdu else {
-        return Err(general_err!(
-            "received unexpected Share Control Pdu (expected Share Data Header)"
+        return Err(reason_err!(
+            "decode_share_data",
+            "received unexpected Share Control PDU: got {} (expected Data PDU)",
+            ctx.pdu.as_short_name(),
         ));
     };
 
@@ -170,6 +172,11 @@ pub enum IoChannelPdu {
     ///
     /// Received when the server wants the client to establish a sideband UDP transport.
     MultitransportRequest(MultitransportRequestPdu),
+    /// Server Redirection PDU ([MS-RDPBCGR] 2.2.13.1.1).
+    ///
+    /// The server is redirecting the client to a target session (used by
+    /// gnome-remote-desktop's system-daemon session handover).
+    Redirection(rdp::headers::ServerRedirectionPdu),
 }
 
 pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoChannelPdu> {
@@ -208,8 +215,11 @@ pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoCh
 
             Ok(IoChannelPdu::Data(share_data_ctx))
         }
-        _ => Err(general_err!(
-            "received unexpected Share Control Pdu (expected Share Data Header or Server Deactivate All)"
+        rdp::headers::ShareControlPdu::ServerRedirect(redirection) => Ok(IoChannelPdu::Redirection(redirection)),
+        other => Err(reason_err!(
+            "decode_io_channel",
+            "received unexpected Share Control PDU: got {} (expected Data PDU or Server Deactivate All PDU)",
+            other.as_short_name(),
         )),
     }
 }

@@ -164,6 +164,13 @@ impl fmt::Display for FailureCode {
 pub enum NegoRequestData {
     RoutingToken(RoutingToken),
     Cookie(Cookie),
+    /// A verbatim routing token, written to the X.224 Connection Request exactly
+    /// as-is with no `Cookie: msts=` prefix or `\r\n` framing added.
+    ///
+    /// Used to forward an RDP redirection `LoadBalanceInfo` blob ([MS-RDPBCGR]
+    /// 2.2.13.1.1), which is already a complete routing token, when following a
+    /// Server Redirection PDU.
+    Raw(Vec<u8>),
 }
 
 impl NegoRequestData {
@@ -173,6 +180,12 @@ impl NegoRequestData {
 
     pub fn cookie(value: String) -> Self {
         Self::Cookie(Cookie(value))
+    }
+
+    /// Builds a verbatim routing token from raw bytes (e.g. a redirection
+    /// `LoadBalanceInfo`).
+    pub fn raw(value: Vec<u8>) -> Self {
+        Self::Raw(value)
     }
 
     pub fn read(src: &mut ReadCursor<'_>) -> DecodeResult<Option<Self>> {
@@ -186,6 +199,11 @@ impl NegoRequestData {
         match self {
             NegoRequestData::RoutingToken(token) => token.write(dst),
             NegoRequestData::Cookie(cookie) => cookie.write(dst),
+            NegoRequestData::Raw(bytes) => {
+                ensure_size!(ctx: "NegoRequestData::Raw", in: dst, size: bytes.len());
+                dst.write_slice(bytes);
+                Ok(())
+            }
         }
     }
 
@@ -193,6 +211,7 @@ impl NegoRequestData {
         match self {
             NegoRequestData::RoutingToken(token) => token.size(),
             NegoRequestData::Cookie(cookie) => cookie.size(),
+            NegoRequestData::Raw(bytes) => bytes.len(),
         }
     }
 }

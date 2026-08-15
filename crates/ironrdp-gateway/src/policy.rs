@@ -72,9 +72,6 @@ pub trait GatewayPolicy: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an error if the policy backend cannot be reached.
-    fn authorize(
-        &self,
-        identity: &Identity,
-        target: &TargetHost,
-    ) -> impl Future<Output = Result<AuthzDecision>> + Send;
+    fn authorize(&self, identity: &Identity, target: &TargetHost)
+    -> impl Future<Output = Result<AuthzDecision>> + Send;
 }

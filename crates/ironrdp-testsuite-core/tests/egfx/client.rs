@@ -44,7 +44,7 @@ impl GraphicsPipelineHandler for TestHandler {
     fn on_surface_deleted(&mut self, _surface_id: u16) {}
     fn on_surface_mapped(&mut self, _surface_id: u16, _x: u32, _y: u32) {}
 
-    fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
+    fn on_bitmap_updated(&mut self, update: BitmapUpdate) {
         self.bitmaps_received.push((update.surface_id, update.codec_id));
     }
 

@@ -39,7 +39,7 @@
 //! struct MyHandler;
 //!
 //! impl GraphicsPipelineHandler for MyHandler {
-//!     fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
+//!     fn on_bitmap_updated(&mut self, update: BitmapUpdate) {
 //!         // Render decoded bitmap to screen
 //!     }
 //! }
@@ -57,19 +57,21 @@ use std::collections::BTreeMap;
 
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
+use ironrdp_graphics::progressive::ProgressiveDecoder;
 use ironrdp_graphics::zgfx;
 use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, trace, warn};
 
 use crate::CHANNEL_NAME;
+use crate::avc444::{self, ChromaVersion};
 use crate::decode::H264Decoder;
 use crate::pdu::{
-    Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
-    CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
-    EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
-    MapSurfaceToWindowPdu, PixelFormat, QueueDepth, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu,
-    WireToSurface2Pdu,
+    Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
+    CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type,
+    DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu,
+    MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth, SolidFillPdu, SurfaceToCachePdu,
+    SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 
 /// Max capacity to keep for decompressed buffer when cleared.
@@ -199,6 +201,16 @@ pub struct BitmapUpdate {
     pub width: u16,
     /// Height of the decoded data in pixels
     pub height: u16,
+    /// Full width of the destination surface in pixels.
+    ///
+    /// Together with `surface_height` this lets a presenting handler decide
+    /// whether the update covers the whole surface (a full-frame replacement)
+    /// or only a sub-rectangle that must be blitted at
+    /// (`destination_rectangle.left`, `destination_rectangle.top`) into a
+    /// persistent surface-sized framebuffer.
+    pub surface_width: u16,
+    /// Full height of the destination surface in pixels. See `surface_width`.
+    pub surface_height: u16,
 }
 
 // ============================================================================
@@ -255,7 +267,11 @@ pub trait GraphicsPipelineHandler: Send {
     ///
     /// This is the primary output path. The `update` contains the
     /// surface ID, destination rectangle, and RGBA pixel data.
-    fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
+    ///
+    /// The update is passed by value so a presenting handler can move the
+    /// (potentially multi-megabyte) `update.data` buffer straight into its
+    /// render path instead of cloning it.
+    fn on_bitmap_updated(&mut self, _update: BitmapUpdate) {}
 
     /// Called when a logical frame is complete
     ///
@@ -381,6 +397,15 @@ enum ClientState {
 pub struct GraphicsPipelineClient {
     handler: Box<dyn GraphicsPipelineHandler>,
     h264_decoder: Option<Box<dyn H264Decoder>>,
+    /// Dedicated H.264 context for the AVC444 chroma-auxiliary sub-stream.
+    ///
+    /// AVC444's luma and chroma sub-streams are two independent H.264 sequences;
+    /// they must not share a decode context (inter-frame prediction would be
+    /// corrupted). The luma sub-stream reuses `h264_decoder`; this slot decodes
+    /// the chroma sub-stream. Populated only when AVC444 is opted into via
+    /// [`GraphicsPipelineClient::set_avc444_chroma_decoder`]; `None` keeps the
+    /// AVC420 default path (and its single decoder) entirely unchanged.
+    h264_chroma_decoder: Option<Box<dyn H264Decoder>>,
 
     decompressor: zgfx::Decompressor,
     decompressed_buffer: Vec<u8>,
@@ -393,6 +418,19 @@ pub struct GraphicsPipelineClient {
     current_frame_id: Option<u32>,
     frames_queued: u32,
     total_frames_decoded: u32,
+
+    /// RemoteFX Progressive decoder (EGFX `WireToSurface2` / codec 0x0009).
+    ///
+    /// Maintains per-`codec_context_id` tile state across frames.
+    progressive: ProgressiveDecoder,
+    /// Persistent per-surface RGBA framebuffers for progressive compositing.
+    ///
+    /// Progressive frames update only changed 64x64 tiles, so the client must
+    /// retain the full surface image between frames and blit tiles into it.
+    progressive_framebuffers: BTreeMap<u16, Vec<u8>>,
+    /// One-shot diagnostic: dump the first composited progressive framebuffer
+    /// to the path in `IRONRDP_EGFX_DUMP` (raw RGBA) for visual verification.
+    progressive_dump_done: bool,
 }
 
 impl GraphicsPipelineClient {
@@ -403,6 +441,7 @@ impl GraphicsPipelineClient {
         Self {
             handler,
             h264_decoder,
+            h264_chroma_decoder: None,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
             state: ClientState::WaitingForConfirm,
@@ -412,7 +451,22 @@ impl GraphicsPipelineClient {
             current_frame_id: None,
             frames_queued: 0,
             total_frames_decoded: 0,
+            progressive: ProgressiveDecoder::new(),
+            progressive_framebuffers: BTreeMap::new(),
+            progressive_dump_done: false,
         }
+    }
+
+    /// Provide a dedicated H.264 decode context for the AVC444 chroma-auxiliary
+    /// sub-stream, enabling AVC444 dual-stream decode.
+    ///
+    /// This is opt-in and separate from the primary (luma/AVC420) decoder passed
+    /// to [`GraphicsPipelineClient::new`]: AVC444's two sub-streams are
+    /// independent H.264 sequences and must not share a decode context. Only call
+    /// this when the caller also advertises AVC444 capability (V10.7); otherwise
+    /// the server never selects AVC444 and the slot stays unused.
+    pub fn set_avc444_chroma_decoder(&mut self, decoder: Box<dyn H264Decoder>) {
+        self.h264_chroma_decoder = Some(decoder);
     }
 
     // ========================================================================
@@ -454,6 +508,7 @@ impl GraphicsPipelineClient {
     // ========================================================================
 
     fn handle_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
+        trace!(pdu = ironrdp_core::name(&pdu), "EGFX PDU received");
         match pdu {
             GfxPdu::CapabilitiesConfirm(confirm) => {
                 self.handle_capabilities_confirm(confirm.0);
@@ -486,8 +541,7 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::WireToSurface2(pdu) => {
-                trace!("WireToSurface2 (progressive codec)");
-                self.handler.on_wire_to_surface2(&pdu);
+                self.handle_wire_to_surface2(&pdu);
                 Ok(vec![])
             }
             GfxPdu::EndFrame(end) => self.handle_end_frame(end.frame_id),
@@ -566,6 +620,7 @@ impl GraphicsPipelineClient {
                     codec_context_id = pdu.codec_context_id,
                     "DeleteEncodingContext"
                 );
+                self.progressive.delete_context(pdu.codec_context_id);
                 self.handler.on_delete_encoding_context(&pdu);
                 Ok(vec![])
             }
@@ -595,6 +650,11 @@ impl GraphicsPipelineClient {
     fn handle_reset_graphics(&mut self, width: u32, height: u32) {
         // Per spec, ResetGraphics implicitly destroys all surfaces
         self.surfaces.clear();
+
+        // Progressive tile state and per-surface framebuffers are tied to the
+        // surfaces that a ResetGraphics implicitly destroys, so drop them too.
+        self.progressive.reset();
+        self.progressive_framebuffers.clear();
 
         // Reset frame tracking state so subsequent FrameAcknowledge PDUs
         // don't report stale queue depth from a previous stream.
@@ -661,6 +721,10 @@ impl GraphicsPipelineClient {
             .get(&pdu.surface_id)
             .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface1"))?;
 
+        // Copy surface dimensions out before any `&mut self` call below (the
+        // decoder borrow conflicts with an outstanding `self.surfaces` borrow).
+        let (surface_width, surface_height) = (surface.width, surface.height);
+
         // Validate rectangle ordering (left <= right, top <= bottom)
         let rect = &pdu.destination_rectangle;
         if rect.left > rect.right || rect.top > rect.bottom {
@@ -688,14 +752,39 @@ impl GraphicsPipelineClient {
 
         match pdu.codec_id {
             Codec1Type::Avc420 => {
-                self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
+                self.decode_avc420(
+                    pdu.surface_id,
+                    &pdu.destination_rectangle,
+                    surface_width,
+                    surface_height,
+                    &pdu.bitmap_data,
+                )?;
             }
             Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
-                debug!("AVC444 codec not yet implemented, forwarding to handler");
-                self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
+                if self.h264_chroma_decoder.is_some() {
+                    let version = if pdu.codec_id == Codec1Type::Avc444v2 {
+                        ChromaVersion::V2
+                    } else {
+                        ChromaVersion::V1
+                    };
+                    self.decode_avc444(
+                        pdu.surface_id,
+                        &pdu.destination_rectangle,
+                        surface_width,
+                        surface_height,
+                        &pdu.bitmap_data,
+                        version,
+                    )?;
+                } else {
+                    // AVC444 was not opted into (no chroma decoder), so we never
+                    // advertised it and the server should not have selected it.
+                    // Forward to the handler rather than silently dropping.
+                    debug!("AVC444 received without an AVC444 decoder configured; forwarding to handler");
+                    self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
+                }
             }
             Codec1Type::Uncompressed => {
-                self.handle_uncompressed(pdu);
+                self.handle_uncompressed(pdu, surface_width, surface_height);
             }
             _ => {
                 trace!(codec_id = ?pdu.codec_id, "Forwarding unsupported codec to handler");
@@ -706,7 +795,14 @@ impl GraphicsPipelineClient {
         Ok(())
     }
 
-    fn decode_avc420(&mut self, surface_id: u16, dest_rect: &InclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
+    fn decode_avc420(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &InclusiveRectangle,
+        surface_width: u16,
+        surface_height: u16,
+        bitmap_data: &[u8],
+    ) -> PduResult<()> {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
@@ -745,13 +841,112 @@ impl GraphicsPipelineClient {
             data: cropped_data,
             width: dest_width,
             height: dest_height,
+            surface_width,
+            surface_height,
         };
 
-        self.handler.on_bitmap_updated(&update);
+        self.handler.on_bitmap_updated(update);
         Ok(())
     }
 
-    fn handle_uncompressed(&mut self, pdu: crate::pdu::WireToSurface1Pdu) {
+    /// Decode an AVC444 (`0x0E`) / AVC444v2 (`0x0F`) dual-stream frame.
+    ///
+    /// Parses the [`Avc444BitmapStream`] (an `LC` selector plus one or two
+    /// [`Avc420BitmapStream`]s), decodes the luma sub-stream via the primary
+    /// H.264 context and the chroma-auxiliary sub-stream via the dedicated
+    /// context, reconstructs YUV 4:4:4 per [MS-RDPEGFX], converts to RGBA, crops
+    /// to the destination rectangle, and delivers a [`BitmapUpdate`] just like
+    /// the AVC420 path.
+    ///
+    /// Only the two-stream case (`LC == LUMA_AND_CHROMA`) is reconstructed.
+    /// Luma-only / chroma-only partial updates need a persistent per-surface YUV
+    /// 4:4:4 framebuffer to composite against; those are warned and skipped here.
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    fn decode_avc444(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &InclusiveRectangle,
+        surface_width: u16,
+        surface_height: u16,
+        bitmap_data: &[u8],
+        version: ChromaVersion,
+    ) -> PduResult<()> {
+        let mut cursor = ReadCursor::new(bitmap_data);
+        let stream = Avc444BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
+
+        // Both decode contexts are required for the two-stream reconstruction.
+        // They are distinct struct fields, so the mutable borrows are disjoint.
+        let (Some(luma_decoder), Some(chroma_decoder)) =
+            (self.h264_decoder.as_mut(), self.h264_chroma_decoder.as_mut())
+        else {
+            debug!("AVC444 frame but no H.264 decoders configured; skipping");
+            return Ok(());
+        };
+
+        let Some(stream2) = stream.stream2.as_ref() else {
+            // LC == LUMA (0x01) or CHROMA (0x02): a partial update carrying only
+            // one view. Correct handling requires retaining the previous YUV444
+            // surface to composite against; not implemented. Skip safely.
+            warn!(
+                encoding = ?stream.encoding,
+                "AVC444 single-view (luma-only/chroma-only) partial update not supported; skipping frame"
+            );
+            return Ok(());
+        };
+
+        if stream.encoding != Encoding::LUMA_AND_CHROMA {
+            warn!(encoding = ?stream.encoding, "AVC444 stream carries two sub-streams but LC != LUMA_AND_CHROMA; skipping");
+            return Ok(());
+        }
+
+        // Decode the luma view (primary context) and chroma-aux view (dedicated).
+        let main = luma_decoder
+            .decode_yuv(stream.stream1.data)
+            .map_err(|e| pdu_other_err!("AVC444 luma H.264 decode", source: e))?;
+        let aux = chroma_decoder
+            .decode_yuv(stream2.data)
+            .map_err(|e| pdu_other_err!("AVC444 chroma H.264 decode", source: e))?;
+
+        let dest_width = dest_rect.width();
+        let dest_height = dest_rect.height();
+
+        // The luma frame must cover the destination rectangle (larger is expected
+        // due to macroblock alignment and handled by the reconstruction ROI).
+        if main.width < u32::from(dest_width) || main.height < u32::from(dest_height) {
+            warn!(
+                luma_width = main.width,
+                luma_height = main.height,
+                dest_width,
+                dest_height,
+                "AVC444 luma frame smaller than destination rectangle; skipping"
+            );
+            return Ok(());
+        }
+
+        let yuv444 = avc444::reconstruct_yuv444(&main, &aux, version, u32::from(dest_width), u32::from(dest_height));
+        let rgba = avc444::yuv444_to_rgba(&yuv444);
+
+        let update = BitmapUpdate {
+            surface_id,
+            destination_rectangle: dest_rect.clone(),
+            codec_id: if version == ChromaVersion::V2 {
+                Codec1Type::Avc444v2
+            } else {
+                Codec1Type::Avc444
+            },
+            data: rgba,
+            width: dest_width,
+            height: dest_height,
+            surface_width,
+            surface_height,
+        };
+
+        self.handler.on_bitmap_updated(update);
+        Ok(())
+    }
+
+    fn handle_uncompressed(&mut self, pdu: crate::pdu::WireToSurface1Pdu, surface_width: u16, surface_height: u16) {
         let dest_width = pdu.destination_rectangle.width();
         let dest_height = pdu.destination_rectangle.height();
 
@@ -768,9 +963,143 @@ impl GraphicsPipelineClient {
             data: rgba_data,
             width: dest_width,
             height: dest_height,
+            surface_width,
+            surface_height,
         };
 
-        self.handler.on_bitmap_updated(&update);
+        self.handler.on_bitmap_updated(update);
+    }
+
+    /// Handle a `WireToSurface2` PDU carrying RemoteFX Progressive bitmap data.
+    ///
+    /// GNOME Remote Desktop (and other RFX-progressive servers) deliver each
+    /// frame as a progressive block stream that updates only the 64x64 tiles
+    /// that changed. We decode those tiles, composite them into a persistent
+    /// per-surface RGBA framebuffer (kept here because its lifecycle is tied to
+    /// ResetGraphics/DeleteSurface), then crop the bounding box of the changed
+    /// tiles out of that framebuffer and deliver only that sub-rectangle as a
+    /// [`BitmapUpdate`]. `surface_width`/`surface_height` on the update let the
+    /// presenting handler place the region at
+    /// (`destination_rectangle.left`, `destination_rectangle.top`) inside its
+    /// own persistent surface-sized buffer instead of full-cloning every frame.
+    fn handle_wire_to_surface2(&mut self, pdu: &WireToSurface2Pdu) {
+        let Some(surface) = self.surfaces.get(&pdu.surface_id) else {
+            warn!(surface_id = pdu.surface_id, "WireToSurface2 for unknown surface");
+            return;
+        };
+        let width = usize::from(surface.width);
+        let height = usize::from(surface.height);
+        let (surface_width, surface_height) = (surface.width, surface.height);
+
+        // Decode the progressive stream into 64x64 RGBA tiles, then composite
+        // into the persistent framebuffer. Both `progressive` and
+        // `progressive_framebuffers` are distinct fields, so the borrows are
+        // disjoint. The block yields the exclusive-bounds bounding box of the
+        // changed tiles (min_x, min_y, max_x, max_y), clipped to the surface.
+        let bbox = {
+            let tiles = match self.progressive.decode_bitmap(
+                pdu.codec_context_id,
+                surface_width,
+                surface_height,
+                &pdu.bitmap_data,
+            ) {
+                Ok(tiles) => tiles,
+                Err(e) => {
+                    warn!(surface_id = pdu.surface_id, error = %e, "progressive decode failed");
+                    return;
+                }
+            };
+
+            if tiles.is_empty() {
+                trace!(surface_id = pdu.surface_id, "progressive frame produced no tiles");
+                return;
+            }
+
+            let fb = self.progressive_framebuffers.entry(pdu.surface_id).or_insert_with(|| {
+                let mut v = vec![0u8; width.saturating_mul(height).saturating_mul(4)];
+                // Initialize to opaque black.
+                for px in v.chunks_exact_mut(4) {
+                    px[3] = 0xFF;
+                }
+                v
+            });
+
+            // Track the changed-tile bounding box while compositing. Tile (x_idx,
+            // y_idx) covers surface pixels [x_idx*64, (x_idx+1)*64), clipped to
+            // the surface edge.
+            let (mut min_x, mut min_y) = (usize::MAX, usize::MAX);
+            let (mut max_x, mut max_y) = (0usize, 0usize);
+            let tile_count = tiles.len();
+            for tile in &tiles {
+                let tx = usize::from(tile.x_idx) * 64;
+                let ty = usize::from(tile.y_idx) * 64;
+                blit_tile(&tile.pixels, fb, width, height, tx, ty);
+                min_x = min_x.min(tx);
+                min_y = min_y.min(ty);
+                max_x = max_x.max((tx + 64).min(width));
+                max_y = max_y.max((ty + 64).min(height));
+            }
+            trace!(surface_id = pdu.surface_id, tile_count, "progressive tiles composited");
+
+            // Clip the origin to the surface too (a tile fully off-surface would
+            // leave min_* past the edge). If the box collapses, nothing to send.
+            min_x = min_x.min(width);
+            min_y = min_y.min(height);
+            if min_x >= max_x || min_y >= max_y {
+                trace!(surface_id = pdu.surface_id, "progressive bbox empty after clipping");
+                return;
+            }
+            (min_x, min_y, max_x, max_y)
+        };
+
+        let (min_x, min_y, max_x, max_y) = bbox;
+        let bbox_w = max_x - min_x;
+        let bbox_h = max_y - min_y;
+
+        // Crop the changed bounding box out of the persistent framebuffer. Only
+        // this sub-rectangle travels to the handler; the accumulator stays whole.
+        let fb = &self.progressive_framebuffers[&pdu.surface_id];
+        let data = crop_region(fb, width, min_x, min_y, bbox_w, bbox_h);
+
+        // One-shot diagnostic dump for visual verification of the decode. Dumps
+        // the FULL accumulated framebuffer (not the cropped region) so it can be
+        // diffed against a whole-surface reference.
+        if !self.progressive_dump_done
+            && let Some(path) = std::env::var_os("IRONRDP_EGFX_DUMP")
+        {
+            if std::fs::write(&path, fb).is_ok() {
+                let mut dims = std::path::PathBuf::from(&path);
+                dims.set_extension("dims");
+                let _ = std::fs::write(dims, format!("{width}x{height}"));
+                debug!(width, height, "dumped progressive framebuffer for verification");
+            }
+            self.progressive_dump_done = true;
+        }
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::as_conversions,
+            reason = "bbox is clipped to the u16 surface bounds, so every coordinate fits in u16"
+        )]
+        let update = BitmapUpdate {
+            surface_id: pdu.surface_id,
+            destination_rectangle: InclusiveRectangle {
+                left: min_x as u16,
+                top: min_y as u16,
+                right: (max_x - 1) as u16,
+                bottom: (max_y - 1) as u16,
+            },
+            // Placeholder: BitmapUpdate.codec_id is a Codec1Type; the renderer
+            // ignores it and always treats `data` as RGBA8888.
+            codec_id: Codec1Type::Uncompressed,
+            data,
+            width: bbox_w as u16,
+            height: bbox_h as u16,
+            surface_width,
+            surface_height,
+        };
+
+        self.handler.on_bitmap_updated(update);
     }
 
     #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
@@ -941,6 +1270,52 @@ fn crop_decoded_frame(
     cropped
 }
 
+/// Blit a decoded 64x64 RGBA tile into a surface framebuffer at pixel
+/// origin `(dst_x, dst_y)`, clipping to the framebuffer bounds.
+///
+/// `tile` is 64*64*4 bytes (RGBA, row-major); `fb` is `fb_w * fb_h * 4` bytes.
+/// Tiles on the right/bottom edge of a surface whose dimensions are not a
+/// multiple of 64 are clipped rather than overrunning the framebuffer.
+fn blit_tile(tile: &[u8], fb: &mut [u8], fb_w: usize, fb_h: usize, dst_x: usize, dst_y: usize) {
+    const TILE: usize = 64;
+    if dst_x >= fb_w || dst_y >= fb_h {
+        return;
+    }
+    let cols = TILE.min(fb_w - dst_x);
+    for row in 0..TILE {
+        let y = dst_y + row;
+        if y >= fb_h {
+            break;
+        }
+        let src_start = row * TILE * 4;
+        let dst_start = (y * fb_w + dst_x) * 4;
+        let (src_end, dst_end) = (src_start + cols * 4, dst_start + cols * 4);
+        if src_end <= tile.len() && dst_end <= fb.len() {
+            fb[dst_start..dst_end].copy_from_slice(&tile[src_start..src_end]);
+        }
+    }
+}
+
+/// Crop a `w`x`h` sub-rectangle at (`x`, `y`) out of a `fb_w`-wide RGBA
+/// framebuffer into a fresh tightly-packed `w`x`h` RGBA buffer (stride `w*4`).
+///
+/// The rectangle must lie within the framebuffer; callers clip it to the
+/// surface bounds beforehand. Rows partially outside the framebuffer are
+/// skipped defensively rather than panicking.
+fn crop_region(fb: &[u8], fb_w: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
+    for row in 0..h {
+        let src_start = ((y + row) * fb_w + x) * 4;
+        let src_end = src_start + w * 4;
+        let dst_start = row * w * 4;
+        let dst_end = dst_start + w * 4;
+        if src_end <= fb.len() && dst_end <= out.len() {
+            out[dst_start..dst_end].copy_from_slice(&fb[src_start..src_end]);
+        }
+    }
+    out
+}
+
 /// Unit tests that require access to private fields (state, surfaces, frame tracking).
 /// Integration tests exercising the public DVC API are in ironrdp-testsuite-core/tests/egfx/client.rs.
 #[cfg(test)]
@@ -954,7 +1329,7 @@ mod tests {
         fn on_surface_created(&mut self, _surface: &Surface) {}
         fn on_surface_deleted(&mut self, _surface_id: u16) {}
         fn on_surface_mapped(&mut self, _surface_id: u16, _x: u32, _y: u32) {}
-        fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
+        fn on_bitmap_updated(&mut self, _update: BitmapUpdate) {}
         fn on_frame_complete(&mut self, _frame_id: u32) {}
         fn on_close(&mut self) {}
         fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
@@ -1029,6 +1404,85 @@ mod tests {
         let data = vec![0xAAu8; 1920 * 1088 * 4];
         let cropped = crop_decoded_frame(&data, 1920, 1088, 1920, 1080);
         assert_eq!(cropped.len(), 1920 * 1080 * 4);
+    }
+
+    /// Build a `w`x`h` RGBA framebuffer whose every pixel encodes its own (x, y)
+    /// so a crop can be checked positionally: pixel (x, y) = [x, y, 0, 0xFF].
+    fn coord_framebuffer(w: usize, h: usize) -> Vec<u8> {
+        let mut fb = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                fb[i] = u8::try_from(x).expect("test width < 256");
+                fb[i + 1] = u8::try_from(y).expect("test height < 256");
+                fb[i + 3] = 0xFF;
+            }
+        }
+        fb
+    }
+
+    #[test]
+    fn crop_region_offset_subrect_is_byte_exact() {
+        // Discriminating case (advisor #2): x>0 AND y>0 AND w<W AND h<H, so the
+        // source stride (W) differs from the destination stride (w). A stride or
+        // offset bug shows up here where an origin/full-surface crop would not.
+        let (surface_w, surface_h) = (10usize, 8usize);
+        let fb = coord_framebuffer(surface_w, surface_h);
+        let (x, y, w, h) = (3usize, 2usize, 4usize, 3usize);
+
+        let cropped = crop_region(&fb, surface_w, x, y, w, h);
+
+        assert_eq!(cropped.len(), w * h * 4);
+        for ry in 0..h {
+            for rx in 0..w {
+                let ci = (ry * w + rx) * 4;
+                assert_eq!(cropped[ci], u8::try_from(x + rx).expect("fits u8"), "R at ({rx},{ry})");
+                assert_eq!(
+                    cropped[ci + 1],
+                    u8::try_from(y + ry).expect("fits u8"),
+                    "G at ({rx},{ry})"
+                );
+                assert_eq!(cropped[ci + 3], 0xFF);
+            }
+        }
+    }
+
+    #[test]
+    fn crop_region_then_blit_back_matches_full_frame_delivery() {
+        // Invariant gate (advisor #1): cropping a bbox out of a full framebuffer
+        // and blitting it back into a black surface-sized buffer reproduces that
+        // region byte-for-byte (== what a full-frame delivery would show there),
+        // while leaving the rest of the surface untouched.
+        let (surface_w, surface_h) = (12usize, 9usize);
+        let fb = coord_framebuffer(surface_w, surface_h);
+        let (x, y, w, h) = (5usize, 4usize, 4usize, 3usize);
+
+        let region = crop_region(&fb, surface_w, x, y, w, h);
+
+        // Reconstruct app.rs's blit into an opaque-black persistent buffer.
+        let mut dst = vec![0u8; surface_w * surface_h * 4];
+        for px in dst.chunks_exact_mut(4) {
+            px[3] = 0xFF;
+        }
+        for ry in 0..h {
+            let src = ry * w * 4;
+            let d = ((y + ry) * surface_w + x) * 4;
+            dst[d..d + w * 4].copy_from_slice(&region[src..src + w * 4]);
+        }
+
+        for py in 0..surface_h {
+            for px in 0..surface_w {
+                let i = (py * surface_w + px) * 4;
+                let inside = px >= x && px < x + w && py >= y && py < y + h;
+                if inside {
+                    // Region pixels equal the full-frame source exactly.
+                    assert_eq!(&dst[i..i + 4], &fb[i..i + 4], "region pixel ({px},{py})");
+                } else {
+                    // Everything outside the dirty rect stays opaque black.
+                    assert_eq!(&dst[i..i + 4], &[0, 0, 0, 0xFF], "untouched pixel ({px},{py})");
+                }
+            }
+        }
     }
 
     #[test]

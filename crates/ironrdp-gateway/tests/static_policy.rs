@@ -8,6 +8,21 @@
 use ironrdp_gateway::policy::AuthzDecision;
 use ironrdp_gateway::static_policy::StaticFilePolicy;
 
+// Silence `unused_crate_dependencies` for dev-dependencies that belong to the
+// still-WIP `listener.rs` integration surface (the lib's own test harness is
+// disabled via `[lib] test = false`), so they are not yet referenced by this
+// policy-only integration test target.
+use anyhow as _;
+use futures_util as _;
+use ironrdp_rdcleanpath as _;
+use rustls_pemfile as _;
+use serde as _;
+use tokio as _;
+use tokio_rustls as _;
+use tokio_tungstenite as _;
+use toml as _;
+use tracing as _;
+
 // ---------------------------------------------------------------------------
 // Helper: shared policy fixture used by most tests.
 // ---------------------------------------------------------------------------
@@ -27,7 +42,7 @@ hosts = ["10.0.0.99:3389"]
 "#;
 
 fn make_policy() -> StaticFilePolicy {
-    StaticFilePolicy::from_str(POLICY_TOML).expect("valid policy fixture")
+    StaticFilePolicy::from_toml_str(POLICY_TOML).expect("valid policy fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +155,7 @@ fn bare_hostname_matches_via_prefix() {
 principal = "svc"
 hosts = ["myhost.internal"]
 "#;
-    let p = StaticFilePolicy::from_str(toml).unwrap();
+    let p = StaticFilePolicy::from_toml_str(toml).unwrap();
     let id = mk_identity("svc");
     assert_eq!(
         block_on_authorize(&p, &id, &mk_target("myhost.internal", 3389)),
@@ -165,7 +180,7 @@ hosts = ["myhost.internal"]
 
 #[test]
 fn empty_policy_denies_everything() {
-    let p = StaticFilePolicy::from_str("").unwrap();
+    let p = StaticFilePolicy::from_toml_str("").unwrap();
     let id = mk_identity("admin");
     let tgt = mk_target("10.0.0.1", 3389);
     assert_eq!(
@@ -177,7 +192,7 @@ fn empty_policy_denies_everything() {
 
 #[test]
 fn malformed_toml_returns_error() {
-    let result = StaticFilePolicy::from_str("this is not valid toml = [[[");
+    let result = StaticFilePolicy::from_toml_str("this is not valid toml = [[[");
     assert!(result.is_err(), "malformed TOML must return an error");
 }
 
@@ -185,11 +200,12 @@ fn malformed_toml_returns_error() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-use ironrdp_gateway::auth::Identity;
-use ironrdp_gateway::policy::{GatewayPolicy, TargetHost};
-use std::future::Future as _;
+use core::future::Future as _;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::pin::pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+use ironrdp_gateway::auth::Identity;
+use ironrdp_gateway::policy::{GatewayPolicy as _, TargetHost};
 
 fn mk_identity(principal: &str) -> Identity {
     Identity {
@@ -217,12 +233,16 @@ fn block_on_authorize(policy: &StaticFilePolicy, id: &Identity, tgt: &TargetHost
         }
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
         // SAFETY: vtable operations are all no-ops; the pointer is never dereferenced.
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
     }
 
     let waker = no_op_waker();
     let mut cx = Context::from_waker(&waker);
     let mut fut = pin!(policy.authorize(id, tgt));
+    #[expect(
+        clippy::panic,
+        reason = "test invariant: authorize wraps a sync decision in future::ready, so the first poll is always Ready"
+    )]
     let Poll::Ready(result) = fut.as_mut().poll(&mut cx) else {
         panic!("StaticFilePolicy::authorize must resolve immediately (uses future::ready)");
     };
