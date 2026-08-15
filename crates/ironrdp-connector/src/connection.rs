@@ -539,20 +539,19 @@ impl Sequence for ClientConnector {
                         connect_time_autodetect::ConnectTimePdu::AutoDetectRequest(request) => {
                             debug!(?request, "Received connect-time Auto-Detect Request");
 
-                            let written = if let Some(response) =
-                                connect_time_autodetect::response_for_request(&request)
-                            {
-                                debug!(?response, "Answering connect-time Auto-Detect Request");
-                                let rsp = connect_time_autodetect::ConnectTimeAutoDetectRsp::new(response);
-                                Written::from_size(encode_send_data_request(
-                                    user_channel_id,
-                                    io_channel_id,
-                                    &rsp,
-                                    output,
-                                )?)?
-                            } else {
-                                Written::Nothing
-                            };
+                            let written =
+                                if let Some(response) = connect_time_autodetect::response_for_request(&request) {
+                                    debug!(?response, "Answering connect-time Auto-Detect Request");
+                                    let rsp = connect_time_autodetect::ConnectTimeAutoDetectRsp::new(response);
+                                    Written::from_size(encode_send_data_request(
+                                        user_channel_id,
+                                        io_channel_id,
+                                        &rsp,
+                                        output,
+                                    )?)?
+                                } else {
+                                    Written::Nothing
+                                };
 
                             (
                                 written,

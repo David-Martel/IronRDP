@@ -86,9 +86,7 @@ impl ScardCall {
             ScardIoCtlCode::State => Ok(ScardCall::StateCall(StateCall::decode(src)?)),
             ScardIoCtlCode::GetAttrib => Ok(ScardCall::GetAttribCall(GetAttribCall::decode(src)?)),
             ScardIoCtlCode::SetAttrib => Ok(ScardCall::SetAttribCall(SetAttribCall::decode(src)?)),
-            ScardIoCtlCode::GetTransmitCount => {
-                Ok(ScardCall::GetTransmitCountCall(GetTransmitCountCall::decode(src)?))
-            }
+            ScardIoCtlCode::GetTransmitCount => Ok(ScardCall::GetTransmitCountCall(GetTransmitCountCall::decode(src)?)),
             ScardIoCtlCode::ReleaseContext => Ok(ScardCall::ContextCall(ContextCall::decode(src)?)),
             ScardIoCtlCode::EndTransaction => Ok(ScardCall::HCardAndDispositionCall(HCardAndDispositionCall::decode(
                 src,
@@ -1595,11 +1593,7 @@ impl rpce::HeaderlessDecode for SetAttribCall {
         ensure_size!(in: src, size: attr_len_usize);
         let attr = src.read_slice(attr_len_usize).to_vec();
 
-        Ok(Self {
-            handle,
-            attr_id,
-            attr,
-        })
+        Ok(Self { handle, attr_id, attr })
     }
 }
 

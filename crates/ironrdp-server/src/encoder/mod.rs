@@ -118,14 +118,8 @@ impl UpdateEncoder {
     ) -> Result<Self> {
         // RDP protocol allows at most 8192×8192; zero dimensions are also invalid
         // because downstream code (e.g., split_diff) divides by width/height.
-        ensure!(
-            desktop_size.width > 0,
-            "desktop width must be non-zero"
-        );
-        ensure!(
-            desktop_size.height > 0,
-            "desktop height must be non-zero"
-        );
+        ensure!(desktop_size.width > 0, "desktop width must be non-zero");
+        ensure!(desktop_size.height > 0, "desktop height must be non-zero");
         ensure!(
             desktop_size.width <= 8192,
             "desktop width {} exceeds protocol maximum of 8192",

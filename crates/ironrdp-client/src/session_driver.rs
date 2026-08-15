@@ -53,7 +53,10 @@ pub(crate) struct RedirectInfo {
 }
 
 pub(crate) enum RdpControlFlow {
-    ReconnectWithNewSize { width: u16, height: u16 },
+    ReconnectWithNewSize {
+        width: u16,
+        height: u16,
+    },
     /// The server sent a Server Redirection PDU; reconnect to the target session
     /// carrying the load-balance routing token and redirection credentials.
     Redirect(RedirectInfo),

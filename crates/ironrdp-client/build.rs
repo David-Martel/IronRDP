@@ -79,11 +79,7 @@ fn split_semver(ver: &str) -> (String, String, String) {
     let minor = parts.next().unwrap_or("0").to_owned();
     // Patch may carry pre-release / build metadata — strip them.
     let patch_raw = parts.next().unwrap_or("0");
-    let patch = patch_raw
-        .split(['-', '+'])
-        .next()
-        .unwrap_or("0")
-        .to_owned();
+    let patch = patch_raw.split(['-', '+']).next().unwrap_or("0").to_owned();
     (major, minor, patch)
 }
 
@@ -102,9 +98,7 @@ fn parse_git_describe(described: &str) -> (String, String, String, String, Strin
 
     // Work on the string without the trailing "-dirty" suffix.
     let base = if dirty {
-        without_v
-            .strip_suffix("-dirty")
-            .unwrap_or(without_v)
+        without_v.strip_suffix("-dirty").unwrap_or(without_v)
     } else {
         without_v
     };
@@ -168,15 +162,7 @@ fn parse_override_version(ver: &str) -> (String, String, String, String, String)
 // ---------------------------------------------------------------------------
 
 /// Emits all `cargo:rustc-env=` directives consumed by `src/version.rs`.
-fn emit_version_vars(
-    version: &str,
-    major: &str,
-    minor: &str,
-    patch: &str,
-    hash: &str,
-    dirty: &str,
-    timestamp: &str,
-) {
+fn emit_version_vars(version: &str, major: &str, minor: &str, patch: &str, hash: &str, dirty: &str, timestamp: &str) {
     println!("cargo:rustc-env=IRONRDP_VERSION={version}");
     println!("cargo:rustc-env=IRONRDP_VERSION_MAJOR={major}");
     println!("cargo:rustc-env=IRONRDP_VERSION_MINOR={minor}");
@@ -205,7 +191,12 @@ fn build_timestamp() -> String {
 
     // On Windows fall back to PowerShell.
     if let Ok(out) = Command::new("powershell")
-        .args(["-NoLogo", "-NoProfile", "-Command", "[datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')"])
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "[datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')",
+        ])
         .output()
         && out.status.success()
         && let Ok(s) = String::from_utf8(out.stdout)

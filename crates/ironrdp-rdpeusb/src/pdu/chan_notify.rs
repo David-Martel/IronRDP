@@ -8,7 +8,9 @@
 
 use alloc::borrow::ToOwned as _;
 
-use ironrdp_core::{DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size, unsupported_value_err};
+use ironrdp_core::{
+    DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size, unsupported_value_err,
+};
 
 use crate::ensure_payload_size;
 use crate::pdu::header::SharedMsgHeader;

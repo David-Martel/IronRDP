@@ -39,10 +39,7 @@ impl TryFrom<u32> for Capability {
         if value == 0x1 {
             Ok(Self::RimCapabilityVersion01)
         } else {
-            Err(unsupported_value_err!(
-                "CapabilityValue",
-                alloc::format!("{value:#x}")
-            ))
+            Err(unsupported_value_err!("CapabilityValue", alloc::format!("{value:#x}")))
         }
     }
 }

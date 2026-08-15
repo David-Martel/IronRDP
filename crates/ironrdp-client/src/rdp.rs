@@ -106,16 +106,25 @@ impl ironrdp_egfx::client::GraphicsPipelineHandler for EgfxRenderHandler {
 
     fn on_bitmap_updated(&mut self, update: ironrdp_egfx::client::BitmapUpdate) {
         if update.data.is_empty() {
-            trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (no decoder or empty frame)");
+            trace!(
+                surface_id = update.surface_id,
+                "EGFX bitmap update skipped (no decoder or empty frame)"
+            );
             return;
         }
 
         let Some(width) = NonZeroU16::new(update.width) else {
-            trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (zero width)");
+            trace!(
+                surface_id = update.surface_id,
+                "EGFX bitmap update skipped (zero width)"
+            );
             return;
         };
         let Some(height) = NonZeroU16::new(update.height) else {
-            trace!(surface_id = update.surface_id, "EGFX bitmap update skipped (zero height)");
+            trace!(
+                surface_id = update.surface_id,
+                "EGFX bitmap update skipped (zero height)"
+            );
             return;
         };
 
@@ -366,17 +375,14 @@ impl RdpClient {
                     redirect_count = redirect_count.saturating_add(1);
                     if redirect_count > MAX_REDIRECTS {
                         error!(redirect_count, "Too many server redirections; aborting");
-                        self.send_terminal_event(Err(ironrdp::session::general_err!(
-                            "too many server redirections"
-                        )));
+                        self.send_terminal_event(Err(ironrdp::session::general_err!("too many server redirections")));
                         break;
                     }
 
                     // Forward the load-balance routing token verbatim in the reconnect's
                     // X.224 Connection Request so the server (e.g. gnome-remote-desktop's
                     // system daemon) routes us to the handed-over target session.
-                    self.config.connector.request_data =
-                        routing_token.map(ironrdp::pdu::nego::NegoRequestData::raw);
+                    self.config.connector.request_data = routing_token.map(ironrdp::pdu::nego::NegoRequestData::raw);
 
                     // GRD's handover instance authenticates the redirected connection
                     // against a winpr NTLM SAM populated with the redirection-provided
@@ -624,7 +630,9 @@ async fn connect(
     let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
-        .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(Some(0)));
+        .with_static_channel(
+            rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(Some(0)),
+        );
 
     if let Some(builder) = cliprdr_factory {
         info!("Attach CLIPRDR channel");
@@ -808,7 +816,9 @@ async fn connect_ws(
     let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
-        .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(Some(0)));
+        .with_static_channel(
+            rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(Some(0)),
+        );
 
     if let Some(builder) = cliprdr_factory {
         info!("Attach CLIPRDR channel");

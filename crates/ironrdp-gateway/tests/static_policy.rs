@@ -243,8 +243,7 @@ fn block_on_authorize(policy: &StaticFilePolicy, id: &Identity, tgt: &TargetHost
         clippy::panic,
         reason = "test invariant: authorize wraps a sync decision in future::ready, so the first poll is always Ready"
     )]
-    let Poll::Ready(result) = fut.as_mut().poll(&mut cx)
-    else {
+    let Poll::Ready(result) = fut.as_mut().poll(&mut cx) else {
         panic!("StaticFilePolicy::authorize must resolve immediately (uses future::ready)");
     };
     result.expect("authorize returned an error")

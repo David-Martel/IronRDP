@@ -9,8 +9,8 @@
 use alloc::format;
 
 use ironrdp_core::{
-    DecodeError, DecodeOwned as _, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor,
-    ensure_fixed_part_size, ensure_size, unsupported_value_err,
+    DecodeError, DecodeOwned as _, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size,
+    ensure_size, unsupported_value_err,
 };
 use ironrdp_pdu::utils::strict_sum;
 use ironrdp_str::prefixed::Cch32String;
@@ -120,9 +120,7 @@ impl Encode for RegisterRequestCallback {
             Some(_) => InterfaceId::FIXED_PART_SIZE,
             None => 0,
         };
-        strict_sum(&[
-            SharedMsgHeader::SIZE_WHEN_NOT_RSP + NUM_REQUEST_COMPLETION_SIZE + request_completion_size,
-        ])
+        strict_sum(&[SharedMsgHeader::SIZE_WHEN_NOT_RSP + NUM_REQUEST_COMPLETION_SIZE + request_completion_size])
     }
 }
 
@@ -329,9 +327,7 @@ impl InternalIoCtl {
         if code != IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME {
             return Err(unsupported_value_err!(
                 "INTERNAL_IO_CONTROL::IoControlCode",
-                format!(
-                    "is: {code:#X}; should be: {IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME:#X}"
-                )
+                format!("is: {code:#X}; should be: {IOCTL_TSUSBGD_IOCTL_USBDI_QUERY_BUS_TIME:#X}")
             ));
         }
         let input_size = src.read_u32();
@@ -466,10 +462,6 @@ impl Encode for QueryDeviceTextRsp {
     }
 
     fn size(&self) -> usize {
-        strict_sum(&[
-            SharedMsgHeader::SIZE_WHEN_RSP
-                + self.device_description.size()
-                + const { size_of::<HResult>() },
-        ])
+        strict_sum(&[SharedMsgHeader::SIZE_WHEN_RSP + self.device_description.size() + const { size_of::<HResult>() }])
     }
 }

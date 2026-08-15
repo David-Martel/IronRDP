@@ -46,8 +46,5 @@ pub trait GatewayAuthenticator: Send + Sync + 'static {
     ///
     /// Returns an error if the credentials are invalid or the backend returns
     /// an error.
-    fn authenticate(
-        &self,
-        credentials: Credentials,
-    ) -> impl Future<Output = Result<Identity>> + Send;
+    fn authenticate(&self, credentials: Credentials) -> impl Future<Output = Result<Identity>> + Send;
 }

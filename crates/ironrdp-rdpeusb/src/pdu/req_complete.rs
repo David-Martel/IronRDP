@@ -73,8 +73,7 @@ impl IoctlCompletion {
     /// Returns an error if the `Information` and `OutputBufferSize` fields are inconsistent with
     /// the `HResult` value as specified in MS-RDPEUSB § 2.2.7.1.
     pub fn decode(src: &mut ReadCursor<'_>, header: SharedMsgHeader) -> DecodeResult<Self> {
-        let fixed_bytes =
-            size_of::<RequestIdIoctl>() + size_of::<HResult>() + size_of::<u32>() + size_of::<u32>();
+        let fixed_bytes = size_of::<RequestIdIoctl>() + size_of::<HResult>() + size_of::<u32>() + size_of::<u32>();
         ensure_size!(in: src, size: fixed_bytes);
 
         let request_id = src.read_u32();
@@ -148,15 +147,13 @@ impl Encode for IoctlCompletion {
             0
         };
 
-        strict_sum(&[
-            SharedMsgHeader::SIZE_WHEN_NOT_RSP
-                + const {
-                    size_of::<RequestIdIoctl>()
+        strict_sum(&[SharedMsgHeader::SIZE_WHEN_NOT_RSP
+            + const {
+                size_of::<RequestIdIoctl>()
                         + size_of::<HResult>()
                         + size_of::<u32>() // Information
                         + size_of::<u32>() // OutputBufferSize
-                }
-                + out_buf_len,
-        ])
+            }
+            + out_buf_len])
     }
 }
