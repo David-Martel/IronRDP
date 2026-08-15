@@ -1,6 +1,7 @@
-# Architectural Comparison & Integration Report: Sunshine/Moonlight vs. IronRDP
+# Architectural Comparison and Fleet Validation Plan: Sunshine/Moonlight vs. IronRDP
 
-This document details the architectural comparison between **Sunshine / Moonlight** and **IronRDP** (`David-Martel/IronRDP`), documents the implementation of the `DesktopPatternProvider` screen streaming engine in `IronRDP`, and presents cross-platform compilation and non-headless Hardware-In-The-Loop (HIL) validation.
+This document compares **Sunshine / Moonlight** with **IronRDP** (`David-Martel/IronRDP`) and defines a reproducible multi-node validation procedure.
+It does not claim a host or cross-machine result unless the corresponding command output and artifact are retained with a dated test report.
 
 ---
 
@@ -30,48 +31,35 @@ This document details the architectural comparison between **Sunshine / Moonligh
 
 ---
 
-## 2. Key Component Integrations Implemented in IronRDP
+## 2. IronRDP Desktop Test Provider
 
-1. **`DesktopPatternProvider` Screen Engine (`examples/server.rs`):**
-   * Replaced pseudo-random noise patches with a structured desktop GUI provider:
-     * Dark Navy / Slate Desktop Background (`#1A1D24` to `#2D323E`).
-     * Top Taskbar & Electric Blue Accent Line (`#0D1117` / `#1F6FEB`).
-     * Application Window Control Frame with Red, Yellow, Green Window Controls (`#FF5F56`, `#FFBD2E`, `#27C93F`).
-     * SMPTE Color Calibration Bars (Blue, Green, Red, Cyan, Magenta, Yellow, White).
-     * Bouncing Motion Target for real-time framerate and dirty-rect update testing.
-   * Adheres strictly to the RDP 64KB FastPath PDU payload limit by streaming 1920x16 stripe tiles.
+The server example renders a deterministic desktop-pattern frame for graphics and dirty-rectangle tests.
+An operator may instead supply a binary P6 PPM image with `--background-ppm <PATH>`.
+The image is parsed and scaled once at server startup, then the cached BGRA frame is reused for every session and stripe update.
 
-2. **Automated Non-Blank Image & Entropy Validation Suite (`tools/validate_rdp_rendering.py`):**
-   * Added an automated verification tool that connects to the live stream, decodes PNG frames, and asserts valid PNG signature, non-trivial image entropy, and full 1920x1080 canvas resolution.
+The example requires a certificate and private-key path for TLS.
+Hybrid CredSSP mode also requires `--user` and the `IRONRDP_SERVER_PASSWORD` runtime environment variable; no default credential is provided.
 
 ---
 
-## 3. Cross-Platform Rebuild Verification
+## 3. Multi-Architecture Revalidation Matrix
 
-| Host Platform | Architecture / Compiler | Build Command | Status |
+Record the exact commit, toolchain, command, exit code, and retained log before changing a row from **Not revalidated**.
+
+| Host class | Target | Required command | Current status |
 | :--- | :--- | :--- | :--- |
-| **`asuspro13` (Linux)** | `x86_64-unknown-linux-gnu` / `rustc 1.94.0` | `cargo check --workspace` | **PASS (0 Warnings/Errors)** |
-| **`dtm-p1gen7` (Windows)** | `x86_64-pc-windows-msvc` / `MSVC 19.44` | `cargo check --features="cliprdr connector rdpsnd server"` | **PASS (0 Warnings/Errors)** |
+| Windows workstation | `x86_64-pc-windows-msvc` | `cargo check --workspace` through the documented CargoTools wrapper | **Not revalidated** |
+| Linux workstation | `x86_64-unknown-linux-gnu` | `cargo check --workspace` | **Not revalidated** |
+| DGX Spark | `aarch64-unknown-linux-gnu` | `cargo check --workspace` | **Not revalidated** |
 
 ---
 
-## 4. Live Rendered Desktop Display Proof
+## 4. Cross-Machine Validation Procedure
 
-A live HIL session was established between the IronRDP Server (`127.0.0.1:33897`) and the IronRDP Client under Hybrid CredSSP/NLA TLS security. The client completed authentication, received 70 RDP 1920x16 desktop tiles, reconstructed the 1920x1080 display, and rendered the image to disk.
+1. Provision the remote server as a user service with a host-managed TLS identity and runtime credential.
+2. Start it through `scripts/fleet/start_spark_server.sh <SSH_DESTINATION> <PORT>`; the SSH destination must already have a verified host key.
+3. Run the screenshot client from a separate node through the approved network path.
+4. Validate the retained image with `tools/validate_rdp_rendering.py`.
+5. Store the image, command transcript, toolchain versions, node identifiers, and commit SHA in a dated test artifact directory before documenting a pass.
 
-### Live Rendered RDP Display Output
-![Live IronRDP Rendered Screen Capture](/home/damartel/.gemini/antigravity-cli/brain/717d76a4-fea3-44a7-b477-e45feb5c25e2/ironrdp_desktop_proof.png)
-
-```
-Image File:    /tmp/ironrdp_desktop_proof.png
-File Size:     43,689 bytes (43.6 KB)
-Image Format:  PNG image data, 1920 x 1080, 8-bit/color RGBA, non-interlaced
-Validation:    PASS (tools/validate_rdp_rendering.py)
-```
-
----
-
-## 5. Repository Documentation Location
-
-* **Local Machine (`asuspro13`):** `dev/repos/IronRDP/docs/architecture/ironrdp_sunshine_comparison.md`
-* **Windows Host (`dtm-p1gen7`):** `T:\projects\IronRDP\docs/architecture/ironrdp_sunshine_comparison.md`
+Do not commit machine-local absolute paths, private-key locations, passwords, or transient `/tmp` evidence as architectural proof.

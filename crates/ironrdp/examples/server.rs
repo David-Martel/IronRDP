@@ -5,7 +5,7 @@
 
 use core::net::SocketAddr;
 use core::num::{NonZeroU16, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
@@ -25,7 +25,11 @@ use tracing::{debug, info, warn};
 
 const HELP: &str = "\
 USAGE:
-  cargo run --example=server -- [--bind-addr <SOCKET ADDRESS>] [--cert <CERTIFICATE>] [--key <CERTIFICATE KEY>] [--user USERNAME] [--pass PASSWORD] [--sec tls|hybrid]
+  cargo run --example=server -- \
+    --cert <CERTIFICATE> --key <CERTIFICATE KEY> [--bind-addr <SOCKET ADDRESS>] \
+    --user USERNAME [--background-ppm <P6 PPM IMAGE>]
+
+Hybrid CredSSP security requires a non-empty IRONRDP_SERVER_PASSWORD in the process environment.
 ";
 
 #[tokio::main(flavor = "current_thread")]
@@ -47,12 +51,12 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         Action::Run {
             bind_addr,
-            hybrid,
             user,
             pass,
             cert,
             key,
-        } => run(bind_addr, hybrid, user, pass, cert, key).await,
+            background_ppm,
+        } => run(bind_addr, user, pass, cert, key, background_ppm).await,
     }
 }
 
@@ -61,11 +65,11 @@ enum Action {
     ShowHelp,
     Run {
         bind_addr: SocketAddr,
-        hybrid: bool,
         user: String,
         pass: String,
-        cert: Option<PathBuf>,
-        key: Option<PathBuf>,
+        cert: PathBuf,
+        key: PathBuf,
+        background_ppm: Option<PathBuf>,
     },
 }
 
@@ -79,26 +83,28 @@ fn parse_args() -> anyhow::Result<Action> {
             .opt_value_from_str("--bind-addr")?
             .unwrap_or_else(|| "127.0.0.1:3389".parse().expect("valid hardcoded SocketAddr string"));
 
-        let sec = args.opt_value_from_str("--sec")?.unwrap_or_else(|| "hybrid".to_owned());
-        let hybrid = match sec.as_ref() {
-            "tls" => false,
-            "hybrid" => true,
-            _ => anyhow::bail!("Unhandled security: '{sec}'"),
-        };
+        let cert = args
+            .opt_value_from_str("--cert")?
+            .context("missing required --cert path")?;
+        let key = args
+            .opt_value_from_str("--key")?
+            .context("missing required --key path")?;
+        let background_ppm = args.opt_value_from_str("--background-ppm")?;
 
-        let cert = args.opt_value_from_str("--cert")?;
-        let key = args.opt_value_from_str("--key")?;
-
-        let user = args.opt_value_from_str("--user")?.unwrap_or_else(|| "user".to_owned());
-        let pass = args.opt_value_from_str("--pass")?.unwrap_or_else(|| "pass".to_owned());
+        let user = args
+            .opt_value_from_str("--user")?
+            .context("missing required --user for hybrid security")?;
+        let pass = std::env::var("IRONRDP_SERVER_PASSWORD")
+            .context("IRONRDP_SERVER_PASSWORD is required for hybrid security")?;
+        anyhow::ensure!(!pass.is_empty(), "IRONRDP_SERVER_PASSWORD must not be empty");
 
         Action::Run {
             bind_addr,
-            hybrid,
             user,
             pass,
             cert,
             key,
+            background_ppm,
         }
     };
 
@@ -127,11 +133,13 @@ fn setup_logging() -> anyhow::Result<()> {
 }
 
 #[derive(Clone, Debug)]
-struct Handler;
+struct Handler {
+    background: Option<Arc<[u8]>>,
+}
 
 impl Handler {
-    fn new() -> Self {
-        Self
+    fn new(background: Option<Arc<[u8]>>) -> Self {
+        Self { background }
     }
 }
 
@@ -151,13 +159,20 @@ const HEIGHT: u16 = 1080;
 struct DisplayUpdates {
     frame_counter: u64,
     stripe_y: u16,
+    frame: Arc<[u8]>,
+    static_frame: bool,
 }
 
 impl DisplayUpdates {
-    fn new() -> Self {
+    fn new(background: Option<Arc<[u8]>>) -> Self {
+        let static_frame = background.is_some();
+        let frame = background.unwrap_or_else(|| Arc::from(render_desktop_frame(0)));
+
         Self {
             frame_counter: 0,
             stripe_y: 0,
+            frame,
+            static_frame,
         }
     }
 }
@@ -170,6 +185,9 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
         if self.stripe_y >= HEIGHT {
             self.stripe_y = 0;
             self.frame_counter += 1;
+            if !self.static_frame {
+                self.frame = Arc::from(render_desktop_frame(self.frame_counter));
+            }
             sleep(Duration::from_millis(66)).await; // ~15 FPS VSync pacing
         }
 
@@ -177,35 +195,121 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
         let h = STRIPE_HEIGHT.min(HEIGHT - y);
         self.stripe_y += h;
 
-        let full_frame = render_full_desktop_frame(self.frame_counter);
-
         // Extract stripe data for [y .. y+h]
-        let start_idx = (y as usize) * (WIDTH as usize) * 4;
-        let end_idx = ((y + h) as usize) * (WIDTH as usize) * 4;
-        let stripe_data = full_frame[start_idx..end_idx].to_vec();
+        let start_idx = usize::from(y) * usize::from(WIDTH) * 4;
+        let end_idx = usize::from(y + h) * usize::from(WIDTH) * 4;
+        let stripe_data = self.frame[start_idx..end_idx].to_vec();
 
         let bitmap = BitmapUpdate {
             x: 0,
             y,
-            width: NonZeroU16::new(WIDTH).unwrap(),
-            height: NonZeroU16::new(h).unwrap(),
+            width: NonZeroU16::new(WIDTH).expect("WIDTH is nonzero"),
+            height: NonZeroU16::new(h).expect("stripe height is nonzero"),
             format: PixelFormat::BgrA32,
             data: stripe_data.into(),
-            stride: NonZeroUsize::new((WIDTH as usize) * 4).unwrap(),
+            stride: NonZeroUsize::new(usize::from(WIDTH) * 4).expect("WIDTH times four is nonzero"),
         };
 
         Ok(Some(DisplayUpdate::Bitmap(bitmap)))
     }
 }
 
-fn render_full_desktop_frame(frame_num: u64) -> Vec<u8> {
+fn load_desktop_ppm(path: &Path) -> anyhow::Result<Vec<u8>> {
+    // This accommodates an 8K RGB frame while bounding startup memory use for untrusted files.
+    const MAX_PPM_BYTES: u64 = 128 * 1024 * 1024;
+
+    let metadata = std::fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    anyhow::ensure!(metadata.len() <= MAX_PPM_BYTES, "PPM image exceeds the 128 MiB limit");
+    let content = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    parse_desktop_ppm(&content).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn parse_desktop_ppm(content: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if !content.starts_with(b"P6") {
+        anyhow::bail!("input is not a binary P6 PPM image");
+    }
+    let mut cursor = 2;
+    match content.get(cursor..) {
+        Some([b'\r', b'\n', ..]) => cursor += 2,
+        Some([separator, ..]) if separator.is_ascii_whitespace() => cursor += 1,
+        _ => anyhow::bail!("PPM magic is not followed by a header separator"),
+    }
+    let mut header_tokens = Vec::new();
+    while header_tokens.len() < 3 && cursor < content.len() {
+        if content[cursor] == b'#' {
+            while cursor < content.len() && content[cursor] != b'\n' {
+                cursor += 1;
+            }
+        } else if content[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        } else {
+            let start = cursor;
+            while cursor < content.len() && !content[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if let Ok(tok) = core::str::from_utf8(&content[start..cursor]) {
+                header_tokens.push(tok.to_owned());
+            }
+        }
+    }
+    anyhow::ensure!(header_tokens.len() == 3, "input has an incomplete PPM header");
+    let orig_w: usize = header_tokens[0].parse().context("input has an invalid PPM width")?;
+    let orig_h: usize = header_tokens[1].parse().context("input has an invalid PPM height")?;
+    anyhow::ensure!(orig_w != 0 && orig_h != 0, "input has zero-sized PPM dimensions");
+    anyhow::ensure!(header_tokens[2] == "255", "input must use an 8-bit PPM max value");
+
+    match content.get(cursor..) {
+        Some([b'\r', b'\n', ..]) => cursor += 2,
+        Some([separator, ..]) if separator.is_ascii_whitespace() => cursor += 1,
+        _ => anyhow::bail!("PPM max value is not followed by a raster separator"),
+    }
+
+    let pixel_bytes = &content[cursor..];
+    let expected_len = orig_w
+        .checked_mul(orig_h)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .context("PPM dimensions overflow the address space")?;
+    anyhow::ensure!(
+        pixel_bytes.len() >= expected_len,
+        "input contains fewer pixels than its PPM header declares"
+    );
+
+    let width = usize::from(WIDTH);
+    let height = usize::from(HEIGHT);
+    let mut bgra = vec![0u8; width * height * 4];
+    for y in 0..height {
+        let src_y = (y * orig_h) / height;
+        for x in 0..width {
+            let src_x = (x * orig_w) / width;
+            let src_idx = (src_y * orig_w + src_x) * 3;
+            let dst_idx = (y * width + x) * 4;
+
+            if src_idx + 2 < pixel_bytes.len() {
+                bgra[dst_idx] = pixel_bytes[src_idx + 2]; // B
+                bgra[dst_idx + 1] = pixel_bytes[src_idx + 1]; // G
+                bgra[dst_idx + 2] = pixel_bytes[src_idx]; // R
+                bgra[dst_idx + 3] = 255;
+            }
+        }
+    }
+    Ok(bgra)
+}
+
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    reason = "the bounded example renderer converts fixed canvas coordinates and animation values"
+)]
+fn render_desktop_frame(frame_num: u64) -> Vec<u8> {
     let mut data = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
 
     // 1. Desktop Background Gradient (Dark Slate / Navy)
     for y in 0..HEIGHT {
-        let r = (26 + (y as u32 * 20 / HEIGHT as u32)) as u8;
-        let g = (29 + (y as u32 * 25 / HEIGHT as u32)) as u8;
-        let b = (36 + (y as u32 * 30 / HEIGHT as u32)) as u8;
+        let r = (26 + (u32::from(y) * 20 / u32::from(HEIGHT))) as u8;
+        let g = (29 + (u32::from(y) * 25 / u32::from(HEIGHT))) as u8;
+        let b = (36 + (u32::from(y) * 30 / u32::from(HEIGHT))) as u8;
         for x in 0..WIDTH {
             let idx = ((y as usize) * (WIDTH as usize) + (x as usize)) * 4;
             data[idx] = b;
@@ -298,18 +402,18 @@ fn render_full_desktop_frame(frame_num: u64) -> Vec<u8> {
 }
 
 fn draw_circle(data: &mut [u8], stride_w: u16, cx: u16, cy: u16, radius: u16, color: [u8; 4]) {
-    let r2 = (radius as i32) * (radius as i32);
+    let r2 = i32::from(radius) * i32::from(radius);
     let y0 = cy.saturating_sub(radius);
     let y1 = (cy + radius).min(HEIGHT);
     let x0 = cx.saturating_sub(radius);
     let x1 = (cx + radius).min(stride_w);
 
     for y in y0..y1 {
-        let dy = y as i32 - cy as i32;
+        let dy = i32::from(y) - i32::from(cy);
         for x in x0..x1 {
-            let dx = x as i32 - cx as i32;
+            let dx = i32::from(x) - i32::from(cx);
             if dx * dx + dy * dy <= r2 {
-                let idx = ((y as usize) * (stride_w as usize) + (x as usize)) * 4;
+                let idx = (usize::from(y) * usize::from(stride_w) + usize::from(x)) * 4;
                 if idx + 3 < data.len() {
                     data[idx] = color[0];
                     data[idx + 1] = color[1];
@@ -331,7 +435,7 @@ impl RdpServerDisplay for Handler {
     }
 
     async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
-        Ok(Box::new(DisplayUpdates::new()))
+        Ok(Box::new(DisplayUpdates::new(self.background.clone())))
     }
 }
 
@@ -518,30 +622,25 @@ fn generate_sine_wave(sample_rate: u32, frequency: f32, duration_ms: u64, phase:
 
 async fn run(
     bind_addr: SocketAddr,
-    hybrid: bool,
     username: String,
     password: String,
-    cert: Option<PathBuf>,
-    key: Option<PathBuf>,
+    cert: PathBuf,
+    key: PathBuf,
+    background_ppm: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    info!(%bind_addr, ?cert, ?key, "run");
+    info!(%bind_addr, ?cert, "run");
 
-    let handler = Handler::new();
+    let background = background_ppm
+        .as_deref()
+        .map(load_desktop_ppm)
+        .transpose()?
+        .map(Arc::from);
+    let handler = Handler::new(background);
 
     let server_builder = RdpServer::builder().with_addr(bind_addr);
-
-    let server_builder = if let Some((cert_path, key_path)) = cert.as_deref().zip(key.as_deref()) {
-        let identity = TlsIdentityCtx::init_from_paths(cert_path, key_path).context("failed to init TLS identity")?;
-        let acceptor = identity.make_acceptor().context("failed to build TLS acceptor")?;
-
-        if hybrid {
-            server_builder.with_hybrid(acceptor, identity.pub_key)
-        } else {
-            server_builder.with_tls(acceptor)
-        }
-    } else {
-        server_builder.with_no_security()
-    };
+    let identity = TlsIdentityCtx::init_from_paths(&cert, &key).context("failed to init TLS identity")?;
+    let acceptor = identity.make_acceptor().context("failed to build TLS acceptor")?;
+    let server_builder = server_builder.with_hybrid(acceptor, identity.pub_key);
 
     let cliprdr = Box::new(StubCliprdrServerFactory);
 
@@ -563,4 +662,31 @@ async fn run(
     }));
 
     server.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scales_single_pixel_ppm_to_cached_frame() {
+        let frame = parse_desktop_ppm(b"P6\n1 1\n255\n\x01\x02\x03").expect("valid PPM");
+
+        assert_eq!(frame.len(), usize::from(WIDTH) * usize::from(HEIGHT) * 4);
+        assert!(frame.chunks_exact(4).all(|pixel| pixel == [0x03, 0x02, 0x01, 0xFF]));
+    }
+
+    #[test]
+    fn rejects_non_eight_bit_ppm() {
+        let error = parse_desktop_ppm(b"P6\n1 1\n1023\n\x01\x02\x03").expect_err("unsupported max value");
+
+        assert!(error.to_string().contains("8-bit PPM max value"));
+    }
+
+    #[test]
+    fn preserves_whitespace_valued_first_pixel() {
+        let frame = parse_desktop_ppm(b"P6\n1 1\n255\n\x20\x0A\x0D").expect("valid PPM");
+
+        assert_eq!(&frame[..4], &[0x0D, 0x0A, 0x20, 0xFF]);
+    }
 }
