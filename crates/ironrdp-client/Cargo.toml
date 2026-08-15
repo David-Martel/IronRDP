@@ -78,6 +78,8 @@ ironrdp-egfx = { path = "../ironrdp-egfx", version = "0.1", optional = true }
 # Windowing and rendering
 winit = { version = "0.30", features = ["rwh_06"] }
 softbuffer = "0.4"
+egui = "0.29"
+egui-winit = { version = "0.29", default-features = false, features = ["wayland", "x11", "clipboard"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "cargo"] }
@@ -98,6 +100,9 @@ socket2 = "0.6"
 
 # Utils
 whoami = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs-next = "2.0"
 anyhow = "1"
 mimalloc = "0.1"
 smallvec = "1.15"
