@@ -18,7 +18,7 @@ namespace Devolutions.IronRdp.ConnectExample
 
             var serverName = arguments["--serverName"];
             var username = arguments["--username"];
-            var password = arguments["--password"];
+            var password = ReadPassword();
             var domain = arguments["--domain"];
 
             try
@@ -160,7 +160,7 @@ namespace Devolutions.IronRdp.ConnectExample
 
         static bool IsValidArgument(string argument)
         {
-            var validArguments = new List<string> { "--serverName", "--username", "--password", "--domain" };
+            var validArguments = new List<string> { "--serverName", "--username", "--domain" };
             return validArguments.Contains(argument);
         }
 
@@ -170,9 +170,56 @@ namespace Devolutions.IronRdp.ConnectExample
             Console.WriteLine("Options:");
             Console.WriteLine("  --serverName <serverName>  The name of the server to connect to.");
             Console.WriteLine("  --username <username>      The username for connection.");
-            Console.WriteLine("  --password <password>      The password for connection.");
             Console.WriteLine("  --domain <domain>          The domain of the server.");
             Console.WriteLine("  --help                     Show this message and exit.");
+            Console.WriteLine("The password is read from redirected standard input or a masked interactive prompt.");
+        }
+
+        static string ReadPassword()
+        {
+            if (Console.IsInputRedirected)
+            {
+                var redirectedPassword = Console.In.ReadLine();
+                if (string.IsNullOrEmpty(redirectedPassword))
+                {
+                    throw new InvalidOperationException("password input is empty");
+                }
+
+                return redirectedPassword;
+            }
+
+            Console.Write("Password: ");
+            var password = new System.Text.StringBuilder();
+            while (true)
+            {
+                var key = Console.ReadKey(intercept: true);
+                if (key.Key == ConsoleKey.Enter)
+                {
+                    Console.WriteLine();
+                    break;
+                }
+
+                if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (password.Length != 0)
+                    {
+                        password.Length--;
+                    }
+                    continue;
+                }
+
+                if (!char.IsControl(key.KeyChar))
+                {
+                    password.Append(key.KeyChar);
+                }
+            }
+
+            if (password.Length == 0)
+            {
+                throw new InvalidOperationException("password input is empty");
+            }
+
+            return password.ToString();
         }
 
         private static Config buildConfig(string username, string password, string domain, int width, int height)

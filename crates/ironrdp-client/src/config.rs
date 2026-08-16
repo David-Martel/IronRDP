@@ -345,6 +345,13 @@ struct Args {
     #[clap(short, long)]
     password: Option<String>,
 
+    /// Read the target RDP server password from standard input
+    ///
+    /// Intended for unattended callers that can provide a private pipe. The input is bounded
+    /// and is never written to logs or the process command line.
+    #[clap(long, conflicts_with = "password")]
+    password_stdin: bool,
+
     /// Proxy URL to connect to for the RDCleanPath
     #[clap(long, requires("rdcleanpath_token"))]
     rdcleanpath_url: Option<Url>,
@@ -621,6 +628,8 @@ impl Config {
 
         let password = if let Some(password) = args.password {
             password
+        } else if args.password_stdin {
+            read_password_from(std::io::stdin().lock()).context("read password from standard input")?
         } else if let Some(password) = properties.clear_text_password() {
             password.to_owned()
         } else {
@@ -807,12 +816,87 @@ impl Config {
     }
 }
 
+fn read_password_from(reader: impl std::io::Read) -> anyhow::Result<String> {
+    use std::io::Read as _;
+
+    const MAX_PASSWORD_BYTES: usize = 16 * 1024;
+
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(128));
+    let input_limit = u64::try_from(MAX_PASSWORD_BYTES + 1).context("password input limit")?;
+    reader
+        .take(input_limit)
+        .read_to_end(&mut bytes)
+        .context("read password input")?;
+
+    if MAX_PASSWORD_BYTES < bytes.len() {
+        anyhow::bail!("password input exceeds {MAX_PASSWORD_BYTES} bytes");
+    }
+
+    while matches!(bytes.last(), Some(b'\r' | b'\n')) {
+        bytes.pop();
+    }
+
+    if bytes.is_empty() {
+        anyhow::bail!("password input is empty");
+    }
+
+    let password = core::str::from_utf8(&bytes).context("password input is not valid UTF-8")?;
+    Ok(password.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
     use ironrdp::pdu::gcc::MultiTransportFlags;
 
-    use super::{Args, MultitransportMode, multitransport_flags_from_mode, resolve_desktop_size};
+    use super::{Args, MultitransportMode, multitransport_flags_from_mode, read_password_from, resolve_desktop_size};
+
+    #[test]
+    fn password_stdin_conflicts_with_password_argument() {
+        let error = Args::try_parse_from([
+            "ironrdp-client",
+            "server.example",
+            "--password",
+            "not-a-real-secret",
+            "--password-stdin",
+        ])
+        .expect_err("password sources must be mutually exclusive");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn reads_bounded_password_from_standard_input() {
+        let password = read_password_from(std::io::Cursor::new(b"not-a-real-secret\r\n"))
+            .expect("valid password input should be accepted");
+
+        assert_eq!(password, "not-a-real-secret");
+    }
+
+    #[test]
+    fn rejects_empty_password_from_standard_input() {
+        let error =
+            read_password_from(std::io::Cursor::new(b"\r\n")).expect_err("empty password input must be rejected");
+
+        assert!(error.to_string().contains("password input is empty"));
+    }
+
+    #[test]
+    fn rejects_oversized_password_from_standard_input() {
+        let input = vec![b'x'; 16 * 1024 + 1];
+        let error =
+            read_password_from(std::io::Cursor::new(input)).expect_err("oversized password input must be rejected");
+
+        assert!(error.to_string().contains("password input exceeds"));
+    }
+
+    #[test]
+    fn rejects_non_utf8_password_from_standard_input() {
+        let error =
+            read_password_from(std::io::Cursor::new([0xff])).expect_err("non-UTF-8 password input must be rejected");
+
+        assert!(error.to_string().contains("not valid UTF-8"));
+    }
 
     #[test]
     fn resolve_desktop_size_prefers_cli_values() {

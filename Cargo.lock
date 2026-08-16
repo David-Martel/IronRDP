@@ -2334,6 +2334,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]
@@ -2447,6 +2448,7 @@ dependencies = [
  "windows",
  "winit",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]

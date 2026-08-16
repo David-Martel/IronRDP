@@ -8,7 +8,7 @@ param(
 
     [string]$Publisher = 'CN=David-Martel IronRDP Test',
     [string]$CertificatePath,
-    [string]$CertificatePassword,
+    [System.Security.SecureString]$CertificatePassword,
     [string]$OutputJsonPath,
     [string]$ReleaseRepo,
     [string]$ReleaseTag,
@@ -130,6 +130,20 @@ function ConvertTo-MsiVersion {
     return '{0}.0.0' -f $parts[0]
 }
 
+function Remove-SigningCertificate {
+    param([Parameter(Mandatory)][string]$Thumbprint)
+
+    $certificateStorePath = "Cert:\CurrentUser\My\$Thumbprint"
+    if (-not (Test-Path -LiteralPath $certificateStorePath)) {
+        return
+    }
+
+    Remove-Item -LiteralPath $certificateStorePath -DeleteKey -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $certificateStorePath) {
+        throw "failed to remove signing certificate and private key: $Thumbprint"
+    }
+}
+
 function Sanitize-Xml {
     param([Parameter(Mandatory)][string]$Value)
 
@@ -228,51 +242,69 @@ function New-SigningMaterial {
         [Parameter(Mandatory)][string]$OutputDirectory,
         [Parameter(Mandatory)][string]$RequestedPublisher,
         [string]$ProvidedCertificatePath,
-        [string]$ProvidedCertificatePassword
+        [System.Security.SecureString]$ProvidedCertificatePassword
     )
 
     New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
     if (-not [string]::IsNullOrWhiteSpace($ProvidedCertificatePath)) {
-        $certPassword = if ([string]::IsNullOrWhiteSpace($ProvidedCertificatePassword)) {
-            $null
+        $resolvedCertificatePath = (Resolve-Path -LiteralPath $ProvidedCertificatePath).Path
+        $existingThumbprints = @(Get-ChildItem -LiteralPath 'Cert:\CurrentUser\My' | Select-Object -ExpandProperty Thumbprint)
+        $importedCertificates = if ($ProvidedCertificatePassword) {
+            @(Import-PfxCertificate `
+                -FilePath $resolvedCertificatePath `
+                -CertStoreLocation 'Cert:\CurrentUser\My' `
+                -Password $ProvidedCertificatePassword)
         } else {
-            ConvertTo-SecureString -String $ProvidedCertificatePassword -AsPlainText -Force
+            @(Import-PfxCertificate `
+                -FilePath $resolvedCertificatePath `
+                -CertStoreLocation 'Cert:\CurrentUser\My')
+        }
+        $certificate = $importedCertificates |
+            Where-Object HasPrivateKey |
+            Select-Object -First 1
+        if (-not $certificate) {
+            throw "PFX did not contain a certificate with a private key: $resolvedCertificatePath"
         }
 
-        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-            (Resolve-Path -LiteralPath $ProvidedCertificatePath).Path,
-            $ProvidedCertificatePassword
+        $importedThumbprintsToRemove = @(
+            $importedCertificates |
+                Where-Object { $_.Thumbprint -notin $existingThumbprints } |
+                Select-Object -ExpandProperty Thumbprint -Unique
         )
+        try {
+            $cerPath = Join-Path $OutputDirectory 'IronRDP-signing.cer'
+            Export-Certificate -Cert $certificate -FilePath $cerPath -Type CERT | Out-Null
 
-        $cerPath = Join-Path $OutputDirectory 'IronRDP-signing.cer'
-        Export-Certificate -Cert $certificate -FilePath $cerPath -Type CERT | Out-Null
-
-        return @{
-            Publisher = $certificate.Subject
-            PfxPath = (Resolve-Path -LiteralPath $ProvidedCertificatePath).Path
-            Password = $ProvidedCertificatePassword
-            CerPath = $cerPath
-            Temporary = $false
+            return @{
+                Publisher = $certificate.Subject
+                CerPath = $cerPath
+                ImportedThumbprintsToRemove = $importedThumbprintsToRemove
+                Thumbprint = $certificate.Thumbprint
+            }
+        } catch {
+            foreach ($thumbprint in $importedThumbprintsToRemove) {
+                Remove-SigningCertificate -Thumbprint $thumbprint
+            }
+            throw
         }
     }
 
     $subject = $RequestedPublisher
     $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddYears(2)
-    $passwordText = [Guid]::NewGuid().ToString('N')
-    $password = ConvertTo-SecureString -String $passwordText -AsPlainText -Force
-    $pfxPath = Join-Path $OutputDirectory 'IronRDP-test-signing.pfx'
-    $cerPath = Join-Path $OutputDirectory 'IronRDP-test-signing.cer'
-    Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $password | Out-Null
-    Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
+    try {
+        $cerPath = Join-Path $OutputDirectory 'IronRDP-test-signing.cer'
+        Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
 
-    return @{
-        Publisher = $cert.Subject
-        PfxPath = $pfxPath
-        Password = $passwordText
-        CerPath = $cerPath
-        Temporary = $true
-        Thumbprint = $cert.Thumbprint
+        return @{
+            Publisher = $cert.Subject
+            CerPath = $cerPath
+            ImportedThumbprintsToRemove = @($cert.Thumbprint)
+            Thumbprint = $cert.Thumbprint
+        }
+    } catch {
+        Remove-SigningCertificate -Thumbprint $cert.Thumbprint
+        throw
     }
 }
 
@@ -282,8 +314,7 @@ function New-MsixInstaller {
         [Parameter(Mandatory)][string]$OutputDirectory,
         [Parameter(Mandatory)][string]$Version,
         [Parameter(Mandatory)][string]$PublisherName,
-        [Parameter(Mandatory)][string]$CertificatePath,
-        [Parameter(Mandatory)][string]$CertificatePassword,
+        [Parameter(Mandatory)][string]$CertificateThumbprint,
         [string]$ReleaseRepo,
         [string]$ReleaseTag
     )
@@ -360,7 +391,7 @@ function New-MsixInstaller {
         throw 'MakeAppx packaging failed'
     }
 
-    & $signTool sign /fd SHA256 /f $CertificatePath /p $CertificatePassword $msixPath | Out-Host
+    & $signTool sign /fd SHA256 /sha1 $CertificateThumbprint $msixPath | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw 'SignTool signing failed for MSIX package'
     }
@@ -410,8 +441,7 @@ function New-MsiInstaller {
         [Parameter(Mandatory)][string]$OutputDirectory,
         [Parameter(Mandatory)][string]$Version,
         [Parameter(Mandatory)][string]$Manufacturer,
-        [Parameter(Mandatory)][string]$CertificatePath,
-        [Parameter(Mandatory)][string]$CertificatePassword
+        [Parameter(Mandatory)][string]$CertificateThumbprint
     )
 
     $wix = Ensure-WixTools
@@ -483,7 +513,7 @@ function New-MsiInstaller {
             throw 'WiX light link failed'
         }
 
-        & $signTool sign /fd SHA256 /f $CertificatePath /p $CertificatePassword $msiPath | Out-Host
+        & $signTool sign /fd SHA256 /sha1 $CertificateThumbprint $msiPath | Out-Host
         if ($LASTEXITCODE -ne 0) {
             throw 'SignTool signing failed for MSI package'
         }
@@ -504,50 +534,52 @@ $version = ConvertTo-AppInstallerVersion -VersionText $manifest.version.FileVers
 
 $signingDir = Join-Path $resolvedOutputRoot 'certificates'
 $signing = New-SigningMaterial -OutputDirectory $signingDir -RequestedPublisher $Publisher -ProvidedCertificatePath $CertificatePath -ProvidedCertificatePassword $CertificatePassword
-
-$stageRoot = Initialize-InstallerStage -SourceRoot $resolvedPackageRoot -StageRoot (Join-Path $resolvedOutputRoot 'stage')
-$artifacts = New-Object System.Collections.Generic.List[object]
-
-if (-not $SkipMsix) {
-    foreach ($artifact in (New-MsixInstaller -StageRoot $stageRoot -OutputDirectory (Join-Path $resolvedOutputRoot 'msix') -Version $version -PublisherName $signing.Publisher -CertificatePath $signing.PfxPath -CertificatePassword $signing.Password -ReleaseRepo $ReleaseRepo -ReleaseTag $ReleaseTag)) {
-        $artifacts.Add($artifact)
-    }
-}
-
-if (-not $SkipMsi) {
-    $artifacts.Add((New-MsiInstaller -StageRoot $stageRoot -OutputDirectory (Join-Path $resolvedOutputRoot 'msi') -Version $version -Manufacturer $signing.Publisher -CertificatePath $signing.PfxPath -CertificatePassword $signing.Password))
-}
-
+$stagePath = Join-Path $resolvedOutputRoot 'stage'
 $intermediatePaths = @(
-    $stageRoot,
+    $stagePath,
     (Join-Path $resolvedOutputRoot 'msix\layout'),
     (Join-Path $resolvedOutputRoot 'msi\wix')
 )
 
-foreach ($path in $intermediatePaths) {
-    if (Test-Path -LiteralPath $path) {
-        Remove-Item -LiteralPath $path -Recurse -Force
+try {
+    $stageRoot = Initialize-InstallerStage -SourceRoot $resolvedPackageRoot -StageRoot $stagePath
+    $artifacts = New-Object System.Collections.Generic.List[object]
+
+    if (-not $SkipMsix) {
+        foreach ($artifact in (New-MsixInstaller -StageRoot $stageRoot -OutputDirectory (Join-Path $resolvedOutputRoot 'msix') -Version $version -PublisherName $signing.Publisher -CertificateThumbprint $signing.Thumbprint -ReleaseRepo $ReleaseRepo -ReleaseTag $ReleaseTag)) {
+            $artifacts.Add($artifact)
+        }
+    }
+
+    if (-not $SkipMsi) {
+        $artifacts.Add((New-MsiInstaller -StageRoot $stageRoot -OutputDirectory (Join-Path $resolvedOutputRoot 'msi') -Version $version -Manufacturer $signing.Publisher -CertificateThumbprint $signing.Thumbprint))
+    }
+
+    $artifacts.Add([pscustomobject]@{
+        kind = 'signing-certificate'
+        path = $signing.CerPath
+    })
+
+    $output = [pscustomobject]@{
+        publisher = $signing.Publisher
+        version = $version
+        artifacts = $artifacts
+    }
+
+    $json = $output | ConvertTo-Json -Depth 5
+    if (-not [string]::IsNullOrWhiteSpace($OutputJsonPath)) {
+        Set-Content -LiteralPath $OutputJsonPath -Value $json -Encoding UTF8
+    }
+
+    $json
+} finally {
+    foreach ($path in $intermediatePaths) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            Remove-Item -LiteralPath $path -Recurse -Force
+        }
+    }
+
+    foreach ($thumbprint in $signing.ImportedThumbprintsToRemove) {
+        Remove-SigningCertificate -Thumbprint $thumbprint
     }
 }
-
-if ($signing.Temporary -and (Test-Path -LiteralPath $signing.PfxPath)) {
-    Remove-Item -LiteralPath $signing.PfxPath -Force
-}
-
-$artifacts.Add([pscustomobject]@{
-    kind = 'signing-certificate'
-    path = $signing.CerPath
-})
-
-$output = [pscustomobject]@{
-    publisher = $signing.Publisher
-    version = $version
-    artifacts = $artifacts
-}
-
-$json = $output | ConvertTo-Json -Depth 5
-if (-not [string]::IsNullOrWhiteSpace($OutputJsonPath)) {
-    Set-Content -LiteralPath $OutputJsonPath -Value $json -Encoding UTF8
-}
-
-$json

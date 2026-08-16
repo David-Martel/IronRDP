@@ -34,8 +34,11 @@ Supported codecs:
 A full-fledged RDP client based on IronRDP crates suite, and implemented using non-blocking, asynchronous I/O.
 
 ```shell
-cargo run --bin ironrdp-client -- <HOSTNAME> --username <USERNAME> --password <PASSWORD>
+cargo run --bin ironrdp-client -- <HOSTNAME> --username <USERNAME>
 ```
+
+The client prompts for the password without echoing it.
+Unattended callers should use `--password-stdin` with a private pipe; do not put passwords in shell history or process arguments.
 
 ## Windows Build And Deployment
 
@@ -208,10 +211,10 @@ of code by leveraging the IronRDP crates suite.
 
 In this basic client implementation, the client establishes a connection
 with the destination server, decodes incoming graphics updates, and saves the
-resulting output as a BMP image file on the disk.
+resulting output as a PNG image file on the disk.
 
 ```shell
-cargo run --example=screenshot -- --host <HOSTNAME> --username <USERNAME> --password <PASSWORD> --output out.bmp
+printf '%s\n' "$RDP_PASSWORD" | cargo run --example=screenshot -- --host <HOSTNAME> --username <USERNAME> --password-stdin --output out.png
 ```
 
 ### How to enable RemoteFX on server

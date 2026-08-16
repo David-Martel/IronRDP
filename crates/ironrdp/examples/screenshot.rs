@@ -11,7 +11,7 @@
 //! # Usage example
 //!
 //! ```shell
-//! cargo run --example=screenshot -- --host <HOSTNAME> -u <USERNAME> -p <PASSWORD> -o out.png
+//! printf '%s\n' "$RDP_PASSWORD" | cargo run --example=screenshot -- --host <HOSTNAME> -u <USERNAME> --password-stdin -o out.png
 //! ```
 
 #![allow(unused_crate_dependencies)] // false positives because there is both a library and a binary
@@ -38,7 +38,7 @@ use tracing::{debug, info, trace};
 const HELP: &str = "\
 USAGE:
   cargo run --example=screenshot -- --host <HOSTNAME> --port <PORT>
-                                    -u/--username <USERNAME> -p/--password <PASSWORD>
+                                    -u/--username <USERNAME> --password-stdin
                                     [-o/--output <OUTPUT_FILE>] [-d/--domain <DOMAIN>]
                                     [--compression-enabled <true|false>] [--compression-level <0..3>]
 ";
@@ -129,7 +129,12 @@ fn parse_args() -> anyhow::Result<Action> {
         let host = args.value_from_str("--host")?;
         let port = args.opt_value_from_str("--port")?.unwrap_or(3389);
         let username = args.value_from_str(["-u", "--username"])?;
-        let pass_token = args.value_from_str(["-p", "--password"])?;
+        let password_stdin = args.contains("--password-stdin");
+        let pass_token = if password_stdin {
+            read_password_from(std::io::stdin().lock()).context("read password from standard input")?
+        } else {
+            anyhow::bail!("--password-stdin is required");
+        };
         let output = args
             .opt_value_from_str(["-o", "--output"])?
             .unwrap_or_else(|| PathBuf::from("out.png"));
@@ -154,6 +159,47 @@ fn parse_args() -> anyhow::Result<Action> {
     };
 
     Ok(action)
+}
+
+fn read_password_from(reader: impl std::io::Read) -> anyhow::Result<String> {
+    use std::io::Read as _;
+
+    const MAX_PASSWORD_BYTES: usize = 16 * 1024;
+
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(128));
+    let input_limit = u64::try_from(MAX_PASSWORD_BYTES + 1).context("password input limit")?;
+    reader
+        .take(input_limit)
+        .read_to_end(&mut bytes)
+        .context("read password input")?;
+
+    if MAX_PASSWORD_BYTES < bytes.len() {
+        anyhow::bail!("password input exceeds {MAX_PASSWORD_BYTES} bytes");
+    }
+
+    while matches!(bytes.last(), Some(b'\r' | b'\n')) {
+        bytes.pop();
+    }
+
+    if bytes.is_empty() {
+        anyhow::bail!("password input is empty");
+    }
+
+    let password = core::str::from_utf8(&bytes).context("password input is not valid UTF-8")?;
+    Ok(password.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_password_from;
+
+    #[test]
+    fn rejects_non_utf8_password_input() {
+        let error =
+            read_password_from(std::io::Cursor::new([0xff])).expect_err("non-UTF-8 password input must be rejected");
+
+        assert!(error.to_string().contains("not valid UTF-8"));
+    }
 }
 
 fn setup_logging() -> anyhow::Result<()> {

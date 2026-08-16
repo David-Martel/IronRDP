@@ -11,7 +11,7 @@ param(
 
     [string]$VmName = 'WS2025-ReFS-Repair',
     [string]$Username = 'IronRdpLab',
-    [string]$Password = 'TempIronRdp!2026',
+    [System.Management.Automation.PSCredential]$Credential,
     [ValidateSet('quick', 'full')]
     [string]$ScenarioSet = 'quick',
     [int]$DurationSeconds = 30,
@@ -97,20 +97,20 @@ function Resolve-ReachableGuestEndpoint {
 function New-GuestCredential {
     param(
         [Parameter(Mandatory)][string]$Username,
-        [Parameter(Mandatory)][string]$Password
+        [Parameter(Mandatory)][System.Security.SecureString]$Password
     )
 
-    New-Object System.Management.Automation.PSCredential(".\$Username", (ConvertTo-SecureString $Password -AsPlainText -Force))
+    New-Object System.Management.Automation.PSCredential(".\$Username", $Password.Copy())
 }
 
 function New-WinRmGuestCredential {
     param(
         [Parameter(Mandatory)][string]$ComputerNameHint,
         [Parameter(Mandatory)][string]$Username,
-        [Parameter(Mandatory)][string]$Password
+        [Parameter(Mandatory)][System.Security.SecureString]$Password
     )
 
-    New-Object System.Management.Automation.PSCredential("$ComputerNameHint\$Username", (ConvertTo-SecureString $Password -AsPlainText -Force))
+    New-Object System.Management.Automation.PSCredential("$ComputerNameHint\$Username", $Password.Copy())
 }
 
 function Ensure-TrustedHost {
@@ -155,8 +155,67 @@ function Ensure-GuestCredentialStored {
         [Parameter(Mandatory)][string]$VmName,
         [Parameter(Mandatory)][string]$ComputerName,
         [Parameter(Mandatory)][string]$Username,
-        [Parameter(Mandatory)][string]$Password
+        [Parameter(Mandatory)][System.Security.SecureString]$Password
     )
+
+    if (-not ('IronRdpCredentialInterop' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security;
+
+public static class IronRdpCredentialInterop
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct NativeCredential
+    {
+        public uint Flags;
+        public uint Type;
+        public string TargetName;
+        public string Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public uint Persist;
+        public uint AttributeCount;
+        public IntPtr Attributes;
+        public string TargetAlias;
+        public string UserName;
+    }
+
+    [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CredWrite(ref NativeCredential credential, uint flags);
+
+    public static void WriteGeneric(string target, string userName, SecureString password)
+    {
+        IntPtr passwordPointer = Marshal.SecureStringToBSTR(password);
+        try
+        {
+            var credential = new NativeCredential
+            {
+                Type = 1,
+                TargetName = target,
+                CredentialBlobSize = checked((uint)password.Length * 2),
+                CredentialBlob = passwordPointer,
+                Persist = 2,
+                UserName = userName,
+            };
+
+            if (!CredWrite(ref credential, 0))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+        }
+        finally
+        {
+            Marshal.ZeroFreeBSTR(passwordPointer);
+        }
+    }
+}
+'@
+    }
 
     $userId = "$VmName\$Username"
     $targets = @(
@@ -166,7 +225,7 @@ function Ensure-GuestCredentialStored {
     ) | Select-Object -Unique
 
     foreach ($target in $targets) {
-        & cmdkey.exe /generic:$target /user:$userId /pass:$Password | Out-Null
+        [IronRdpCredentialInterop]::WriteGeneric($target, $userId, $Password)
     }
 }
 
@@ -582,7 +641,6 @@ function Invoke-GuestWorkload {
         return $result
     }
 
-    $plainPassword = $Credential.GetNetworkCredential().Password
     $interactiveLaunchError = $null
 
     if ($ClientProcess) {
@@ -625,7 +683,7 @@ function Invoke-GuestWorkload {
     }
 
     Invoke-GuestCommand -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
-        param($Workload, $UserName, $Password, $InteractiveLaunchError)
+        param($Workload, $UserName, $InteractiveLaunchError)
 
         $startMap = @{
             notepad = @{ filePath = 'notepad.exe'; processName = 'notepad'; arguments = $null }
@@ -668,36 +726,22 @@ function Invoke-GuestWorkload {
             }
         }
 
-        function New-ScheduledTaskCommandLine {
-            param([Parameter(Mandatory)][object]$WorkloadSpec)
-
-            if ([string]::IsNullOrWhiteSpace($WorkloadSpec.arguments)) {
-                return $WorkloadSpec.filePath
-            }
-
-            return '"{0}" {1}' -f $WorkloadSpec.filePath, $WorkloadSpec.arguments
-        }
-
         function Start-InteractiveScheduledTask {
             param(
                 [Parameter(Mandatory)][string]$TaskName,
                 [Parameter(Mandatory)][object]$WorkloadSpec,
-                [Parameter(Mandatory)][string]$UserName,
-                [Parameter(Mandatory)][string]$Password
+                [Parameter(Mandatory)][string]$UserName
             )
 
-            $startTime = (Get-Date).AddMinutes(1).ToString('HH:mm')
-            $taskCommand = New-ScheduledTaskCommandLine -WorkloadSpec $WorkloadSpec
-
-            & schtasks.exe /Create /TN $TaskName /SC ONCE /ST $startTime /RL HIGHEST /RU $UserName /RP $Password /IT /TR $taskCommand /F | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw "schtasks /Create failed with exit code $LASTEXITCODE"
+            $action = if ([string]::IsNullOrWhiteSpace($WorkloadSpec.arguments)) {
+                New-ScheduledTaskAction -Execute $WorkloadSpec.filePath
+            } else {
+                New-ScheduledTaskAction -Execute $WorkloadSpec.filePath -Argument $WorkloadSpec.arguments
             }
-
-            & schtasks.exe /Run /TN $TaskName | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw "schtasks /Run failed with exit code $LASTEXITCODE"
-            }
+            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
+            $principal = New-ScheduledTaskPrincipal -UserId $UserName -LogonType Interactive -RunLevel Highest
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+            Start-ScheduledTask -TaskName $TaskName
         }
 
         $taskName = "IronRdp-E2E-$([Guid]::NewGuid().ToString('N'))"
@@ -712,7 +756,7 @@ function Invoke-GuestWorkload {
         try {
             if ($interactiveSession) {
                 try {
-                    Start-InteractiveScheduledTask -TaskName $interactiveTaskName -WorkloadSpec $workloadSpec -UserName $interactiveSession.userName -Password $Password
+                    Start-InteractiveScheduledTask -TaskName $interactiveTaskName -WorkloadSpec $workloadSpec -UserName $interactiveSession.userName
                     $launchMode = 'scheduled-task-interactive-token'
 
                     do {
@@ -746,7 +790,7 @@ function Invoke-GuestWorkload {
             if (-not $process) {
             try {
                 $normalizedUserName = $UserName -replace '^[.\\]+', ''
-                Start-InteractiveScheduledTask -TaskName $taskName -WorkloadSpec $workloadSpec -UserName $normalizedUserName -Password $Password
+                Start-InteractiveScheduledTask -TaskName $taskName -WorkloadSpec $workloadSpec -UserName $normalizedUserName
             } catch {
                 $launchMode = 'start-process-fallback'
                 $scheduledTaskError = ($_ | Out-String).Trim()
@@ -796,7 +840,7 @@ function Invoke-GuestWorkload {
     } finally {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
     }
-} -ArgumentList $Workload, $Credential.UserName, $plainPassword, $interactiveLaunchError
+} -ArgumentList $Workload, $Credential.UserName, $interactiveLaunchError
 }
 
 function Get-GuestFeatureSnapshot {
@@ -1483,6 +1527,43 @@ function Get-ScenarioDefinitions {
     return @($baseline, $resize, $outage)
 }
 
+function Start-IronRdpClientWithCredential {
+    param(
+        [Parameter(Mandatory)][string]$ClientExe,
+        [Parameter(Mandatory)][System.Collections.Generic.List[string]]$Arguments,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ClientExe
+    $startInfo.WorkingDirectory = Split-Path -Parent $ClientExe
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.Environment['IRONRDP_LOG'] = 'info,ironrdp_client=trace,ironrdp_connector=debug,ironrdp_session=debug,ironrdp_cliprdr=trace,ironrdp_rdpsnd=debug,ironrdp_rdpsnd_native=debug'
+    foreach ($argument in $Arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw 'failed to start IronRDP client'
+    }
+
+    $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+    try {
+        for ($index = 0; $index -lt $Credential.Password.Length; $index++) {
+            $process.StandardInput.Write([char][Runtime.InteropServices.Marshal]::ReadInt16($passwordPointer, $index * 2))
+        }
+        $process.StandardInput.WriteLine()
+    } finally {
+        $process.StandardInput.Close()
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
+    }
+
+    $process
+}
+
 function Invoke-Scenario {
     param(
         [Parameter(Mandatory)][pscustomobject]$Scenario,
@@ -1491,7 +1572,6 @@ function Invoke-Scenario {
         [Parameter(Mandatory)][string]$VmName,
         [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential,
         [Parameter(Mandatory)][string]$Username,
-        [Parameter(Mandatory)][string]$Password,
         [Parameter(Mandatory)][string]$OutputRoot,
         [Parameter(Mandatory)][int]$DurationSeconds,
         [Parameter(Mandatory)][int]$SampleIntervalMs,
@@ -1516,8 +1596,7 @@ function Invoke-Scenario {
     $arguments.Add($Destination)
     $arguments.Add('--username')
     $arguments.Add($Username)
-    $arguments.Add('--password')
-    $arguments.Add($Password)
+    $arguments.Add('--password-stdin')
     $arguments.Add('--width')
     $arguments.Add($Width.ToString([System.Globalization.CultureInfo]::InvariantCulture))
     $arguments.Add('--height')
@@ -1533,9 +1612,7 @@ function Invoke-Scenario {
         $arguments.Add($Multitransport)
     }
 
-    $process = Start-Process -FilePath $ClientExe -ArgumentList $arguments -WorkingDirectory (Split-Path -Parent $ClientExe) -PassThru -Environment @{
-        IRONRDP_LOG = 'info,ironrdp_client=trace,ironrdp_connector=debug,ironrdp_session=debug,ironrdp_cliprdr=trace,ironrdp_rdpsnd=debug,ironrdp_rdpsnd_native=debug'
-    }
+    $process = Start-IronRdpClientWithCredential -ClientExe $ClientExe -Arguments $arguments -Credential $Credential
 
     $process = Wait-ForMainWindow -ProcessId $process.Id -TimeoutSeconds 15
     if (-not $process) {
@@ -1739,11 +1816,16 @@ $outputPath = if ($OutputRoot) {
 }
 New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
 
+if (-not $Credential) {
+    $Credential = Get-Credential -UserName $Username -Message "Credentials for Hyper-V guest '$VmName'"
+}
+$guestUsername = (($Credential.UserName -replace '^[.\\]+', '') -split '\\')[-1]
+
 $guest = Resolve-ReachableGuestEndpoint -VmName $VmName
-$powerShellDirectCredential = New-GuestCredential -Username $Username -Password $Password
-$winRmCredential = New-WinRmGuestCredential -ComputerNameHint $VmName -Username $Username -Password $Password
+$powerShellDirectCredential = New-GuestCredential -Username $guestUsername -Password $Credential.Password
+$winRmCredential = New-WinRmGuestCredential -ComputerNameHint $VmName -Username $guestUsername -Password $Credential.Password
 Ensure-GuestWinRm -VmName $VmName -ComputerName $guest.selected.ipAddress -PowerShellDirectCredential $powerShellDirectCredential -WinRmCredential $winRmCredential
-Ensure-GuestCredentialStored -VmName $VmName -ComputerName $guest.selected.ipAddress -Username $Username -Password $Password
+Ensure-GuestCredentialStored -VmName $VmName -ComputerName $guest.selected.ipAddress -Username $guestUsername -Password $Credential.Password
 $guestFeatureSnapshot = Get-GuestFeatureSnapshot -ComputerName $guest.selected.ipAddress -Credential $winRmCredential
 $clientCapabilities = Get-ClientCapabilityProfile -ClipboardType $ClipboardType -GuestFeatureSnapshot $guestFeatureSnapshot
 $scenarios = Get-ScenarioDefinitions -ScenarioSet $ScenarioSet -ClipboardType $ClipboardType
@@ -1757,8 +1839,7 @@ foreach ($scenario in $scenarios) {
             -Destination $guest.selected.ipAddress `
             -VmName $VmName `
             -Credential $winRmCredential `
-            -Username $Username `
-            -Password $Password `
+            -Username $guestUsername `
             -OutputRoot $outputPath `
             -DurationSeconds $DurationSeconds `
             -SampleIntervalMs $SampleIntervalMs `

@@ -24,8 +24,8 @@ The project uses `cargo` and a custom `xtask` automation runner.
 
 - **Bootstrap Environment**: `cargo xtask bootstrap` (Installs necessary development tools).
 - **Run Full CI Suite**: `cargo xtask ci` (Runs fmt, typos, tests, lints, fuzzing, and FFI checks).
-- **Run RDP Client**: `cargo run --bin ironrdp-client -- <HOSTNAME> --username <USERNAME> --password <PASSWORD>`
-- **Run Screenshot Example**: `cargo run --example=screenshot -- --host <HOSTNAME> --username <USERNAME> --password <PASSWORD> --output out.bmp`
+- **Run RDP Client**: `cargo run --bin ironrdp-client -- <HOSTNAME> --username <USERNAME>` (uses the masked interactive password prompt).
+- **Run Screenshot Example**: pipe a password to `cargo run --example=screenshot -- --host <HOSTNAME> --username <USERNAME> --password-stdin --output out.png`; never put the password in process arguments.
 - **Fuzzing**: `cargo xtask fuzz run` (Runs the fuzzer on core PDU targets).
 - **Coverage**: `cargo xtask cov report` (Generates a coverage report).
 

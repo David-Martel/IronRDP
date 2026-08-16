@@ -11,7 +11,7 @@ param(
 
     [string]$LaunchHost,
     [string]$Username,
-    [string]$Password,
+    [System.Management.Automation.PSCredential]$Credential,
     [int]$ConnectSeconds = 20,
     [string]$ConnectionLogPath,
     [ValidateSet('off', 'prefer-reliable', 'reliable', 'prefer-lossy', 'lossy')]
@@ -85,7 +85,7 @@ function Get-LiveConnectSummary {
         [Parameter(Mandatory)][string]$ClientExe,
         [Parameter(Mandatory)][string]$Destination,
         [string]$Username,
-        [string]$Password,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential,
         [int]$ConnectSeconds,
         [string]$ConnectionLogPath,
         [string]$Multitransport,
@@ -116,10 +116,7 @@ function Get-LiveConnectSummary {
         $arguments.Add($Username)
     }
 
-    if ($Password) {
-        $arguments.Add('--password')
-        $arguments.Add($Password)
-    }
+    $arguments.Add('--password-stdin')
 
     $arguments.Add('--width')
     $arguments.Add($Width.ToString([System.Globalization.CultureInfo]::InvariantCulture))
@@ -136,18 +133,33 @@ function Get-LiveConnectSummary {
         $arguments.Add($Multitransport)
     }
 
-    $startInfo = @{
-        FilePath = $ClientExe
-        ArgumentList = $arguments
-        WorkingDirectory = Split-Path -Parent $ClientExe
-        PassThru = $true
-        WindowStyle = 'Minimized'
-        Environment = @{
-            IRONRDP_LOG = 'info,ironrdp_client=trace,ironrdp_connector=debug,ironrdp_session=debug'
-        }
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ClientExe
+    $startInfo.WorkingDirectory = Split-Path -Parent $ClientExe
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Minimized
+    $startInfo.Environment['IRONRDP_LOG'] = 'info,ironrdp_client=trace,ironrdp_connector=debug,ironrdp_session=debug'
+    foreach ($argument in $arguments) {
+        $startInfo.ArgumentList.Add($argument)
     }
 
-    $process = Start-Process @startInfo
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw 'failed to start IronRDP client'
+    }
+
+    $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+    try {
+        for ($index = 0; $index -lt $Credential.Password.Length; $index++) {
+            $process.StandardInput.Write([char][Runtime.InteropServices.Marshal]::ReadInt16($passwordPointer, $index * 2))
+        }
+        $process.StandardInput.WriteLine()
+    } finally {
+        $process.StandardInput.Close()
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
+    }
     $startedAt = Get-Date
     $process | Wait-Process -Timeout $ConnectSeconds -ErrorAction SilentlyContinue
     $timedOut = -not $process.HasExited
@@ -258,12 +270,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $connection = $null
-if ($LaunchHost -and $Password) {
+if ($LaunchHost -and $Credential) {
+    $connectionUsername = if ($Username) { $Username } else { $Credential.UserName }
     $connection = Get-LiveConnectSummary `
         -ClientExe $clientExe `
         -Destination $LaunchHost `
-        -Username $Username `
-        -Password $Password `
+        -Username $connectionUsername `
+        -Credential $Credential `
         -ConnectSeconds $ConnectSeconds `
         -ConnectionLogPath $ConnectionLogPath `
         -Multitransport $Multitransport `
