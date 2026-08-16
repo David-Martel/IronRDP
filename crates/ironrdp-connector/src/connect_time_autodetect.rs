@@ -144,7 +144,9 @@ pub(crate) fn response_for_request(request: &AutoDetectRequest) -> Option<AutoDe
             payload,
             ..
         } => {
-            let byte_count = payload.as_ref().map_or(0, |p| u32::try_from(p.len()).unwrap_or(u32::MAX));
+            let byte_count = payload
+                .as_ref()
+                .map_or(0, |p| u32::try_from(p.len()).unwrap_or(u32::MAX));
             Some(AutoDetectResponse::BandwidthMeasureResults {
                 sequence_number: *sequence_number,
                 response_type: BW_RESULTS_CONNECT_TIME,

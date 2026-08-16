@@ -509,11 +509,17 @@ mod tests {
         let mut frame = Yuv444Frame::new(1, 1);
         frame.y[0] = 235;
         let rgba = yuv444_to_rgba(&frame);
-        assert!(rgba[0] > 250 && rgba[1] > 250 && rgba[2] > 250, "expected white, got {rgba:?}");
+        assert!(
+            rgba[0] > 250 && rgba[1] > 250 && rgba[2] > 250,
+            "expected white, got {rgba:?}"
+        );
         // Y=16 (limited-range black), chroma neutral => ~black.
         frame.y[0] = 16;
         let rgba = yuv444_to_rgba(&frame);
-        assert!(rgba[0] < 5 && rgba[1] < 5 && rgba[2] < 5, "expected black, got {rgba:?}");
+        assert!(
+            rgba[0] < 5 && rgba[1] < 5 && rgba[2] < 5,
+            "expected black, got {rgba:?}"
+        );
     }
 
     #[test]

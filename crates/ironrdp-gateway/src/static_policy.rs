@@ -116,8 +116,7 @@ impl StaticFilePolicy {
     ///
     /// Returns an error if the file cannot be read or the TOML is malformed.
     pub fn from_file(path: &Path) -> Result<Self> {
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("read policy file {}", path.display()))?;
+        let raw = std::fs::read_to_string(path).with_context(|| format!("read policy file {}", path.display()))?;
         Self::from_toml_str(&raw).with_context(|| format!("parse policy file {}", path.display()))
     }
 

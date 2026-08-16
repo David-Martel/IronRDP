@@ -206,10 +206,7 @@ async fn handle_connection(
     debug!("starting TLS handshake");
 
     // --- TLS handshake ---
-    let tls_stream = acceptor
-        .accept(stream)
-        .await
-        .context("TLS handshake failed")?;
+    let tls_stream = acceptor.accept(stream).await.context("TLS handshake failed")?;
 
     debug!("TLS handshake complete, upgrading to WebSocket");
 
@@ -240,8 +237,8 @@ async fn handle_connection(
     debug!(destination = %destination, "received RDCleanPath request");
 
     // --- Parse target host ---
-    let target = TargetHost::from_destination(&destination)
-        .with_context(|| format!("invalid destination `{destination}`"))?;
+    let target =
+        TargetHost::from_destination(&destination).with_context(|| format!("invalid destination `{destination}`"))?;
 
     // --- Authenticate ---
     let credentials = Credentials { token: proxy_auth };

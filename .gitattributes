@@ -1,0 +1,36 @@
+# Line-ending normalization.
+#
+# Why this file exists: on 2026-08-16 this working tree reported 652 modified files
+# (91,900 insertions) containing ZERO authored changes. 624 of them were a pure
+# LF->CRLF flip in the working tree while every HEAD blob was LF; the remaining 28
+# were that same flip plus rustfmt reordering. Without normalization rules, git
+# treats a CRLF worktree copy of an LF blob as a whole-file modification, so the
+# repo looks like it holds hundreds of files of work in progress when it holds none.
+#
+# `text=auto` lets git decide what is text, and normalizes text to LF *in the
+# repository* on commit. Checkout still uses the platform's native convention
+# (governed by core.autocrlf), so Windows contributors are unaffected — this only
+# guarantees CRLF is never recorded, which is what makes the phantom diff impossible.
+# Deliberately no `eol=` override: this repo carries a large C#/Visual Studio subtree
+# (.cs/.sln/.csproj) where forcing LF would be a gratuitous behavior change.
+* text=auto
+
+# Binary assets — never touch these. git's heuristic usually gets them right, but
+# the cost of a wrong guess is a corrupted fixture, so they are declared explicitly.
+*.bin   binary
+*.pdu   binary
+*.data  binary
+*.bmp   binary
+*.png   binary
+*.ico   binary
+
+# PEM is TEXT, not binary. Marking it `binary` is an easy mistake with a real cost:
+# git then stores the worktree bytes verbatim, so a CRLF worktree copy would have
+# ADDED 22 (cert) and 28 (key) CR bytes to fixtures that are LF in HEAD — measured
+# here on 2026-08-16 before it was committed. Normalizing them to LF is correct and
+# keeps the test certs byte-stable across platforms.
+*.pem   text
+
+# Shader sources are text.
+*.frag  text
+*.vert  text

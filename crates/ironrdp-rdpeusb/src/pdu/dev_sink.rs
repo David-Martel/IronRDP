@@ -356,15 +356,13 @@ impl Encode for AddDevice {
         let hw_ids_size = self.hw_ids.as_ref().map_or(size_of::<u32>(), Encode::size);
         let compat_ids_size = self.compat_ids.as_ref().map_or(size_of::<u32>(), Encode::size);
 
-        strict_sum(&[
-            SharedMsgHeader::SIZE_WHEN_NOT_RSP
+        strict_sum(&[SharedMsgHeader::SIZE_WHEN_NOT_RSP
                 + size_of::<u32>() // NumUsbDevice
                 + InterfaceId::FIXED_PART_SIZE
                 + self.device_instance_id.size()
                 + hw_ids_size
                 + compat_ids_size
                 + self.container_id.size()
-                + self.usb_device_caps.size(),
-        ])
+                + self.usb_device_caps.size()])
     }
 }

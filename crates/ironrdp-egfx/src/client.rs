@@ -924,13 +924,7 @@ impl GraphicsPipelineClient {
             return Ok(());
         }
 
-        let yuv444 = avc444::reconstruct_yuv444(
-            &main,
-            &aux,
-            version,
-            u32::from(dest_width),
-            u32::from(dest_height),
-        );
+        let yuv444 = avc444::reconstruct_yuv444(&main, &aux, version, u32::from(dest_width), u32::from(dest_height));
         let rgba = avc444::yuv444_to_rgba(&yuv444);
 
         let update = BitmapUpdate {
@@ -1021,17 +1015,14 @@ impl GraphicsPipelineClient {
                 return;
             }
 
-            let fb = self
-                .progressive_framebuffers
-                .entry(pdu.surface_id)
-                .or_insert_with(|| {
-                    let mut v = vec![0u8; width.saturating_mul(height).saturating_mul(4)];
-                    // Initialize to opaque black.
-                    for px in v.chunks_exact_mut(4) {
-                        px[3] = 0xFF;
-                    }
-                    v
-                });
+            let fb = self.progressive_framebuffers.entry(pdu.surface_id).or_insert_with(|| {
+                let mut v = vec![0u8; width.saturating_mul(height).saturating_mul(4)];
+                // Initialize to opaque black.
+                for px in v.chunks_exact_mut(4) {
+                    px[3] = 0xFF;
+                }
+                v
+            });
 
             // Track the changed-tile bounding box while compositing. Tile (x_idx,
             // y_idx) covers surface pixels [x_idx*64, (x_idx+1)*64), clipped to
@@ -1446,7 +1437,11 @@ mod tests {
             for rx in 0..w {
                 let ci = (ry * w + rx) * 4;
                 assert_eq!(cropped[ci], u8::try_from(x + rx).expect("fits u8"), "R at ({rx},{ry})");
-                assert_eq!(cropped[ci + 1], u8::try_from(y + ry).expect("fits u8"), "G at ({rx},{ry})");
+                assert_eq!(
+                    cropped[ci + 1],
+                    u8::try_from(y + ry).expect("fits u8"),
+                    "G at ({rx},{ry})"
+                );
                 assert_eq!(cropped[ci + 3], 0xFF);
             }
         }

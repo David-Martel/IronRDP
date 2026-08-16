@@ -223,7 +223,9 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.encode(dst),
             // The client only ever decodes a Server Redirection PDU (it is server-to-client),
             // so re-encoding is not supported.
-            ShareControlPdu::ServerRedirect(_) => Err(other_err!("ShareControlPdu", "cannot encode Server Redirection PDU")),
+            ShareControlPdu::ServerRedirect(_) => {
+                Err(other_err!("ShareControlPdu", "cannot encode Server Redirection PDU"))
+            }
         }
     }
 
@@ -319,7 +321,12 @@ impl ServerRedirectionPdu {
         // Remaining optional fields (LB_TARGET_FQDN, LB_TARGET_NETBIOS_NAME,
         // LB_REDIRECTION_GUID, LB_TARGET_CERTIFICATE, ...) are not needed to
         // follow the redirection and are left unparsed.
-        let _ = (LB_TARGET_FQDN, LB_TARGET_NETBIOS_NAME, LB_REDIRECTION_GUID, LB_TARGET_CERTIFICATE);
+        let _ = (
+            LB_TARGET_FQDN,
+            LB_TARGET_NETBIOS_NAME,
+            LB_REDIRECTION_GUID,
+            LB_TARGET_CERTIFICATE,
+        );
 
         Ok(Self {
             session_id,

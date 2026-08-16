@@ -173,8 +173,14 @@ impl DecodeStream {
                         let nb_samples = match dec.get_nb_samples(&pkt) {
                             Ok(nb_samples) => nb_samples,
                             Err(error) => {
-                                let n = decode_error_count_clone.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-                                warn!(?error, decode_errors = n, "Failed to get Opus packet sample count; skipping packet");
+                                let n = decode_error_count_clone
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    .saturating_add(1);
+                                warn!(
+                                    ?error,
+                                    decode_errors = n,
+                                    "Failed to get Opus packet sample count; skipping packet"
+                                );
                                 continue;
                             }
                         };
@@ -185,8 +191,14 @@ impl DecodeStream {
                         )]
                         let mut pcm_i16 = vec![0i16; nb_samples * chan as usize];
                         if let Err(error) = dec.decode(&pkt, &mut pcm_i16, false) {
-                            let n = decode_error_count_clone.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-                            warn!(?error, decode_errors = n, "Failed to decode Opus packet; skipping packet");
+                            let n = decode_error_count_clone
+                                .fetch_add(1, Ordering::Relaxed)
+                                .saturating_add(1);
+                            warn!(
+                                ?error,
+                                decode_errors = n,
+                                "Failed to decode Opus packet; skipping packet"
+                            );
                             continue;
                         }
                         // Vec<u8> is what the channel carries downstream. Reinterpreting
@@ -332,10 +344,7 @@ impl RxBuffer {
                         // the remainder of the callback buffer with silence so
                         // the driver receives valid audio data and the OS does
                         // not produce an audible click or report a hard error.
-                        let underruns = self
-                            .underrun_count
-                            .fetch_add(1, Ordering::Relaxed)
-                            .saturating_add(1);
+                        let underruns = self.underrun_count.fetch_add(1, Ordering::Relaxed).saturating_add(1);
                         debug!(underruns, "Playback buffer underrun, writing silence");
                         data[filled..].fill(self.silence_byte);
                         return;

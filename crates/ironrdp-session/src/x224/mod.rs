@@ -179,10 +179,7 @@ impl Processor {
     fn process_unrouted_channel(&self, channel_id: u16, user_data: &[u8]) -> SessionResult<Vec<ProcessorOutput>> {
         match ironrdp_connector::connect_time_autodetect::in_session_autodetect_response(user_data) {
             Ok(Some(rsp)) => {
-                debug!(
-                    channel_id,
-                    "Answering in-session (message-channel) Auto-Detect Request"
-                );
+                debug!(channel_id, "Answering in-session (message-channel) Auto-Detect Request");
                 let mut buf = WriteBuf::new();
                 self.encode_io_channel(&mut buf, &rsp)?;
                 Ok(vec![ProcessorOutput::ResponseFrame(buf.filled().to_vec())])
@@ -217,7 +214,10 @@ impl Processor {
                         if let InfoData::LogonExtended(extended) = &session_info.info_data
                             && let Some(auto_reconnect) = &extended.auto_reconnect
                         {
-                            debug!(logon_id = auto_reconnect.logon_id, "Captured server auto-reconnect cookie");
+                            debug!(
+                                logon_id = auto_reconnect.logon_id,
+                                "Captured server auto-reconnect cookie"
+                            );
                             self.reconnect_cookie = Some(auto_reconnect.clone());
                         }
                         Ok(Vec::new())
@@ -268,20 +268,20 @@ impl Processor {
                         use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
 
                         match req {
-                            AutoDetectRequest::RttRequest { sequence_number, request_type } => {
+                            AutoDetectRequest::RttRequest {
+                                sequence_number,
+                                request_type,
+                            } => {
                                 // Respond immediately with an RTT Measure Response carrying the
                                 // same sequence number as the request.
                                 //
                                 // [MS-RDPBCGR] §2.2.14.2.1
                                 debug!(
                                     sequence_number,
-                                    request_type,
-                                    "Received Auto-Detect RTT Request; sending RTT Response"
+                                    request_type, "Received Auto-Detect RTT Request; sending RTT Response"
                                 );
 
-                                let rsp = AutoDetectResponse::RttResponse {
-                                    sequence_number,
-                                };
+                                let rsp = AutoDetectResponse::RttResponse { sequence_number };
 
                                 let mut buf = WriteBuf::new();
                                 self.encode_static(&mut buf, ShareDataPdu::AutoDetectRsp(rsp))?;
@@ -297,13 +297,15 @@ impl Processor {
                                 // scope for this pass; log and continue.
                                 debug!(
                                     sequence_number,
-                                    request_type,
-                                    "Received Auto-Detect Bandwidth Measure Start"
+                                    request_type, "Received Auto-Detect Bandwidth Measure Start"
                                 );
                                 Ok(Vec::new())
                             }
 
-                            AutoDetectRequest::BandwidthMeasurePayload { sequence_number, payload } => {
+                            AutoDetectRequest::BandwidthMeasurePayload {
+                                sequence_number,
+                                payload,
+                            } => {
                                 // Payload-only PDU sent during connect-time BW detection; no
                                 // response required.
                                 debug!(
@@ -340,8 +342,7 @@ impl Processor {
                                 // required per [MS-RDPBCGR] §2.2.14.1.5.
                                 debug!(
                                     sequence_number,
-                                    request_type,
-                                    "Received Auto-Detect Network Characteristics Result from server"
+                                    request_type, "Received Auto-Detect Network Characteristics Result from server"
                                 );
                                 Ok(Vec::new())
                             }

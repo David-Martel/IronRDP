@@ -583,10 +583,7 @@ impl Sequence for Acceptor {
                     let rejected = if let Some(provider) = &self.credential_provider {
                         // Dynamic provider: accept only if the provider returns a
                         // matching candidate for this username/domain pair.
-                        let candidates = provider.get_credentials(
-                            &creds.username,
-                            creds.domain.as_deref(),
-                        );
+                        let candidates = provider.get_credentials(&creds.username, creds.domain.as_deref());
                         !candidates.iter().any(|c| c == &creds)
                     } else if let Some(expected) = &self.creds {
                         // Static credential check (legacy path).
