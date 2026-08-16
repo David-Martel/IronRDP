@@ -40,4 +40,13 @@ Describe 'Windows tooling credential hygiene' {
         Get-Content -LiteralPath (Join-Path $repositoryRoot 'scripts\windows\Invoke-HyperVE2ESuite.ps1') -Raw |
             Should -Match '--password-stdin'
     }
+
+    It 'fails closed around installer and non-interactive Hyper-V orchestration' {
+        $content = Get-Content -LiteralPath $buildScript.FullName -Raw
+        $content | Should -Match '\$global:LASTEXITCODE\s*=\s*0\s*\r?\n\s*&\s*\$installerScript'
+        $content | Should -Match 'installer generation failed with exit code'
+        $content | Should -Match '\[Console\]::IsInputRedirected'
+        $content | Should -Match '\[Environment\]::UserInteractive'
+        $content | Should -Match 'pass -HyperVCredential'
+    }
 }

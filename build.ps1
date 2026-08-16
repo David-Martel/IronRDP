@@ -1222,6 +1222,27 @@ function New-InstallerOutputRoot {
     return Join-Path $installerRoot $outputName
 }
 
+function Get-RequiredHyperVCredential {
+    param(
+        [System.Management.Automation.PSCredential]$Credential,
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$VmName
+    )
+
+    if ($Credential) {
+        return $Credential
+    }
+    $ciMode = $env:CI -match '^(?i:1|true|yes)$'
+    if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected -or $ciMode) {
+        throw 'Hyper-V credentials are required in non-interactive sessions; pass -HyperVCredential.'
+    }
+    $prompted = Get-Credential -UserName $Username -Message "Credentials for Hyper-V guest '$VmName'"
+    if (-not $prompted) {
+        throw 'Hyper-V credential entry was cancelled.'
+    }
+    return $prompted
+}
+
 function Publish-InstallerArtifacts {
     param(
         [Parameter(Mandatory)][string]$PackageRoot
@@ -1279,7 +1300,11 @@ function Publish-InstallerArtifacts {
         $arguments.SkipMsi = $true
     }
 
+    $global:LASTEXITCODE = 0
     & $installerScript @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "installer generation failed with exit code $LASTEXITCODE"
+    }
 
     $installerResultPath = Join-Path $installerOutputRoot 'installer-output.json'
     if (-not (Test-Path -LiteralPath $installerResultPath -PathType Leaf)) {
@@ -1721,9 +1746,10 @@ try {
             if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 Write-Warning "No build manifest found at '$manifestPath'; suite will run against the deployed binary without full package metadata"
             }
-            if (-not $HyperVCredential) {
-                $HyperVCredential = Get-Credential -UserName $HyperVUsername -Message "Credentials for Hyper-V guest '$HyperVVmName'"
-            }
+            $HyperVCredential = Get-RequiredHyperVCredential `
+                -Credential $HyperVCredential `
+                -Username $HyperVUsername `
+                -VmName $HyperVVmName
 
             & $suiteScript `
                 -PackageRoot $script:ArtifactRoot `
@@ -1776,9 +1802,10 @@ try {
             if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 throw "package root not found at '$($script:ArtifactRoot)'; run build.ps1 -Mode package -Release first or pass -ArtifactRoot"
             }
-            if (-not $HyperVCredential) {
-                $HyperVCredential = Get-Credential -UserName $HyperVUsername -Message "Credentials for Hyper-V guest '$HyperVVmName'"
-            }
+            $HyperVCredential = Get-RequiredHyperVCredential `
+                -Credential $HyperVCredential `
+                -Username $HyperVUsername `
+                -VmName $HyperVVmName
 
             & $smokeScript `
                 -PackageRoot $script:ArtifactRoot `
@@ -1798,9 +1825,10 @@ try {
             if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 throw "package root not found at '$($script:ArtifactRoot)'; run build.ps1 -Mode package -Release first or pass -ArtifactRoot"
             }
-            if (-not $HyperVCredential) {
-                $HyperVCredential = Get-Credential -UserName $HyperVUsername -Message "Credentials for Hyper-V guest '$HyperVVmName'"
-            }
+            $HyperVCredential = Get-RequiredHyperVCredential `
+                -Credential $HyperVCredential `
+                -Username $HyperVUsername `
+                -VmName $HyperVVmName
 
             & $suiteScript `
                 -PackageRoot $script:ArtifactRoot `
