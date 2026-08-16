@@ -8,7 +8,7 @@ param(
     [string]$BootstrapRelativePath = 'ProgramData\IronRDP\msi-e2e',
     [string]$LogRelativePath = 'ProgramData\IronRDP\msi-e2e-logs',
     [string]$TestUsername = 'IronRdpLab',
-    [string]$TestPassword = 'TempIronRdp!2026',
+    [System.Management.Automation.PSCredential]$TestCredential,
     [int]$BootWaitSeconds = 150,
     [switch]$StopVmAfterTest
 )
@@ -66,6 +66,13 @@ function Set-OfflineBootstrapService {
 }
 
 $resolvedMsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
+if (-not $TestCredential) {
+    $TestCredential = Get-Credential -UserName $TestUsername -Message "Existing credentials for Hyper-V guest '$VmName'"
+}
+$TestUsername = (($TestCredential.UserName -replace '^[.\\]+', '') -split '\\')[-1]
+if ($TestUsername -notmatch '^[A-Za-z0-9_.-]+$') {
+    throw "unsupported guest username: $TestUsername"
+}
 
 if ((Get-VM -Name $VmName).State -ne 'Off') {
     Stop-VM -Name $VmName -Force | Out-Null
@@ -106,10 +113,9 @@ try {
     Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' | Out-Null
     Start-Service -Name TermService -ErrorAction SilentlyContinue
 
-    Write-Step 'creating test account'
-    `$securePassword = ConvertTo-SecureString '$TestPassword' -AsPlainText -Force
+    Write-Step 'validating existing test account'
     if (-not (Get-LocalUser -Name '$TestUsername' -ErrorAction SilentlyContinue)) {
-        New-LocalUser -Name '$TestUsername' -Password `$securePassword -PasswordNeverExpires -AccountNeverExpires | Out-Null
+        throw 'required pre-provisioned test account was not found: $TestUsername'
     }
     Add-LocalGroupMember -Group 'Administrators' -Member '$TestUsername' -ErrorAction SilentlyContinue
     Add-LocalGroupMember -Group 'Remote Desktop Users' -Member '$TestUsername' -ErrorAction SilentlyContinue
@@ -158,7 +164,7 @@ finally {
 
 Start-VM -Name $VmName | Out-Null
 Start-Sleep -Seconds $BootWaitSeconds
-$credential = New-Object System.Management.Automation.PSCredential(".\$TestUsername", (ConvertTo-SecureString $TestPassword -AsPlainText -Force))
+$credential = New-Object System.Management.Automation.PSCredential(".\$TestUsername", $TestCredential.Password.Copy())
 $liveResult = $null
 $liveError = $null
 

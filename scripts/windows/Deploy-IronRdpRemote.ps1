@@ -8,9 +8,9 @@
     install script, and executes a smoke test to verify the deployment.
 
     The remote machine must have OpenSSH server running and PowerShell 7+
-    available as 'pwsh' on PATH.  Password-less SSH (key auth) is strongly
-    preferred; pass -SshKeyPath when the private key is not in the default
-    ssh-agent keyring.
+    available as 'pwsh' on PATH. SSH authentication is restricted to the
+    explicitly supplied private key, and the host key must already be pinned
+    in the explicitly supplied known-hosts file.
 
     Exit codes
         0   Deployment and all requested tests passed.
@@ -24,8 +24,14 @@
 .PARAMETER RemoteUser
     SSH username on the remote host.  Defaults to the current $env:USERNAME.
 .PARAMETER SshKeyPath
-    Optional path to a PEM/OpenSSH private key.  When omitted, ssh/scp use
-    the key already loaded in ssh-agent.
+    Path to the PEM/OpenSSH private key used for the deployment. The script
+    disables ssh-agent and all password or keyboard-interactive fallback.
+.PARAMETER UserKnownHostsFile
+    Path to a dedicated OpenSSH known-hosts file containing the pinned key for
+    HostKeyAlias. The script never accepts or updates host keys automatically.
+.PARAMETER HostKeyAlias
+    Exact host identity to verify in UserKnownHostsFile. This can differ from
+    RemoteHost when RemoteHost is an address or SSH config alias.
 .PARAMETER RemoteTempDir
     Working directory created on the remote machine for bundle transfer and
     extraction.  Defaults to C:\Temp\IronRDP-deploy.
@@ -36,31 +42,41 @@
 .PARAMETER SmokeTestHost
     If set, run a live-connect smoke test from the remote machine against this
     RDP host after installation completes.
-.PARAMETER SmokeTestUsername
-    RDP username for the live-connect smoke test.
-.PARAMETER SmokeTestPassword
-    RDP password for the live-connect smoke test.
+.PARAMETER SmokeTestCredential
+    RDP credential for the live-connect smoke test. When omitted, the script
+    prompts locally and forwards the password only over the encrypted SSH
+    standard-input stream.
 .PARAMETER SmokeTestConnectSeconds
     How long (seconds) to hold the RDP connection open during the smoke test.
     Defaults to 15.
 .PARAMETER Force
     Passed through to Install-IronRdpPackage.ps1 to allow overwriting an
     existing installation on the remote machine.
-.EXAMPLE
-    ./Deploy-IronRdpRemote.ps1 -BundlePath T:\artifacts\IronRDP-portable.zip -RemoteHost dtm-p1gen7
+.PARAMETER ValidateSshConfigurationOnly
+    Validate the pinned SSH policy and return without opening a connection.
 .EXAMPLE
     ./Deploy-IronRdpRemote.ps1 `
         -BundlePath T:\artifacts\IronRDP-portable.zip `
         -RemoteHost dtm-p1gen7 `
+        -SshKeyPath ~/.ssh/id_ed25519 `
+        -UserKnownHostsFile ~/.ssh/ironrdp_known_hosts `
+        -HostKeyAlias dtm-p1gen7
+.EXAMPLE
+    ./Deploy-IronRdpRemote.ps1 `
+        -BundlePath T:\artifacts\IronRDP-portable.zip `
+        -RemoteHost dtm-p1gen7 `
+        -SshKeyPath ~/.ssh/id_ed25519 `
+        -UserKnownHostsFile ~/.ssh/ironrdp_known_hosts `
+        -HostKeyAlias dtm-p1gen7 `
         -SmokeTestHost 172.23.187.173 `
-        -SmokeTestUsername IronRdpLab `
-        -SmokeTestPassword 'TempIronRdp!2026' `
         -Force
 .EXAMPLE
     ./Deploy-IronRdpRemote.ps1 `
         -BundlePath T:\artifacts\IronRDP-portable.zip `
         -RemoteHost dtm-p1gen7 `
         -SshKeyPath ~/.ssh/id_ed25519 `
+        -UserKnownHostsFile ~/.ssh/ironrdp_known_hosts `
+        -HostKeyAlias dtm-p1gen7 `
         -RemoteInstallRoot 'C:\IronRDP' `
         -Force | ConvertTo-Json -Depth 6
 #>
@@ -75,7 +91,14 @@ param(
 
     [string]$RemoteUser = $env:USERNAME,
 
+    [Parameter(Mandatory)]
     [string]$SshKeyPath,
+
+    [Parameter(Mandatory)]
+    [string]$UserKnownHostsFile,
+
+    [Parameter(Mandatory)]
+    [string]$HostKeyAlias,
 
     [string]$RemoteTempDir = 'C:\Temp\IronRDP-deploy',
 
@@ -83,11 +106,12 @@ param(
 
     # If set, run a live-connect smoke test against this host after install
     [string]$SmokeTestHost,
-    [string]$SmokeTestUsername,
-    [string]$SmokeTestPassword,
+    [System.Management.Automation.PSCredential]$SmokeTestCredential,
     [int]$SmokeTestConnectSeconds = 15,
 
-    [switch]$Force
+    [switch]$Force,
+
+    [switch]$ValidateSshConfigurationOnly
 )
 
 Set-StrictMode -Version Latest
@@ -108,12 +132,68 @@ function Write-StepOk {
 }
 
 function Build-SshArgs {
-    # Returns a [string[]] of common ssh/scp flags (key path only; -o flags
-    # that suppress host-key prompts can be added here when needed).
-    if ($SshKeyPath) {
-        return @('-i', $SshKeyPath)
+    return @(
+        '-F', 'none',
+        '-i', $script:resolvedSshKeyPath,
+        '-o', 'BatchMode=yes',
+        '-o', 'StrictHostKeyChecking=yes',
+        '-o', "UserKnownHostsFile=$script:resolvedKnownHostsPath",
+        '-o', "HostKeyAlias=$HostKeyAlias",
+        '-o', 'IdentitiesOnly=yes',
+        '-o', 'IdentityAgent=none',
+        '-o', 'PreferredAuthentications=publickey',
+        '-o', 'PubkeyAuthentication=yes',
+        '-o', 'PasswordAuthentication=no',
+        '-o', 'KbdInteractiveAuthentication=no',
+        '-o', 'ChallengeResponseAuthentication=no',
+        '-o', 'HostbasedAuthentication=no',
+        '-o', 'ForwardAgent=no',
+        '-o', 'ClearAllForwardings=yes',
+        '-o', 'PermitLocalCommand=no'
+    )
+}
+
+function Assert-SshSecurityPolicy {
+    $sshArgs = Build-SshArgs
+    $effectiveConfig = & ssh @sshArgs -G "${RemoteUser}@${RemoteHost}" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "could not evaluate the effective SSH configuration (exit code $LASTEXITCODE)"
     }
-    return @()
+
+    $settings = @{}
+    foreach ($line in $effectiveConfig) {
+        if ($line -match '^(\S+)\s+(.+)$') {
+            $settings[$matches[1].ToLowerInvariant()] = $matches[2].Trim()
+        }
+    }
+
+    $expected = @{
+        batchmode = 'yes'
+        stricthostkeychecking = 'true'
+        hostkeyalias = $HostKeyAlias
+        identitiesonly = 'yes'
+        identityagent = 'none'
+        preferredauthentications = 'publickey'
+        pubkeyauthentication = 'true'
+        passwordauthentication = 'no'
+        kbdinteractiveauthentication = 'no'
+        hostbasedauthentication = 'no'
+        forwardagent = 'no'
+        clearallforwardings = 'yes'
+        permitlocalcommand = 'no'
+    }
+    foreach ($setting in $expected.GetEnumerator()) {
+        if ($settings[$setting.Key] -ne $setting.Value) {
+            throw "SSH security policy mismatch for '$($setting.Key)': expected '$($setting.Value)', got '$($settings[$setting.Key])'"
+        }
+    }
+
+    $effectiveKnownHosts = $settings.userknownhostsfile.Trim('"')
+    if (-not [System.IO.Path]::GetFullPath($effectiveKnownHosts).Equals(
+            $script:resolvedKnownHostsPath,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "SSH security policy did not retain the pinned known-hosts file: $effectiveKnownHosts"
+    }
 }
 
 function Invoke-Ssh {
@@ -128,6 +208,51 @@ function Invoke-Ssh {
     & ssh @sshArgs
     if ($LASTEXITCODE -ne 0) {
         throw "ssh command failed with exit code $LASTEXITCODE.  Command: $Command"
+    }
+}
+
+function Invoke-SshWithCredentialInput {
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'ssh'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in (Build-SshArgs)) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $startInfo.ArgumentList.Add("${RemoteUser}@${RemoteHost}")
+    $startInfo.ArgumentList.Add($Command)
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw 'failed to start ssh process'
+    }
+
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+    try {
+        for ($index = 0; $index -lt $Credential.Password.Length; $index++) {
+            $process.StandardInput.Write([char][Runtime.InteropServices.Marshal]::ReadInt16($passwordPointer, $index * 2))
+        }
+        $process.StandardInput.WriteLine()
+    } finally {
+        $process.StandardInput.Close()
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
+    }
+
+    $process.WaitForExit()
+    [pscustomobject]@{
+        exitCode = $process.ExitCode
+        stdout = $stdoutTask.GetAwaiter().GetResult()
+        stderr = $stderrTask.GetAwaiter().GetResult()
     }
 }
 
@@ -148,6 +273,34 @@ if (-not $resolvedBundle.EndsWith('.zip', [System.StringComparison]::OrdinalIgno
     throw "bundle must be a .zip file, got: $resolvedBundle"
 }
 
+try {
+    $script:resolvedSshKeyPath = (Resolve-Path -LiteralPath $SshKeyPath).Path
+} catch {
+    throw "SSH private key not found: $SshKeyPath"
+}
+if ((Get-Item -LiteralPath $script:resolvedSshKeyPath).PSIsContainer) {
+    throw "SSH private key must be a file: $script:resolvedSshKeyPath"
+}
+
+try {
+    $script:resolvedKnownHostsPath = (Resolve-Path -LiteralPath $UserKnownHostsFile).Path
+} catch {
+    throw "known-hosts file not found: $UserKnownHostsFile"
+}
+if ((Get-Item -LiteralPath $script:resolvedKnownHostsPath).PSIsContainer) {
+    throw "known-hosts path must be a file: $script:resolvedKnownHostsPath"
+}
+
+if ($HostKeyAlias -notmatch '^[A-Za-z0-9._:\[\]%-]+$') {
+    throw "HostKeyAlias contains unsupported characters: $HostKeyAlias"
+}
+if ($RemoteHost -notmatch '^[A-Za-z0-9._:\[\]%-]+$') {
+    throw "RemoteHost contains unsupported characters: $RemoteHost"
+}
+if ($RemoteUser -notmatch '^[A-Za-z0-9_][A-Za-z0-9._\\-]*$') {
+    throw "RemoteUser contains unsupported characters: $RemoteUser"
+}
+
 $bundleItem = Get-Item -LiteralPath $resolvedBundle
 $bundleFileName = $bundleItem.Name
 $bundleSizeBytes = $bundleItem.Length
@@ -156,10 +309,29 @@ Write-StepOk "Bundle: $resolvedBundle ($([math]::Round($bundleSizeBytes / 1MB, 2
 Write-StepOk "Remote target: ${RemoteUser}@${RemoteHost}"
 
 # Warn if ssh or scp are not on PATH — fail fast before touching the network.
-foreach ($tool in 'ssh', 'scp') {
+foreach ($tool in 'ssh', 'scp', 'ssh-keygen') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         throw "$tool not found on PATH — install OpenSSH client before running this script"
     }
+}
+
+$pinnedKeys = & ssh-keygen -F $HostKeyAlias -f $script:resolvedKnownHostsPath 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $pinnedKeys) {
+    throw "no pinned host key for '$HostKeyAlias' exists in $script:resolvedKnownHostsPath"
+}
+
+Assert-SshSecurityPolicy
+Write-StepOk "SSH policy: pinned host '$HostKeyAlias', explicit key only, no agent or password fallback"
+
+if ($ValidateSshConfigurationOnly) {
+    [pscustomobject]@{
+        validated = $true
+        remoteHost = $RemoteHost
+        hostKeyAlias = $HostKeyAlias
+        sshKeyPath = $script:resolvedSshKeyPath
+        userKnownHostsFile = $script:resolvedKnownHostsPath
+    }
+    return
 }
 
 # ---------------------------------------------------------------------------
@@ -300,10 +472,10 @@ $liveConnectResult = $null
 if ($SmokeTestHost) {
     Write-Step "Running live-connect smoke test: remote -> $SmokeTestHost (${SmokeTestConnectSeconds}s)"
 
-    $smokeCredArgs = ''
-    if ($SmokeTestUsername) { $smokeCredArgs += " -Username '$SmokeTestUsername'" }
-    if ($SmokeTestPassword) { $smokeCredArgs += " -Password '$SmokeTestPassword'" }
-    $smokeCredArgs = $smokeCredArgs.Trim()
+    if (-not $SmokeTestCredential) {
+        $SmokeTestCredential = Get-Credential -Message "RDP credentials for '$SmokeTestHost'"
+    }
+    $smokeUsername = $SmokeTestCredential.UserName.Replace("'", "''")
 
     $remoteLiveScript = @"
 Set-StrictMode -Version Latest
@@ -317,15 +489,29 @@ if (-not `$smokeScript) {
     throw 'Invoke-IronRdpSmokeTest.ps1 not found in bundle — cannot run live-connect test'
 }
 
-Write-Host "Running live-connect smoke test: `$(`$smokeScript.FullName) -LaunchHost '$SmokeTestHost' -ConnectSeconds $SmokeTestConnectSeconds $smokeCredArgs"
-`$result = & `$smokeScript.FullName -LaunchHost '$SmokeTestHost' -ConnectSeconds $SmokeTestConnectSeconds $smokeCredArgs
+`$plainPassword = [Console]::In.ReadLine()
+if ([string]::IsNullOrEmpty(`$plainPassword)) {
+    throw 'RDP password was not received on standard input'
+}
+try {
+    `$securePassword = ConvertTo-SecureString `$plainPassword -AsPlainText -Force
+    `$credential = [System.Management.Automation.PSCredential]::new('$smokeUsername', `$securePassword)
+    `$plainPassword = `$null
+    `$result = & `$smokeScript.FullName -LaunchHost '$SmokeTestHost' -ConnectSeconds $SmokeTestConnectSeconds -Credential `$credential
+} finally {
+    `$plainPassword = `$null
+}
 `$result | ConvertTo-Json -Depth 6 -Compress
 "@
 
     Write-Verbose "Remote live-connect script:`n$remoteLiveScript"
-    $liveOutput = & ssh @sshCommonArgs "pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -Command $remoteLiveScript"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Live-connect smoke test exited with code $LASTEXITCODE on remote (session may still have connected)"
+    $encodedLiveScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($remoteLiveScript))
+    $liveInvocation = Invoke-SshWithCredentialInput `
+        -Command "pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedLiveScript" `
+        -Credential $SmokeTestCredential
+    $liveOutput = $liveInvocation.stdout -split "`r?`n"
+    if ($liveInvocation.exitCode -ne 0) {
+        Write-Warning "Live-connect smoke test exited with code $($liveInvocation.exitCode) on remote: $($liveInvocation.stderr.Trim())"
     }
 
     try {

@@ -38,13 +38,17 @@ level to guide the next GPU/render and multitransport work.
 ## Sample usage
 
 ```shell
-ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
+ironrdp-client <HOSTNAME> --username <USERNAME>
 ```
+
+The client prompts for the password without echoing it.
+For unattended use, pass `--password-stdin` and write the password through a private standard-input pipe.
+The legacy `--password` option remains for compatibility but exposes the secret through process inspection and shell history, so new tooling must not use it.
 
 For repeatable demo sizing on Windows, you can also request an initial desktop size explicitly:
 
 ```shell
-ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD> --width 1600 --height 900
+ironrdp-client <HOSTNAME> --username <USERNAME> --width 1600 --height 900
 ```
 
 If you provide an `.rdp` file, `desktopwidth` and `desktopheight` are now used as the initial
@@ -60,7 +64,7 @@ For multitransport protocol testing, the Windows-native client can advertise opt
 capability:
 
 ```shell
-ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD> --multitransport prefer-reliable
+ironrdp-client <HOSTNAME> --username <USERNAME> --multitransport prefer-reliable
 ```
 
 Current behavior: if the server follows up with a multitransport request, the client replies
@@ -71,13 +75,13 @@ with `E_ABORT` on the TCP control path until the sideband UDP transport is imple
 The `IRONRDP_LOG` environment variable is used to set the log filter directives. 
 
 ```shell
-IRONRDP_LOG="info,ironrdp_connector=trace" ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
+IRONRDP_LOG="info,ironrdp_connector=trace" ironrdp-client <HOSTNAME> --username <USERNAME>
 ```
 
 For frame-path diagnostics on the Windows-native branch:
 
 ```shell
-IRONRDP_LOG="info,ironrdp_client=trace" ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
+IRONRDP_LOG="info,ironrdp_client=trace" ironrdp-client <HOSTNAME> --username <USERNAME>
 ```
 
 See [`tracing-subscriber`’s documentation][tracing-doc] for more details.
@@ -94,7 +98,7 @@ This file can be read by Wireshark so that in can decrypt the packets.
 ### Example
 
 ```shell
-SSLKEYLOGFILE=/tmp/tls-secrets ironrdp-client <HOSTNAME> --username <USERNAME> --password <PASSWORD>
+SSLKEYLOGFILE=/tmp/tls-secrets ironrdp-client <HOSTNAME> --username <USERNAME>
 ```
 
 ### Usage in Wireshark

@@ -11,7 +11,7 @@ param(
 
     [string]$VmName = 'WS2025-ReFS-Repair',
     [string]$Username = 'IronRdpLab',
-    [string]$Password = 'TempIronRdp!2026',
+    [System.Management.Automation.PSCredential]$Credential,
     [int]$ConnectSeconds = 20,
     [ValidateSet('off', 'prefer-reliable', 'reliable', 'prefer-lossy', 'lossy')]
     [string]$Multitransport = 'off',
@@ -51,10 +51,15 @@ if (-not (Test-Path -LiteralPath $smokeScript -PathType Leaf)) {
 }
 
 $connectLogPath = Join-Path ([System.IO.Path]::GetTempPath()) ("ironrdp-hyperv-{0}-{1:yyyyMMdd-HHmmss}.log" -f $VmName, (Get-Date))
+if (-not $Credential) {
+    $Credential = Get-Credential -UserName $Username -Message "Credentials for Hyper-V guest '$VmName'"
+}
+$connectionUsername = (($Credential.UserName -replace '^[.\\]+', '') -split '\\')[-1]
+
 $commonArgs = @{
     LaunchHost = $selected.ipAddress
-    Username = $Username
-    Password = $Password
+    Username = $connectionUsername
+    Credential = $Credential
     ConnectSeconds = $ConnectSeconds
     ConnectionLogPath = $connectLogPath
     Multitransport = $Multitransport

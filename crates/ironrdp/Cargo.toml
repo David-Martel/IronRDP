@@ -70,6 +70,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-rustls = "0.26"
 rand = "0.9"
 opus2 = "0.3"
+zeroize = "1"
 
 [package.metadata.docs.rs]
 cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
@@ -87,4 +88,3 @@ required-features = ["cliprdr", "connector", "rdpsnd", "server"]
 
 [lints]
 workspace = true
-

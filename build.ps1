@@ -19,14 +19,14 @@ param(
     [int]$Jobs,
     [string]$InstallerPublisher = 'CN=David-Martel IronRDP Test',
     [string]$InstallerCertificatePath,
-    [string]$InstallerCertificatePassword,
+    [System.Security.SecureString]$InstallerCertificatePassword,
     [string]$ReleaseRepo,
     [string]$ReleaseTag,
     [switch]$SkipMsix,
     [switch]$SkipMsi,
     [string]$HyperVVmName = 'WS2025-ReFS-Repair',
     [string]$HyperVUsername = 'IronRdpLab',
-    [string]$HyperVPassword = 'TempIronRdp!2026',
+    [System.Management.Automation.PSCredential]$HyperVCredential,
     [int]$ConnectSeconds = 20,
     [ValidateSet('off', 'prefer-reliable', 'reliable', 'prefer-lossy', 'lossy')]
     [string]$LiveTestMultitransport = 'off',
@@ -1248,45 +1248,38 @@ function Publish-InstallerArtifacts {
         $ReleaseTag
     }
 
-    $arguments = @(
-        '-NoLogo',
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', $installerScript,
-        '-PackageRoot', $PackageRoot,
-        '-OutputRoot', $installerOutputRoot,
-        '-Publisher', $InstallerPublisher,
-        '-OutputJsonPath', (Join-Path $installerOutputRoot 'installer-output.json')
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($InstallerCertificatePath)) {
-        $arguments += @('-CertificatePath', $InstallerCertificatePath)
+    $arguments = @{
+        PackageRoot = $PackageRoot
+        OutputRoot = $installerOutputRoot
+        Publisher = $InstallerPublisher
+        OutputJsonPath = Join-Path $installerOutputRoot 'installer-output.json'
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($InstallerCertificatePassword)) {
-        $arguments += @('-CertificatePassword', $InstallerCertificatePassword)
+    if (-not [string]::IsNullOrWhiteSpace($InstallerCertificatePath)) {
+        $arguments.CertificatePath = $InstallerCertificatePath
+    }
+
+    if ($InstallerCertificatePassword) {
+        $arguments.CertificatePassword = $InstallerCertificatePassword
     }
 
     if (-not [string]::IsNullOrWhiteSpace($resolvedReleaseRepo)) {
-        $arguments += @('-ReleaseRepo', $resolvedReleaseRepo)
+        $arguments.ReleaseRepo = $resolvedReleaseRepo
     }
 
     if (-not [string]::IsNullOrWhiteSpace($resolvedReleaseTag)) {
-        $arguments += @('-ReleaseTag', $resolvedReleaseTag)
+        $arguments.ReleaseTag = $resolvedReleaseTag
     }
 
     if ($SkipMsix) {
-        $arguments += '-SkipMsix'
+        $arguments.SkipMsix = $true
     }
 
     if ($SkipMsi) {
-        $arguments += '-SkipMsi'
+        $arguments.SkipMsi = $true
     }
 
-    & pwsh @arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw 'installer generation failed'
-    }
+    & $installerScript @arguments
 
     $installerResultPath = Join-Path $installerOutputRoot 'installer-output.json'
     if (-not (Test-Path -LiteralPath $installerResultPath -PathType Leaf)) {
@@ -1728,12 +1721,15 @@ try {
             if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 Write-Warning "No build manifest found at '$manifestPath'; suite will run against the deployed binary without full package metadata"
             }
+            if (-not $HyperVCredential) {
+                $HyperVCredential = Get-Credential -UserName $HyperVUsername -Message "Credentials for Hyper-V guest '$HyperVVmName'"
+            }
 
             & $suiteScript `
                 -PackageRoot $script:ArtifactRoot `
                 -VmName $HyperVVmName `
                 -Username $HyperVUsername `
-                -Password $HyperVPassword `
+                -Credential $HyperVCredential `
                 -ScenarioSet $HyperVScenarioSet `
                 -DurationSeconds $SuiteDurationSeconds `
                 -SampleIntervalMs $SuiteSampleIntervalMs `
@@ -1780,12 +1776,15 @@ try {
             if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 throw "package root not found at '$($script:ArtifactRoot)'; run build.ps1 -Mode package -Release first or pass -ArtifactRoot"
             }
+            if (-not $HyperVCredential) {
+                $HyperVCredential = Get-Credential -UserName $HyperVUsername -Message "Credentials for Hyper-V guest '$HyperVVmName'"
+            }
 
             & $smokeScript `
                 -PackageRoot $script:ArtifactRoot `
                 -VmName $HyperVVmName `
                 -Username $HyperVUsername `
-                -Password $HyperVPassword `
+                -Credential $HyperVCredential `
                 -ConnectSeconds $ConnectSeconds `
                 -Multitransport $LiveTestMultitransport
         }
@@ -1799,12 +1798,15 @@ try {
             if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 throw "package root not found at '$($script:ArtifactRoot)'; run build.ps1 -Mode package -Release first or pass -ArtifactRoot"
             }
+            if (-not $HyperVCredential) {
+                $HyperVCredential = Get-Credential -UserName $HyperVUsername -Message "Credentials for Hyper-V guest '$HyperVVmName'"
+            }
 
             & $suiteScript `
                 -PackageRoot $script:ArtifactRoot `
                 -VmName $HyperVVmName `
                 -Username $HyperVUsername `
-                -Password $HyperVPassword `
+                -Credential $HyperVCredential `
                 -ScenarioSet $HyperVScenarioSet `
                 -DurationSeconds $SuiteDurationSeconds `
                 -SampleIntervalMs $SuiteSampleIntervalMs `

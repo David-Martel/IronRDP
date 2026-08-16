@@ -120,13 +120,16 @@ live session probe and return timing/log data instead of just launching the
 client:
 
 ```pwsh
-pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-IronRdpSmokeTest.ps1 `
+$credential = Get-Credential -UserName alice -Message 'RDP test credentials'
+& .\tools\Invoke-IronRdpSmokeTest.ps1 `
   -InstallRoot $env:LOCALAPPDATA\Programs\IronRDP `
   -LaunchHost 10.0.0.20 `
-  -Username alice `
-  -Password secret `
+  -Credential $credential `
   -ConnectSeconds 20
 ```
+
+The helper forwards the secure credential through a redirected standard-input pipe.
+It never adds the password to the IronRDP or PowerShell command line.
 
 The live-connect result currently records:
 
@@ -157,8 +160,10 @@ pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\Invoke-IronRdpSmokeTest.
 Direct TCP/TLS:
 
 ```pwsh
-& "$env:LOCALAPPDATA\Programs\IronRDP\Start-IronRdpClient.ps1" 10.0.0.20 --username alice --password secret
+& "$env:LOCALAPPDATA\Programs\IronRDP\Start-IronRdpClient.ps1" 10.0.0.20 --username alice
 ```
+
+The client prompts for the password without echoing it.
 
 Help and version:
 
@@ -194,6 +199,9 @@ Server Hyper-V test VM:
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-HyperVInstallerTest.ps1 -MsiPath .\IronRDP.msi
 ```
 
+The installer harness prompts for an existing guest account when `-TestCredential` is omitted.
+It no longer creates an account from a password embedded in the offline bootstrap script.
+
 The current baseline validated by this fork is:
 
 - MSI install inside `WS2025-ReFS-Repair`
@@ -209,6 +217,8 @@ running and uses the packaged client to connect back into the VM:
 ```pwsh
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tools\Invoke-HyperVLiveConnectTest.ps1 -PackageRoot . -ConnectSeconds 25
 ```
+
+The live-connect and e2e harnesses prompt with `Get-Credential` when `-Credential` is omitted.
 
 The current observed Hyper-V baseline is:
 
@@ -270,8 +280,17 @@ To deploy the portable bundle to another Windows machine over SSH without a loca
 pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\Deploy-IronRdpRemote.ps1 `
   -BundlePath T:\RustCache\artifacts\IronRDP\windows-server-only\bundles\IronRDP-DTM-WORK-0.0.0-dev-portable.zip `
   -RemoteHost dtm-p1gen7 `
+  -SshKeyPath ~/.ssh/id_ed25519 `
+  -UserKnownHostsFile ~/.ssh/ironrdp_known_hosts `
+  -HostKeyAlias dtm-p1gen7 `
   -Force
 ```
+
+Populate the dedicated known-hosts file only after verifying the server key
+fingerprint through an independent trusted channel. The deployment script
+ignores ambient SSH configuration, requires that pinned identity, uses only the
+explicit private key, and disables ssh-agent, password authentication, and
+forwarding before it transfers data or an optional smoke-test credential.
 
 ## Uninstall
 
